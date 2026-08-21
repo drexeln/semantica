@@ -1,0 +1,284 @@
+{
+  "ok": true,
+  "queries": {
+    "influenced_artifacts": {
+      "answer": {
+        "artifact_id": "artifact_porsche_bid_v01_slide_6",
+        "artifact_type": "pptx_slide",
+        "relationship_type": "INFLUENCED_ARTIFACT",
+        "target": "Slide 6",
+        "title": "Porsche Bid v0.1 Slide 6"
+      },
+      "deterministic": true,
+      "ok": true,
+      "source_record_ids": [
+        "decision_d017",
+        "artifact_porsche_bid_v01_slide_6"
+      ]
+    },
+    "later_dependencies": {
+      "answer": {
+        "decision_id": "decision_d023",
+        "depends_on": "decision_d017",
+        "relationship_type": "INFLUENCED",
+        "summary": "Reduce strength of MCP claim"
+      },
+      "deterministic": true,
+      "ok": true,
+      "source_record_ids": [
+        "decision_d017",
+        "decision_d023"
+      ]
+    },
+    "rejected_alternatives": {
+      "answer": [
+        {
+          "alternative_id": "alternative_a",
+          "evidence_ids": [
+            "evidence_e12"
+          ],
+          "label": "proven Exxeta reference",
+          "reason": "no verified evidence"
+        },
+        {
+          "alternative_id": "alternative_c",
+          "evidence_ids": [
+            "evidence_e19"
+          ],
+          "label": "remove claim",
+          "reason": "requirement relevance too high"
+        }
+      ],
+      "deterministic": true,
+      "ok": true,
+      "source_record_ids": [
+        "decision_d017",
+        "alternative_a",
+        "alternative_c",
+        "evidence_e12",
+        "evidence_e19"
+      ]
+    },
+    "supporting_evidence": {
+      "answer": {
+        "evidence_records": [
+          {
+            "confidence": 0.91,
+            "id": "evidence_e12",
+            "provenance": {
+              "captured_at": "2026-08-21T00:00:00Z",
+              "captured_by": "research_agent",
+              "source_uri": "falcon://research/mcp-reference-search"
+            },
+            "source_id": "source_search_mcp_reference",
+            "source_type": "source_search",
+            "summary": "No verified Exxeta MCP reference was found",
+            "supports": [
+              "alternative_b",
+              "alternative_c"
+            ]
+          },
+          {
+            "confidence": 0.87,
+            "id": "evidence_e19",
+            "provenance": {
+              "captured_at": "2026-08-21T00:00:00Z",
+              "captured_by": "requirements_agent",
+              "source_uri": "falcon://requirements/r17"
+            },
+            "source_id": "requirement_r17",
+            "source_type": "requirement",
+            "summary": "MCP capability remains relevant to the tender requirement",
+            "supports": [
+              "alternative_b"
+            ]
+          }
+        ],
+        "provenance": [
+          {
+            "captured_at": "2026-08-21T00:00:00Z",
+            "captured_by": "research_agent",
+            "source_uri": "falcon://research/mcp-reference-search"
+          },
+          {
+            "captured_at": "2026-08-21T00:00:00Z",
+            "captured_by": "requirements_agent",
+            "source_uri": "falcon://requirements/r17"
+          }
+        ],
+        "source_ids": [
+          "source_search_mcp_reference",
+          "requirement_r17"
+        ]
+      },
+      "deterministic": true,
+      "ok": true,
+      "source_record_ids": [
+        "decision_d017",
+        "evidence_e12",
+        "evidence_e19"
+      ]
+    },
+    "why_selected": {
+      "answer": {
+        "actor_id": "falk",
+        "confidence": 0.86,
+        "rationale": "A capability statement preserves requirement coverage while avoiding an unsupported claim of a proven Exxeta reference.",
+        "rejected_alternatives": [
+          {
+            "evidence_ids": [
+              "evidence_e12"
+            ],
+            "id": "alternative_a",
+            "label": "proven Exxeta reference",
+            "reason": "no verified evidence",
+            "status": "rejected"
+          },
+          {
+            "evidence_ids": [
+              "evidence_e19"
+            ],
+            "id": "alternative_c",
+            "label": "remove claim",
+            "reason": "requirement relevance too high",
+            "status": "rejected"
+          }
+        ],
+        "selected_alternative": {
+          "evidence_ids": [
+            "evidence_e12",
+            "evidence_e19"
+          ],
+          "id": "alternative_b",
+          "label": "capability statement",
+          "status": "selected"
+        },
+        "source_record_ids": [
+          "decision_d017",
+          "alternative_b",
+          "evidence_e12",
+          "evidence_e19"
+        ],
+        "supporting_evidence_ids": [
+          "evidence_e12",
+          "evidence_e19"
+        ]
+      },
+      "deterministic": true,
+      "ok": true,
+      "source_record_ids": [
+        "decision_d017",
+        "alternative_b",
+        "evidence_e12",
+        "evidence_e19",
+        "alternative_a",
+        "alternative_c"
+      ]
+    }
+  },
+  "recommendation": {
+    "accepted_criteria": [
+      "SC-001 five deterministic queries passed",
+      "SC-002 rejected alternatives are structured records",
+      "SC-003 evidence provenance is traversable from decision answers",
+      "SC-004 artifact impact identifies Porsche Bid v0.1 Slide 6",
+      "SC-005 later dependent decision is traversable from D-017",
+      "SC-006 Falcon/Porsche concepts stay in example fixture and adapter",
+      "SC-007 recommendation includes observed evidence"
+    ],
+    "decision": "GO",
+    "evidence": [
+      "PASS record_work_object",
+      "PASS record_evidence",
+      "PASS record_decision",
+      "PASS record_alternatives",
+      "PASS record_artifact",
+      "PASS link_later_decision",
+      "PASS query_why_selected",
+      "PASS query_supporting_evidence",
+      "PASS query_rejected_alternatives",
+      "PASS query_influenced_artifacts",
+      "PASS query_later_dependencies"
+    ],
+    "failed_criteria": [],
+    "next_action": "Proceed to S2 Agent Precedent or S3 Godot Decision View only after reviewing the S1 branch.",
+    "observed_semantica_version": "0.6.6",
+    "partial_criteria": [],
+    "risks": [
+      "S1 uses an example-level adapter; production API shape should be decided only after S2 precedent search.",
+      "Rejected alternatives are represented as graph nodes/metadata, not as a Semantica core alternative class."
+    ]
+  },
+  "records": {
+    "alternatives": [
+      {
+        "evidence_ids": [
+          "evidence_e12"
+        ],
+        "id": "alternative_a",
+        "label": "proven Exxeta reference",
+        "reason": "no verified evidence",
+        "status": "rejected"
+      },
+      {
+        "evidence_ids": [
+          "evidence_e12",
+          "evidence_e19"
+        ],
+        "id": "alternative_b",
+        "label": "capability statement",
+        "status": "selected"
+      },
+      {
+        "evidence_ids": [
+          "evidence_e19"
+        ],
+        "id": "alternative_c",
+        "label": "remove claim",
+        "reason": "requirement relevance too high",
+        "status": "rejected"
+      }
+    ],
+    "artifact": {
+      "id": "artifact_porsche_bid_v01_slide_6",
+      "label": "Porsche Bid v0.1 Slide 6",
+      "type": "artifact"
+    },
+    "decision": {
+      "backend_id": "59933688-bf04-4e57-8c47-ec5b3e8452af",
+      "id": "decision_d017",
+      "label": "How should MCP capability be positioned?",
+      "type": "human_decision"
+    },
+    "evidence": [
+      {
+        "id": "evidence_e12",
+        "label": "No verified Exxeta MCP reference was found",
+        "type": "evidence"
+      },
+      {
+        "id": "evidence_e19",
+        "label": "MCP capability remains relevant to the tender requirement",
+        "type": "evidence"
+      }
+    ],
+    "later_decision": {
+      "backend_id": "fd2c48de-ba60-4eb3-8454-e07966b45b4a",
+      "id": "decision_d023",
+      "label": "Reduce strength of MCP claim",
+      "type": "human_decision"
+    },
+    "outcome": {
+      "id": "outcome_d017_pending_review",
+      "label": "Porsche Bid v0.1 Slide 6 uses a capability statement pending executive review.",
+      "type": "outcome"
+    },
+    "work_object": {
+      "id": "porsche_tender_001",
+      "label": "Prepare Porsche Tender",
+      "type": "work_object"
+    }
+  },
+  "schema_version": "falcon-semantica-s1-result/v1",
+  "semantica_version": "0.6.6"
+}

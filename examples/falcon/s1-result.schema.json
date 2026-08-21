@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://falcon.local/contracts/semantica-s1-result.schema.json",
+  "title": "FalconSemanticaS1Result",
+  "type": "object",
+  "required": ["schema_version", "ok", "records", "queries", "recommendation"],
+  "properties": {
+    "schema_version": { "const": "falcon-semantica-s1-result/v1" },
+    "ok": { "type": "boolean" },
+    "semantica_version": { "type": "string" },
+    "records": {
+      "type": "object",
+      "required": ["work_object", "evidence", "decision", "alternatives", "artifact", "outcome", "later_decision"],
+      "properties": {
+        "work_object": { "$ref": "#/$defs/record_ref" },
+        "evidence": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/record_ref" } },
+        "decision": { "$ref": "#/$defs/record_ref" },
+        "alternatives": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/alternative" } },
+        "artifact": { "$ref": "#/$defs/record_ref" },
+        "outcome": { "$ref": "#/$defs/record_ref" },
+        "later_decision": { "$ref": "#/$defs/record_ref" }
+      },
+      "additionalProperties": false
+    },
+    "queries": {
+      "type": "object",
+      "required": ["why_selected", "supporting_evidence", "rejected_alternatives", "influenced_artifacts", "later_dependencies"],
+      "properties": {
+        "why_selected": { "$ref": "#/$defs/query_result" },
+        "supporting_evidence": { "$ref": "#/$defs/query_result" },
+        "rejected_alternatives": { "$ref": "#/$defs/query_result" },
+        "influenced_artifacts": { "$ref": "#/$defs/query_result" },
+        "later_dependencies": { "$ref": "#/$defs/query_result" }
+      },
+      "additionalProperties": false
+    },
+    "recommendation": {
+      "type": "object",
+      "required": ["decision", "observed_semantica_version", "accepted_criteria", "partial_criteria", "failed_criteria", "evidence", "risks", "next_action"],
+      "properties": {
+        "decision": { "enum": ["GO", "DEFER", "REJECT"] },
+        "observed_semantica_version": { "type": "string" },
+        "accepted_criteria": { "type": "array", "items": { "type": "string" } },
+        "partial_criteria": { "type": "array", "items": { "type": "string" } },
+        "failed_criteria": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "risks": { "type": "array", "items": { "type": "string" } },
+        "next_action": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "record_ref": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "backend_id": { "type": "string" },
+        "label": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "alternative": {
+      "type": "object",
+      "required": ["id", "label", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "status": { "enum": ["selected", "rejected"] },
+        "reason": { "type": "string" },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "query_result": {
+      "type": "object",
+      "required": ["ok", "deterministic", "answer", "source_record_ids"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "deterministic": { "const": true },
+        "answer": {},
+        "source_record_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

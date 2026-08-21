@@ -1,0 +1,96 @@
+{
+  "work_object": {
+    "id": "porsche_tender_001",
+    "title": "Prepare Porsche Tender",
+    "target_outcome": "submission-ready bid",
+    "status": "active",
+    "source": "falcon_s1_fixture"
+  },
+  "evidence": [
+    {
+      "id": "evidence_e12",
+      "summary": "No verified Exxeta MCP reference was found",
+      "source_type": "source_search",
+      "source_id": "source_search_mcp_reference",
+      "confidence": 0.91,
+      "supports": ["alternative_b", "alternative_c"],
+      "provenance": {
+        "source_uri": "falcon://research/mcp-reference-search",
+        "captured_by": "research_agent",
+        "captured_at": "2026-08-21T00:00:00Z"
+      }
+    },
+    {
+      "id": "evidence_e19",
+      "summary": "MCP capability remains relevant to the tender requirement",
+      "source_type": "requirement",
+      "source_id": "requirement_r17",
+      "confidence": 0.87,
+      "supports": ["alternative_b"],
+      "provenance": {
+        "source_uri": "falcon://requirements/r17",
+        "captured_by": "requirements_agent",
+        "captured_at": "2026-08-21T00:00:00Z"
+      }
+    }
+  ],
+  "decision": {
+    "id": "decision_d017",
+    "category": "bid_positioning",
+    "scenario": "Position MCP capability in Porsche tender",
+    "question": "How should MCP capability be positioned?",
+    "actor_type": "human",
+    "actor_id": "falk",
+    "selected": "alternative_b",
+    "confidence": 0.86,
+    "rationale": "A capability statement preserves requirement coverage while avoiding an unsupported claim of a proven Exxeta reference.",
+    "outcome": "capability_statement"
+  },
+  "alternatives": [
+    {
+      "id": "alternative_a",
+      "label": "proven Exxeta reference",
+      "status": "rejected",
+      "reason": "no verified evidence",
+      "evidence_ids": ["evidence_e12"]
+    },
+    {
+      "id": "alternative_b",
+      "label": "capability statement",
+      "status": "selected",
+      "evidence_ids": ["evidence_e12", "evidence_e19"]
+    },
+    {
+      "id": "alternative_c",
+      "label": "remove claim",
+      "status": "rejected",
+      "reason": "requirement relevance too high",
+      "evidence_ids": ["evidence_e19"]
+    }
+  ],
+  "artifact": {
+    "id": "artifact_porsche_bid_v01_slide_6",
+    "artifact_type": "pptx_slide",
+    "title": "Porsche Bid v0.1 Slide 6",
+    "target": "Slide 6",
+    "status": "draft"
+  },
+  "outcome": {
+    "id": "outcome_d017_pending_review",
+    "decision_id": "decision_d017",
+    "status": "pending",
+    "summary": "Porsche Bid v0.1 Slide 6 uses a capability statement pending executive review.",
+    "recorded_at": "2026-08-21T00:00:00Z"
+  },
+  "later_decision": {
+    "id": "decision_d023",
+    "category": "bid_wording_review",
+    "summary": "Reduce strength of MCP claim",
+    "question": "Should the MCP claim be softened after review?",
+    "actor_id": "falk",
+    "depends_on": "decision_d017",
+    "relationship_type": "INFLUENCED",
+    "outcome": "revised_claim_strength",
+    "confidence": 0.79
+  }
+}

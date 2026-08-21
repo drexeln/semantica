@@ -1,0 +1,643 @@
+{
+  "edges": [
+    {
+      "familyId": "7e975119-ce6f-5276-b17a-d2a6ecdd15b1",
+      "id": "7e975119-ce6f-5276-b17a-d2a6ecdd15b1",
+      "source": "porsche_tender_001",
+      "target": "evidence_e12",
+      "type": "HAS_EVIDENCE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "af32c525-bcdf-5c4d-9fc4-d1a983e65fd9",
+      "id": "af32c525-bcdf-5c4d-9fc4-d1a983e65fd9",
+      "source": "porsche_tender_001",
+      "target": "evidence_e19",
+      "type": "HAS_EVIDENCE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "b320a44a-a300-5431-b2a3-20b50baec4ae",
+      "id": "b320a44a-a300-5431-b2a3-20b50baec4ae",
+      "metadata": {
+        "confidence": 0.86
+      },
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "porsche_tender_001",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "a6c0dde6-c034-52e8-b32d-544c72ef2200",
+      "id": "a6c0dde6-c034-52e8-b32d-544c72ef2200",
+      "metadata": {
+        "confidence": 0.86
+      },
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "artifact_porsche_bid_v01_slide_6",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "70334c9d-6f9f-58d8-8908-9372ce2d1070",
+      "id": "70334c9d-6f9f-58d8-8908-9372ce2d1070",
+      "metadata": {
+        "confidence": 0.86
+      },
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "evidence_e12",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "67a13105-c1b3-5edb-90cc-b9abe0083af8",
+      "id": "67a13105-c1b3-5edb-90cc-b9abe0083af8",
+      "metadata": {
+        "confidence": 0.86
+      },
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "evidence_e19",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "80e6e3f5-cf6c-5d10-bb73-276e529c8df3",
+      "id": "80e6e3f5-cf6c-5d10-bb73-276e529c8df3",
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "category_bid_positioning",
+      "type": "belongs_to",
+      "weight": 1.0
+    },
+    {
+      "familyId": "c12e1119-fd07-5462-888d-7f2832e53249",
+      "id": "c12e1119-fd07-5462-888d-7f2832e53249",
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "maker_falk",
+      "type": "made_by",
+      "weight": 1.0
+    },
+    {
+      "familyId": "4a89dded-a43d-590e-a355-e66bc1d622be",
+      "id": "4a89dded-a43d-590e-a355-e66bc1d622be",
+      "source": "porsche_tender_001",
+      "target": "decision_d017",
+      "type": "HAS_DECISION",
+      "weight": 1.0
+    },
+    {
+      "familyId": "b30fd59c-cc49-5c3a-9a3c-5c407db1ce32",
+      "id": "b30fd59c-cc49-5c3a-9a3c-5c407db1ce32",
+      "source": "decision_d017",
+      "target": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "type": "BACKED_BY_SEMANTICA_DECISION",
+      "weight": 1.0
+    },
+    {
+      "familyId": "3d6808f1-a53e-5c17-a44f-c1f837fbac52",
+      "id": "3d6808f1-a53e-5c17-a44f-c1f837fbac52",
+      "source": "decision_d017",
+      "target": "alternative_a",
+      "type": "CONSIDERED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "90469d10-ad04-584f-93b1-8a786fdde0f6",
+      "id": "90469d10-ad04-584f-93b1-8a786fdde0f6",
+      "metadata": {
+        "reason": "no verified evidence"
+      },
+      "source": "decision_d017",
+      "target": "alternative_a",
+      "type": "REJECTED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "83475116-5460-5521-9506-af60ca8983ca",
+      "id": "83475116-5460-5521-9506-af60ca8983ca",
+      "source": "evidence_e12",
+      "target": "alternative_a",
+      "type": "INFORMS_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "fb264360-a16d-5ace-b393-d59ad3c96ca5",
+      "id": "fb264360-a16d-5ace-b393-d59ad3c96ca5",
+      "source": "decision_d017",
+      "target": "alternative_b",
+      "type": "CONSIDERED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "92b9fb7a-f23a-5c92-9f63-ce9075bcd17e",
+      "id": "92b9fb7a-f23a-5c92-9f63-ce9075bcd17e",
+      "source": "decision_d017",
+      "target": "alternative_b",
+      "type": "SELECTED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "a0fcac87-d6ca-5c88-aabc-2104643a8ad0",
+      "id": "a0fcac87-d6ca-5c88-aabc-2104643a8ad0",
+      "source": "evidence_e12",
+      "target": "alternative_b",
+      "type": "INFORMS_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "e611ed2a-c219-52ff-b041-f2d1f2ffd10c",
+      "id": "e611ed2a-c219-52ff-b041-f2d1f2ffd10c",
+      "source": "evidence_e19",
+      "target": "alternative_b",
+      "type": "INFORMS_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "177d5765-545d-5f27-b064-879538580492",
+      "id": "177d5765-545d-5f27-b064-879538580492",
+      "source": "decision_d017",
+      "target": "alternative_c",
+      "type": "CONSIDERED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "a7eefa1a-ae04-5ac3-b719-1dd7cb034d8c",
+      "id": "a7eefa1a-ae04-5ac3-b719-1dd7cb034d8c",
+      "metadata": {
+        "reason": "requirement relevance too high"
+      },
+      "source": "decision_d017",
+      "target": "alternative_c",
+      "type": "REJECTED_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "e408cd94-94c6-5135-a884-a9587e7da697",
+      "id": "e408cd94-94c6-5135-a884-a9587e7da697",
+      "source": "evidence_e19",
+      "target": "alternative_c",
+      "type": "INFORMS_ALTERNATIVE",
+      "weight": 1.0
+    },
+    {
+      "familyId": "1651a286-583b-5e95-b107-7c89341a8c74",
+      "id": "1651a286-583b-5e95-b107-7c89341a8c74",
+      "source": "evidence_e12",
+      "target": "decision_d017",
+      "type": "SUPPORTS_DECISION",
+      "weight": 1.0
+    },
+    {
+      "familyId": "f3c668ef-1e59-5f7c-b34f-6576eebaf6a7",
+      "id": "f3c668ef-1e59-5f7c-b34f-6576eebaf6a7",
+      "source": "evidence_e19",
+      "target": "decision_d017",
+      "type": "SUPPORTS_DECISION",
+      "weight": 1.0
+    },
+    {
+      "familyId": "4862346f-4234-5eac-ac2d-14601bf71fc4",
+      "id": "4862346f-4234-5eac-ac2d-14601bf71fc4",
+      "metadata": {
+        "target": "Slide 6"
+      },
+      "source": "decision_d017",
+      "target": "artifact_porsche_bid_v01_slide_6",
+      "type": "INFLUENCED_ARTIFACT",
+      "weight": 1.0
+    },
+    {
+      "familyId": "d8d77dc8-b531-5f14-ae44-433e9d75deab",
+      "id": "d8d77dc8-b531-5f14-ae44-433e9d75deab",
+      "source": "decision_d017",
+      "target": "outcome_d017_pending_review",
+      "type": "PRODUCED_OUTCOME",
+      "weight": 1.0
+    },
+    {
+      "familyId": "9b48fd04-ce4a-5f0b-81aa-eca075a8a95c",
+      "id": "9b48fd04-ce4a-5f0b-81aa-eca075a8a95c",
+      "metadata": {
+        "confidence": 0.79
+      },
+      "source": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "target": "porsche_tender_001",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "c9df1b9b-e9b7-509a-bc5f-22dd5f5172fe",
+      "id": "c9df1b9b-e9b7-509a-bc5f-22dd5f5172fe",
+      "metadata": {
+        "confidence": 0.79
+      },
+      "source": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "target": "artifact_porsche_bid_v01_slide_6",
+      "type": "involves",
+      "weight": 1.0
+    },
+    {
+      "familyId": "f5aa6497-90aa-5348-bd39-de54454f8515",
+      "id": "f5aa6497-90aa-5348-bd39-de54454f8515",
+      "source": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "target": "category_bid_wording_review",
+      "type": "belongs_to",
+      "weight": 1.0
+    },
+    {
+      "familyId": "6ce10983-057e-59cc-b12f-c0f2329bce4b",
+      "id": "6ce10983-057e-59cc-b12f-c0f2329bce4b",
+      "source": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "target": "maker_falk",
+      "type": "made_by",
+      "weight": 1.0
+    },
+    {
+      "familyId": "b9913bba-f9b4-529b-8f07-9f8fbe5d863d",
+      "id": "b9913bba-f9b4-529b-8f07-9f8fbe5d863d",
+      "metadata": {
+        "recorded_at": "2026-08-21T15:50:22.326405"
+      },
+      "source": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "target": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "type": "INFLUENCED",
+      "weight": 1.0
+    },
+    {
+      "familyId": "e31bac52-e21e-5111-83ee-2f03999de1a1",
+      "id": "e31bac52-e21e-5111-83ee-2f03999de1a1",
+      "source": "decision_d017",
+      "target": "decision_d023",
+      "type": "INFLUENCED",
+      "weight": 1.0
+    }
+  ],
+  "nodes": [
+    {
+      "content": "Prepare Porsche Tender",
+      "id": "porsche_tender_001",
+      "metadata": {
+        "source": "falcon_s1_fixture",
+        "status": "active",
+        "target_outcome": "submission-ready bid"
+      },
+      "properties": {
+        "source": "falcon_s1_fixture",
+        "status": "active",
+        "target_outcome": "submission-ready bid"
+      },
+      "type": "work_object"
+    },
+    {
+      "content": "No verified Exxeta MCP reference was found",
+      "id": "evidence_e12",
+      "metadata": {
+        "confidence": 0.91,
+        "provenance": {
+          "captured_at": "2026-08-21T00:00:00Z",
+          "captured_by": "research_agent",
+          "source_uri": "falcon://research/mcp-reference-search"
+        },
+        "source_id": "source_search_mcp_reference",
+        "source_type": "source_search"
+      },
+      "properties": {
+        "confidence": 0.91,
+        "provenance": {
+          "captured_at": "2026-08-21T00:00:00Z",
+          "captured_by": "research_agent",
+          "source_uri": "falcon://research/mcp-reference-search"
+        },
+        "source_id": "source_search_mcp_reference",
+        "source_type": "source_search"
+      },
+      "type": "evidence"
+    },
+    {
+      "content": "MCP capability remains relevant to the tender requirement",
+      "id": "evidence_e19",
+      "metadata": {
+        "confidence": 0.87,
+        "provenance": {
+          "captured_at": "2026-08-21T00:00:00Z",
+          "captured_by": "requirements_agent",
+          "source_uri": "falcon://requirements/r17"
+        },
+        "source_id": "requirement_r17",
+        "source_type": "requirement"
+      },
+      "properties": {
+        "confidence": 0.87,
+        "provenance": {
+          "captured_at": "2026-08-21T00:00:00Z",
+          "captured_by": "requirements_agent",
+          "source_uri": "falcon://requirements/r17"
+        },
+        "source_id": "requirement_r17",
+        "source_type": "requirement"
+      },
+      "type": "evidence"
+    },
+    {
+      "content": "Position MCP capability in Porsche tender",
+      "id": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+      "metadata": {
+        "actor_type": "human",
+        "category": "bid_positioning",
+        "confidence": 0.86,
+        "decision_maker": "falk",
+        "decision_storage_rule": {
+          "do_not_store": [
+            "routine_agent_step",
+            "transient_execution_log",
+            "progress_without_material_choice"
+          ],
+          "store_decision_when": [
+            "changes_scope",
+            "changes_artifact",
+            "changes_priority",
+            "rejects_meaningful_alternative",
+            "requires_human_approval",
+            "triggers_downstream_work",
+            "creates_material_risk",
+            "creates_reusable_precedent"
+          ]
+        },
+        "falcon_record_id": "decision_d017",
+        "outcome": "capability_statement",
+        "question": "How should MCP capability be positioned?",
+        "reasoning": "A capability statement preserves requirement coverage while avoiding an unsupported claim of a proven Exxeta reference.",
+        "rejected_alternative_ids": [
+          "alternative_a",
+          "alternative_c"
+        ],
+        "scenario": "Position MCP capability in Porsche tender",
+        "selected_alternative_id": "alternative_b",
+        "timestamp": 1787327422.326405
+      },
+      "properties": {
+        "actor_type": "human",
+        "category": "bid_positioning",
+        "confidence": 0.86,
+        "decision_maker": "falk",
+        "decision_storage_rule": {
+          "do_not_store": [
+            "routine_agent_step",
+            "transient_execution_log",
+            "progress_without_material_choice"
+          ],
+          "store_decision_when": [
+            "changes_scope",
+            "changes_artifact",
+            "changes_priority",
+            "rejects_meaningful_alternative",
+            "requires_human_approval",
+            "triggers_downstream_work",
+            "creates_material_risk",
+            "creates_reusable_precedent"
+          ]
+        },
+        "falcon_record_id": "decision_d017",
+        "outcome": "capability_statement",
+        "question": "How should MCP capability be positioned?",
+        "reasoning": "A capability statement preserves requirement coverage while avoiding an unsupported claim of a proven Exxeta reference.",
+        "rejected_alternative_ids": [
+          "alternative_a",
+          "alternative_c"
+        ],
+        "scenario": "Position MCP capability in Porsche tender",
+        "selected_alternative_id": "alternative_b",
+        "timestamp": 1787327422.326405
+      },
+      "type": "decision"
+    },
+    {
+      "content": "Porsche Bid v0.1 Slide 6",
+      "id": "artifact_porsche_bid_v01_slide_6",
+      "metadata": {
+        "artifact_type": "pptx_slide",
+        "status": "draft",
+        "target": "Slide 6"
+      },
+      "properties": {
+        "artifact_type": "pptx_slide",
+        "status": "draft",
+        "target": "Slide 6"
+      },
+      "type": "artifact"
+    },
+    {
+      "content": "category_bid_positioning",
+      "id": "category_bid_positioning",
+      "metadata": {
+        "name": "bid_positioning"
+      },
+      "properties": {
+        "name": "bid_positioning"
+      },
+      "type": "category"
+    },
+    {
+      "content": "maker_falk",
+      "id": "maker_falk",
+      "metadata": {
+        "name": "falk"
+      },
+      "properties": {
+        "name": "falk"
+      },
+      "type": "decision_maker"
+    },
+    {
+      "content": "How should MCP capability be positioned?",
+      "id": "decision_d017",
+      "metadata": {
+        "actor_type": "human",
+        "backend_id": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+        "decision_storage_rule": {
+          "do_not_store": [
+            "routine_agent_step",
+            "transient_execution_log",
+            "progress_without_material_choice"
+          ],
+          "store_decision_when": [
+            "changes_scope",
+            "changes_artifact",
+            "changes_priority",
+            "rejects_meaningful_alternative",
+            "requires_human_approval",
+            "triggers_downstream_work",
+            "creates_material_risk",
+            "creates_reusable_precedent"
+          ]
+        },
+        "falcon_record_id": "decision_d017",
+        "question": "How should MCP capability be positioned?",
+        "rejected_alternative_ids": [
+          "alternative_a",
+          "alternative_c"
+        ],
+        "selected_alternative_id": "alternative_b"
+      },
+      "properties": {
+        "actor_type": "human",
+        "backend_id": "0ee0d37d-da89-49b0-8e0a-1ccebc77f09e",
+        "decision_storage_rule": {
+          "do_not_store": [
+            "routine_agent_step",
+            "transient_execution_log",
+            "progress_without_material_choice"
+          ],
+          "store_decision_when": [
+            "changes_scope",
+            "changes_artifact",
+            "changes_priority",
+            "rejects_meaningful_alternative",
+            "requires_human_approval",
+            "triggers_downstream_work",
+            "creates_material_risk",
+            "creates_reusable_precedent"
+          ]
+        },
+        "falcon_record_id": "decision_d017",
+        "question": "How should MCP capability be positioned?",
+        "rejected_alternative_ids": [
+          "alternative_a",
+          "alternative_c"
+        ],
+        "selected_alternative_id": "alternative_b"
+      },
+      "type": "human_decision"
+    },
+    {
+      "content": "proven Exxeta reference",
+      "id": "alternative_a",
+      "metadata": {
+        "evidence_ids": [
+          "evidence_e12"
+        ],
+        "reason": "no verified evidence",
+        "status": "rejected"
+      },
+      "properties": {
+        "evidence_ids": [
+          "evidence_e12"
+        ],
+        "reason": "no verified evidence",
+        "status": "rejected"
+      },
+      "type": "alternative"
+    },
+    {
+      "content": "capability statement",
+      "id": "alternative_b",
+      "metadata": {
+        "evidence_ids": [
+          "evidence_e12",
+          "evidence_e19"
+        ],
+        "reason": "",
+        "status": "selected"
+      },
+      "properties": {
+        "evidence_ids": [
+          "evidence_e12",
+          "evidence_e19"
+        ],
+        "reason": "",
+        "status": "selected"
+      },
+      "type": "alternative"
+    },
+    {
+      "content": "remove claim",
+      "id": "alternative_c",
+      "metadata": {
+        "evidence_ids": [
+          "evidence_e19"
+        ],
+        "reason": "requirement relevance too high",
+        "status": "rejected"
+      },
+      "properties": {
+        "evidence_ids": [
+          "evidence_e19"
+        ],
+        "reason": "requirement relevance too high",
+        "status": "rejected"
+      },
+      "type": "alternative"
+    },
+    {
+      "content": "Porsche Bid v0.1 Slide 6 uses a capability statement pending executive review.",
+      "id": "outcome_d017_pending_review",
+      "metadata": {
+        "decision_id": "decision_d017",
+        "recorded_at": "2026-08-21T00:00:00Z",
+        "status": "pending"
+      },
+      "properties": {
+        "decision_id": "decision_d017",
+        "recorded_at": "2026-08-21T00:00:00Z",
+        "status": "pending"
+      },
+      "type": "outcome"
+    },
+    {
+      "content": "Should the MCP claim be softened after review?",
+      "id": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+      "metadata": {
+        "category": "bid_wording_review",
+        "confidence": 0.79,
+        "decision_maker": "falk",
+        "depends_on": "decision_d017",
+        "falcon_record_id": "decision_d023",
+        "outcome": "revised_claim_strength",
+        "reasoning": "Reduce strength of MCP claim",
+        "scenario": "Should the MCP claim be softened after review?",
+        "timestamp": 1787327422.326405
+      },
+      "properties": {
+        "category": "bid_wording_review",
+        "confidence": 0.79,
+        "decision_maker": "falk",
+        "depends_on": "decision_d017",
+        "falcon_record_id": "decision_d023",
+        "outcome": "revised_claim_strength",
+        "reasoning": "Reduce strength of MCP claim",
+        "scenario": "Should the MCP claim be softened after review?",
+        "timestamp": 1787327422.326405
+      },
+      "type": "decision"
+    },
+    {
+      "content": "category_bid_wording_review",
+      "id": "category_bid_wording_review",
+      "metadata": {
+        "name": "bid_wording_review"
+      },
+      "properties": {
+        "name": "bid_wording_review"
+      },
+      "type": "category"
+    },
+    {
+      "content": "Should the MCP claim be softened after review?",
+      "id": "decision_d023",
+      "metadata": {
+        "backend_id": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+        "depends_on": "decision_d017",
+        "summary": "Reduce strength of MCP claim"
+      },
+      "properties": {
+        "backend_id": "61a8c3ef-f39f-4c8c-b494-71d914616657",
+        "depends_on": "decision_d017",
+        "summary": "Reduce strength of MCP claim"
+      },
+      "type": "human_decision"
+    }
+  ],
+  "statistics": {
+    "edge_count": 30,
+    "node_count": 15
+  }
+}

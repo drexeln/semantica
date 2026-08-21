@@ -306,9 +306,7 @@ def query_later_dependencies(graph: ContextGraph, state: Dict[str, Any]) -> Dict
     return _query_result(answer, [state["decision"]["id"], later["id"]])
 
 
-def build_result(fixture_path: Path | str = DEFAULT_FIXTURE) -> Dict[str, Any]:
-    fixture = load_fixture(fixture_path)
-    graph, state = build_graph(fixture)
+def _result_from_graph_state(graph: ContextGraph, state: Dict[str, Any]) -> Dict[str, Any]:
     queries = {
         "why_selected": query_why_selected(state),
         "supporting_evidence": query_supporting_evidence(state),
@@ -368,6 +366,18 @@ def build_result(fixture_path: Path | str = DEFAULT_FIXTURE) -> Dict[str, Any]:
     }
 
 
+def build_result(fixture_path: Path | str = DEFAULT_FIXTURE) -> Dict[str, Any]:
+    fixture = load_fixture(fixture_path)
+    graph, state = build_graph(fixture)
+    return _result_from_graph_state(graph, state)
+
+
+def build_export_graph(fixture_path: Path | str = DEFAULT_FIXTURE) -> Dict[str, Any]:
+    fixture = load_fixture(fixture_path)
+    graph, _state = build_graph(fixture)
+    return graph.to_dict()
+
+
 def validate_result_shape(result: Dict[str, Any]) -> None:
     required_top = {"schema_version", "ok", "records", "queries", "recommendation"}
     missing_top = required_top - set(result)
@@ -398,9 +408,12 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Falcon Semantica S1 demonstrator")
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--graph-out", type=Path)
     args = parser.parse_args(argv)
 
-    result = build_result(args.fixture)
+    fixture = load_fixture(args.fixture)
+    graph, state = build_graph(fixture)
+    result = _result_from_graph_state(graph, state)
     validate_result_shape(result)
 
     for line in REQUIRED_PASS_LINES:
@@ -408,6 +421,8 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.json_out:
         args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    if args.graph_out:
+        args.graph_out.write_text(json.dumps(graph.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
 
     return 0
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from examples.falcon.porsche_decision_s1 import REQUIRED_PASS_LINES, build_result, main
+from examples.falcon.porsche_decision_s1 import REQUIRED_PASS_LINES, build_export_graph, build_result, main
 
 
 def test_records_complete_porsche_decision_chain() -> None:
@@ -58,3 +58,37 @@ def test_cli_writes_schema_shaped_json_and_pass_lines(tmp_path: Path, capsys) ->
     assert payload["schema_version"] == "falcon-semantica-s1-result/v1"
     assert payload["recommendation"]["decision"] == "GO"
     assert not payload["recommendation"]["failed_criteria"]
+
+
+
+def test_graph_export_contains_explorer_loadable_decision_chain(tmp_path: Path) -> None:
+    graph_payload = build_export_graph()
+
+    node_ids = {node["id"] for node in graph_payload["nodes"]}
+    edge_types = {edge["type"] for edge in graph_payload["edges"]}
+
+    assert graph_payload["statistics"]["node_count"] == 15
+    assert graph_payload["statistics"]["edge_count"] == 30
+    assert {
+        "porsche_tender_001",
+        "decision_d017",
+        "artifact_porsche_bid_v01_slide_6",
+        "decision_d023",
+    } <= node_ids
+    assert {
+        "HAS_DECISION",
+        "SELECTED_ALTERNATIVE",
+        "INFLUENCED_ARTIFACT",
+        "INFLUENCED",
+    } <= edge_types
+
+    result_path = tmp_path / "falcon_s1_result.json"
+    graph_path = tmp_path / "falcon_s1_graph.json"
+
+    assert main(["--json-out", str(result_path), "--graph-out", str(graph_path)]) == 0
+
+    exported = json.loads(graph_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert exported["statistics"]["node_count"] == 15
+    assert exported["statistics"]["edge_count"] == 30
+    assert result["records"]["decision"]["backend_id"] in {node["id"] for node in exported["nodes"]}

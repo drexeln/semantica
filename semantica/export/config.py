@@ -74,10 +74,11 @@ class ExportConfig:
                         self._configs.update(data.get("export", {}))
                         self._method_configs.update(data.get("export_methods", {}))
                 elif config_file.endswith(".toml"):
-                    import toml
+                    # tomllib needs a binary file.
+                    import tomllib
 
-                    with open(config_file, "r") as f:
-                        data = toml.load(f) or {}
+                    with open(config_file, "rb") as f:
+                        data = tomllib.load(f) or {}
                         if "export" in data:
                             self._configs.update(data["export"])
                         if "export_methods" in data:
@@ -105,7 +106,7 @@ class ExportConfig:
             if value:
                 try:
                     if type_func == bool:
-                        self._configs[config_key] = value.lower() in (
+                        self._configs[config_key] = value.strip().lower() in (
                             "true",
                             "1",
                             "yes",
@@ -122,8 +123,8 @@ class ExportConfig:
             if key.startswith(env_prefix) and key not in env_mappings:
                 config_key = key[len(env_prefix) :].lower()
                 # Try to convert to appropriate type
-                if value.lower() in ("true", "false"):
-                    self._configs[config_key] = value.lower() == "true"
+                if value.strip().lower() in ("true", "false"):
+                    self._configs[config_key] = value.strip().lower() == "true"
                 elif value.isdigit():
                     self._configs[config_key] = int(value)
                 else:
@@ -148,12 +149,12 @@ class ExportConfig:
         if value:
             try:
                 # Try to convert to appropriate type
-                if isinstance(default, int):
+                if isinstance(default, bool):
+                    return value.strip().lower() in ("true", "1", "yes", "on")
+                elif isinstance(default, int):
                     return int(value)
                 elif isinstance(default, float):
                     return float(value)
-                elif isinstance(default, bool):
-                    return value.lower() in ("true", "1", "yes", "on")
                 return value
             except (ValueError, TypeError):
                 pass

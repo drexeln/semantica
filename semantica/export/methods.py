@@ -160,14 +160,16 @@ Example Usage:
 """
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from ..utils.exceptions import ProcessingError
 from ..utils.logging import get_logger
+from ..utils.custom_methods import CUSTOM_METHOD_FELL_BACK, call_custom_method
 from .arango_aql_exporter import ArangoAQLExporter
 from .arrow_exporter import ArrowExporter
 from .config import export_config
 from .csv_exporter import CSVExporter
+from .endpoint_names import RELATIONSHIP_COLLECTIONS, canonical_endpoints
 from .graph_exporter import GraphExporter
 from .json_exporter import JSONExporter
 from .lpg_exporter import LPGExporter
@@ -221,12 +223,12 @@ def export_rdf(
     # Check for custom method in registry
     custom_method = method_registry.get("rdf", method)
     if custom_method and custom_method is not export_rdf:
-        try:
-            return custom_method(data, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -270,12 +272,12 @@ def export_json(
     # Check for custom method in registry
     custom_method = method_registry.get("json", method)
     if custom_method and custom_method is not export_json:
-        try:
-            return custom_method(data, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -296,7 +298,7 @@ def export_csv(
     file_path: Union[str, Path],
     method: str = "default",
     **kwargs,
-) -> None:
+) -> Optional[List[Path]]:
     """
     Export data to CSV format (convenience function).
 
@@ -308,6 +310,12 @@ def export_csv(
         method: Export method (default: "default")
         **kwargs: Additional options passed to CSVExporter
 
+    Returns:
+        The files written. A dictionary is written one file per key, so
+        ``file_path`` is a base name there and this is how the caller learns
+        what was actually produced. A registered custom method's own result is
+        returned in its place.
+
     Examples:
         >>> from semantica.export.methods import export_csv
         >>> export_csv(entities, "entities.csv")
@@ -316,12 +324,12 @@ def export_csv(
     # Check for custom method in registry
     custom_method = method_registry.get("csv", method)
     if custom_method and custom_method is not export_csv:
-        try:
-            return custom_method(data, file_path, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -329,7 +337,7 @@ def export_csv(
         config.update(kwargs)
 
         exporter = CSVExporter(**config)
-        exporter.export(data, file_path, **kwargs)
+        return exporter.export(data, file_path, **kwargs)
 
     except Exception as e:
         logger.error(f"Failed to export CSV: {e}")
@@ -341,7 +349,7 @@ def export_arrow(
     file_path: Union[str, Path],
     method: str = "default",
     **kwargs,
-) -> None:
+) -> Optional[List[Path]]:
     """
     Export data to Apache Arrow format (convenience function).
 
@@ -353,6 +361,12 @@ def export_arrow(
         method: Export method (default: "default")
         **kwargs: Additional options passed to ArrowExporter
 
+    Returns:
+        The files written. A dictionary is written one file per key, so
+        ``file_path`` is a base name there and this is how the caller learns
+        what was actually produced. A registered custom method's own result is
+        returned in its place.
+
     Examples:
         >>> from semantica.export.methods import export_arrow
         >>> export_arrow(entities, "entities.arrow")
@@ -361,12 +375,12 @@ def export_arrow(
     # Check for custom method in registry
     custom_method = method_registry.get("arrow", method)
     if custom_method and custom_method is not export_arrow:
-        try:
-            return custom_method(data, file_path, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -374,7 +388,7 @@ def export_arrow(
         config.update(kwargs)
 
         exporter = ArrowExporter(**config)
-        exporter.export(data, file_path, **kwargs)
+        return exporter.export(data, file_path, **kwargs)
 
     except Exception as e:
         logger.error(f"Failed to export Arrow: {e}")
@@ -387,7 +401,7 @@ def export_parquet(
     compression: str = "snappy",
     method: str = "default",
     **kwargs,
-) -> None:
+) -> Optional[List[Path]]:
     """
     Export data to Apache Parquet format (convenience function).
 
@@ -407,6 +421,12 @@ def export_parquet(
         method: Export method (default: "default")
         **kwargs: Additional options passed to ParquetExporter
 
+    Returns:
+        The files written. A dictionary is written one file per key, so
+        ``file_path`` is a base name there and this is how the caller learns
+        what was actually produced. A registered custom method's own result is
+        returned in its place.
+
     Examples:
         >>> from semantica.export.methods import export_parquet
         >>> export_parquet(entities, "entities.parquet", compression="snappy")
@@ -421,12 +441,12 @@ def export_parquet(
     # Check for custom method in registry
     custom_method = method_registry.get("parquet", method)
     if custom_method and custom_method is not export_parquet:
-        try:
-            return custom_method(data, file_path, compression=compression, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, compression=compression, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -434,7 +454,7 @@ def export_parquet(
         config.update(kwargs)
 
         exporter = ParquetExporter(compression=compression, **config)
-        exporter.export(data, file_path, **kwargs)
+        return exporter.export(data, file_path, **kwargs)
 
     except Exception as e:
         logger.error(f"Failed to export Parquet: {e}")
@@ -472,12 +492,12 @@ def export_graph(
     # Check for custom method in registry
     custom_method = method_registry.get("graph", method)
     if custom_method and custom_method is not export_graph:
-        try:
-            return custom_method(graph_data, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, graph_data, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -538,12 +558,12 @@ def export_yaml(
     # Check for custom method in registry
     custom_method = method_registry.get("yaml", method)
     if custom_method and custom_method is not export_yaml:
-        try:
-            return custom_method(data, file_path, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -595,12 +615,12 @@ def export_owl(
     # Check for custom method in registry
     custom_method = method_registry.get("owl", method)
     if custom_method and custom_method is not export_owl:
-        try:
-            return custom_method(ontology, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, ontology, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -647,12 +667,12 @@ def export_vector(
     # Check for custom method in registry
     custom_method = method_registry.get("vector", method)
     if custom_method and custom_method is not export_vector:
-        try:
-            return custom_method(vectors, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, vectors, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -695,12 +715,12 @@ def export_lpg(
     # Check for custom method in registry
     custom_method = method_registry.get("lpg", method)
     if custom_method and custom_method is not export_lpg:
-        try:
-            return custom_method(knowledge_graph, file_path, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, knowledge_graph, file_path, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -738,12 +758,12 @@ def export_neo4j_csv(
     """
     custom_method = method_registry.get("neo4j_csv", method)
     if custom_method and custom_method is not export_neo4j_csv:
-        try:
-            return custom_method(knowledge_graph, output_dir, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, knowledge_graph, output_dir, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         config = export_config.get_method_config("neo4j_csv")
@@ -808,12 +828,12 @@ def export_arango(
     # Check for custom method in registry
     custom_method = method_registry.get("arango", method)
     if custom_method and custom_method is not export_arango:
-        try:
-            return custom_method(knowledge_graph, file_path, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, knowledge_graph, file_path, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -859,12 +879,12 @@ def generate_report(
     # Check for custom method in registry
     custom_method = method_registry.get("report", method)
     if custom_method and custom_method is not generate_report:
-        try:
-            return custom_method(data, file_path, format=format, **kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Custom method {method} failed: {e}, falling back to default"
-            )
+        fallback = kwargs.pop("fallback_on_custom_error", False)
+        result = call_custom_method(
+            logger, method, custom_method, data, file_path, format=format, fallback_on_custom_error=fallback, **kwargs
+        )
+        if result is not CUSTOM_METHOD_FELL_BACK:
+            return result
 
     try:
         # Get config
@@ -880,13 +900,52 @@ def generate_report(
         raise
 
 
+# Collections whose records carry relationship endpoints, and the endpoint
+# names themselves, live in endpoint_names so the exporters that classify or
+# rewrite records share one table instead of keeping their own copy.
+
+
+# Formats whose route writes one file per collection instead of ``file_path``
+# and returns the files it wrote, so a caller can report or read the real output
+# rather than the base name it passed. A caller with room for one artifact
+# (stdout, a single compressed file) cannot take their output, so it is told
+# before the export runs rather than after. Kept beside the routing table it
+# describes; a test checks it against what the routes actually write.
+MULTI_FILE_FORMATS: Tuple[str, ...] = ("arrow", "csv", "parquet")
+
+
+def _one_collection_per_kind(
+    knowledge_graph: Union[Dict[str, Any], List[Dict[str, Any]]],
+) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+    """Give a dictionary one collection per kind, not one per spelling.
+
+    A knowledge graph arrives under the ``entities``/``relationships`` names or
+    the ``nodes``/``edges`` ones, and the command hands over both because the
+    exporters it routes to read different pairs. Arrow and Parquet write one
+    file per key, so an alias holding the same collection as its canonical name
+    is written a second time. An alias holding something else is left alone: it
+    is a second collection, not a second spelling of the first.
+    """
+    if not isinstance(knowledge_graph, dict):
+        return knowledge_graph
+
+    projected = dict(knowledge_graph)
+    for alias, canonical in (("nodes", "entities"), ("edges", "relationships")):
+        if alias not in projected or canonical not in projected:
+            continue
+        alias_value, canonical_value = projected[alias], projected[canonical]
+        if alias_value is canonical_value or alias_value == canonical_value:
+            del projected[alias]
+    return projected
+
+
 def export_knowledge_graph(
     knowledge_graph: Dict[str, Any],
     file_path: Union[str, Path],
-    format: str = "json",
+    format: Optional[str] = None,
     method: Optional[str] = None,
     **kwargs,
-) -> None:
+) -> Optional[List[Path]]:
     """
     Export knowledge graph to specified format (unified convenience function).
 
@@ -895,31 +954,60 @@ def export_knowledge_graph(
 
     Args:
         knowledge_graph: Knowledge graph dictionary with entities and
-            relationships
+            relationships. Relationships may name their endpoints with any of
+            the spellings the graph stores use (``source_id``, ``source``,
+            ``start_node_id``, ``start_id``, ``from``, and the target-side
+            equivalents); they are normalized to ``source_id``/``target_id``
+            before routing, since that is all the serializers understand.
         file_path: Output file path (format auto-detected from extension
             if format not specified)
         format: Export format (auto-detected from file extension if not
             specified)
             - "json", "json-ld": JSONExporter
             - "csv": CSVExporter
+            - "parquet": ParquetExporter
+            - "arrow": ArrowExporter
             - "ttl", "turtle": RDFExporter (turtle)
             - "rdf", "rdfxml": RDFExporter (rdfxml)
             - "graphml": GraphExporter (graphml)
             - "gexf": GraphExporter (gexf)
             - "dot": GraphExporter (dot)
             - "yaml", "yml": YAML exporters
-            - "owl": OWLExporter
+            - "owl", "owl-xml": OWLExporter, which takes an ontology dictionary
+              rather than a knowledge graph; a graph with no classes exports no
+              classes
             - "cypher": LPGExporter
-            - "aql": ArangoAQLExporter
-        method: Optional specific export method
+            - "aql", "arangodb": ArangoAQLExporter
+        method: Optional specific export method. Left as ``None``, each
+            exporter keeps its own default rather than being handed a value
+            the caller never chose.
         **kwargs: Additional options passed to exporter
+
+        Returns:
+            The files an Arrow or Parquet route wrote, so a caller can report
+            or read them instead of the base name it passed; one file per
+            collection, which is not ``file_path``. The other routes write
+            ``file_path`` itself and return ``None``.
 
     Examples:
         >>> from semantica.export.methods import export_knowledge_graph
         >>> export_knowledge_graph(kg, "output.json", format="json")
         >>> export_knowledge_graph(kg, "output.ttl", format="turtle")
+        >>> export_knowledge_graph(kg, "output.ttl")   # extension decides
         >>> export_knowledge_graph(kg, "output.cypher", format="cypher")
     """
+    # Store-shaped relationship records carry their endpoints under names the
+    # serializers do not know. Normalize once here rather than in each exporter:
+    # this function is the single entry point every caller goes through, and the
+    # RDF serializers, the tabular exporters and the pass-through exporters
+    # (JSON, CSV, YAML) each read the records differently.
+    if isinstance(knowledge_graph, dict):
+        for key in RELATIONSHIP_COLLECTIONS:
+            collection = knowledge_graph.get(key)
+            canonical = canonical_endpoints(collection)
+            if canonical is not collection:
+                knowledge_graph = {**knowledge_graph, key: canonical}
+
     # Auto-detect format from file extension if not specified
     if not format:
         file_path_obj = Path(file_path)
@@ -929,6 +1017,7 @@ def export_knowledge_graph(
             ".jsonld": "json-ld",
             ".csv": "csv",
             ".ttl": "turtle",
+            ".nt": "ntriples",
             ".rdf": "rdfxml",
             ".graphml": "graphml",
             ".gexf": "gexf",
@@ -939,34 +1028,74 @@ def export_knowledge_graph(
             ".cypher": "cypher",
             ".aql": "aql",
             ".parquet": "parquet",
+            ".arrow": "arrow",
         }
         format = format_map.get(ext, "json")
 
+    # Forward ``method`` only when the caller actually set it. Passing an
+    # explicit None would overwrite the default each wrapper declares for
+    # itself, which is how ``format="yaml"`` used to raise.
+    def _method_kwargs() -> Dict[str, Any]:
+        return {} if method is None else {"method": method}
+
+    # Arrow and Parquet write one file per collection rather than one file at
+    # ``file_path``, so a caller that has to report or consume the output needs
+    # the paths back instead of the base name it passed.
+    written: Optional[List[Path]] = None
+
     # Route to appropriate exporter
     if format in ["json", "json-ld"]:
-        export_json(knowledge_graph, file_path, format=format, method=method, **kwargs)
+        export_json(knowledge_graph, file_path, format=format, **_method_kwargs(), **kwargs)
     elif format == "csv":
-        export_csv(knowledge_graph, file_path, method=method, **kwargs)
+        written = export_csv(
+            _one_collection_per_kind(knowledge_graph),
+            file_path,
+            **_method_kwargs(),
+            **kwargs,
+        )
     elif format in ["turtle", "rdfxml", "jsonld", "ntriples", "n3"]:
-        export_rdf(knowledge_graph, file_path, format=format, method=method, **kwargs)
+        export_rdf(knowledge_graph, file_path, format=format, **_method_kwargs(), **kwargs)
     elif format in ["graphml", "gexf", "dot"]:
-        export_graph(knowledge_graph, file_path, format=format, method=method, **kwargs)
+        export_graph(knowledge_graph, file_path, format=format, **_method_kwargs(), **kwargs)
     elif format in ["yaml", "yml"]:
-        export_yaml(knowledge_graph, file_path, method=method, **kwargs)
+        export_yaml(knowledge_graph, file_path, **_method_kwargs(), **kwargs)
     elif format in ["owl-xml", "owl"]:
-        export_owl(knowledge_graph, file_path, format=format, method=method, **kwargs)
+        # OWLExporter accepts "owl-xml" or "turtle". The extension map and the
+        # docs already call the default "owl-xml", so the short name is
+        # normalized the same way instead of being forwarded and rejected.
+        export_owl(
+            knowledge_graph,
+            file_path,
+            format="owl-xml" if format == "owl" else format,
+            **_method_kwargs(),
+            **kwargs,
+        )
     elif format == "cypher":
-        export_lpg(knowledge_graph, file_path, method=method, **kwargs)
+        export_lpg(knowledge_graph, file_path, **_method_kwargs(), **kwargs)
     elif format in ["neo4j_csv", "neo4j-csv"]:
         # file_path is treated as the output directory; nodes.csv and
         # relationships.csv are written inside it.
-        export_neo4j_csv(knowledge_graph, file_path, method=method, **kwargs)
-    elif format == "aql":
-        export_arango(knowledge_graph, file_path, method=method, **kwargs)
+        export_neo4j_csv(knowledge_graph, file_path, **_method_kwargs(), **kwargs)
+    elif format in ["aql", "arangodb"]:
+        export_arango(knowledge_graph, file_path, **_method_kwargs(), **kwargs)
+    elif format == "arrow":
+        written = export_arrow(
+            _one_collection_per_kind(knowledge_graph),
+            file_path,
+            **_method_kwargs(),
+            **kwargs,
+        )
     elif format == "parquet":
-        export_parquet(knowledge_graph, file_path, method=method, **kwargs)
+        written = export_parquet(
+            _one_collection_per_kind(knowledge_graph),
+            file_path,
+            **_method_kwargs(),
+            **kwargs,
+        )
     else:
         raise ProcessingError(f"Unknown export format: {format}")
+
+    return written
 
 
 def get_export_method(task: str, name: str) -> Optional[Callable]:

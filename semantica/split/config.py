@@ -77,10 +77,11 @@ class SplitConfig:
                         self._configs.update(data.get("split", {}))
                         self._method_configs.update(data.get("split_methods", {}))
                 elif config_file.endswith(".toml"):
-                    import toml
+                    # tomllib needs a binary file.
+                    import tomllib
 
-                    with open(config_file, "r") as f:
-                        data = toml.load(f) or {}
+                    with open(config_file, "rb") as f:
+                        data = tomllib.load(f) or {}
                         if "split" in data:
                             self._configs.update(data["split"])
                         if "split_methods" in data:
@@ -123,12 +124,12 @@ class SplitConfig:
         if value:
             try:
                 # Try to convert to appropriate type
-                if isinstance(default, int):
+                if isinstance(default, bool):
+                    return value.strip().lower() in ("true", "1", "yes", "on")
+                elif isinstance(default, int):
                     return int(value)
                 elif isinstance(default, float):
                     return float(value)
-                elif isinstance(default, bool):
-                    return value.lower() in ("true", "1", "yes", "on")
                 return value
             except (ValueError, TypeError):
                 pass

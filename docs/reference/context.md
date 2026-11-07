@@ -25,32 +25,33 @@ icon: "brain"
 | `DecisionRecorder` | Record decisions with embeddings, causal chains, and metadata |
 | `PolicyEngine` | Policy management: `add_policy()`, `check_compliance()`, `get_applicable_policies()` |
 | `CausalChainAnalyzer` | Trace how decisions influenced each other: `get_causal_chain(decision_id)` |
+| `ErasureCoordinator` | Erase an entity across graph, memory, and vector store, returning an auditable `ErasureReceipt` |
 
 
 ## What You Get
 
-- **AgentContext** — Memory, decision tracking, and graph-backed retrieval behind one API
+- **AgentContext**: memory, decision tracking, and graph-backed retrieval behind one API
   - Conversation history and checkpoint diffing
   - Persist and restore full context state to disk
-- **ContextGraph** — Thread-safe in-memory knowledge graph
+- **ContextGraph**: thread-safe in-memory knowledge graph
   - PageRank, centrality, community detection, temporal validity
   - Cross-graph navigation and link traversal
-- **AgentMemory** — Embedding-backed memory with retention policy
+- **AgentMemory**: embedding-backed memory with retention policy
   - LRU eviction at configurable `max_memory_size`
   - Per-conversation history isolation
-- **DecisionRecorder** — Records decisions with causal chains and confidence scores
+- **DecisionRecorder**: records decisions with causal chains and confidence scores
   - Temporal validity windows (`valid_from` / `valid_until`)
   - Cross-system context capture on every decision
-- **PolicyEngine** — Versioned policy storage in the knowledge graph
+- **PolicyEngine**: versioned policy storage in the knowledge graph
   - Compliance checking against recorded decisions
   - Policy exception tracking with approver audit trail
-- **EntityLinker** — Maps entity text to stable URIs
+- **EntityLinker**: maps entity text to stable URIs
   - Creates typed links between entity IDs
   - Prevents "Apple", "Apple Inc.", "AAPL" becoming separate nodes
-- **ContextRetriever** — Fuses vector similarity, graph traversal, and agent memory
+- **ContextRetriever**: fuses vector similarity, graph traversal, and agent memory
   - Richer context than pure vector search
   - Configurable `hybrid_alpha` and expansion hops
-- **CausalChainAnalyzer** — Traces upstream causes and downstream effects of any decision
+- **CausalChainAnalyzer**: traces upstream causes and downstream effects of any decision
   - Explainability paths with relationship types
   - Configurable depth and direction
 
@@ -211,7 +212,10 @@ icon: "brain"
     Add versioned compliance policies and gate every decision against them before recording.
 
     ```python
+    from datetime import datetime
+
     from semantica.context import AgentContext, ContextGraph, PolicyEngine
+    from semantica.context.decision_models import Decision, Policy
     from semantica.vector_store import VectorStore
 
     context = AgentContext(
@@ -220,29 +224,41 @@ icon: "brain"
         decision_tracking=True,
     )
 
-    engine = PolicyEngine(knowledge_graph=context.knowledge_graph)
+    engine = PolicyEngine(graph_store=context.knowledge_graph)
 
-    engine.add_policy(
-        name="data_privacy",
+    engine.add_policy(Policy(
+        policy_id="data_privacy",
+        name="Data Privacy",
         description="No PII stored without user consent flag",
-        version="1.2",
-        effective_date="2024-01-01",
+        rules={"required_user_consent": True, "max_retention_days": 90},
         category="privacy",
-        rules={"requires_consent": True, "max_retention_days": 90},
+        version="1.2",
+        created_at=datetime(2024, 1, 1),
+        updated_at=datetime(2024, 1, 1),
+    ))
+
+    decision = Decision(
+        decision_id="dec_store_email",
+        category="data_storage",
+        scenario="Store user profile",
+        reasoning="User opted in to profile storage",
+        outcome="stored",
+        confidence=1.0,
+        timestamp=datetime.now(),
+        decision_maker="profile_agent",
+        metadata={"user_consent": True, "retention_days": 30},
     )
 
-    decision_data = {"action": "store_user_email", "user_consent": True}
-    result = engine.check_compliance(decision_data, policy_names=["data_privacy"])
-
-    if result["compliant"]:
+    if engine.check_compliance(decision, "data_privacy"):
         context.record_decision(
-            category="data_storage",
-            scenario="Store user profile",
-            outcome="stored",
-            confidence=1.0,
+            category=decision.category,
+            scenario=decision.scenario,
+            reasoning=decision.reasoning,
+            outcome=decision.outcome,
+            confidence=decision.confidence,
         )
     else:
-        print("Blocked by policy:", result["violations"])
+        print("Blocked by policy: data_privacy")
     ```
   </Tab>
 </Tabs>
@@ -272,7 +288,7 @@ icon: "brain"
 </Tip>
 
 <Tip>
-  **Persist your context between runs.** `VectorStore` does not auto-persist — passing `index_path=` to its constructor is a no-op. Call `context.save("agent_state/")` to write memory, the vector index, and the graph to disk, and `context.load("agent_state/")` on the next process to restore them. See the "Persist & Restore" tab under [Real-World Patterns](#real-world-patterns) below.
+  **Persist your context between runs.** `VectorStore` does not auto-persist; passing `index_path=` to its constructor is a no-op. Call `context.save("agent_state/")` to write memory, the vector index, and the graph to disk, and `context.load("agent_state/")` on the next process to restore them. See the "Persist & Restore" tab under [Real-World Patterns](#real-world-patterns) below.
 </Tip>
 
 ### Memory Methods
@@ -435,8 +451,8 @@ print("Nodes: {}, Edges: {}".format(stats["node_count"], stats["edge_count"]))
 | `query(query, skip, limit)` | `List[Dict]` | Full-text search over node content |
 | `stats()` | `Dict` | Node/edge counts, type breakdowns, graph density |
 | `density()` | `float` | Graph density score |
-| `save_to_file(path)` | `None` | Persist graph to JSON |
-| `load_from_file(path)` | `None` | Load graph from JSON |
+| `save_to_file(path, format="json")` | `None` | Persist graph as JSON or a Markdown directory |
+| `load_from_file(path, format="json")` | `None` | Replace graph state from JSON or a Markdown directory |
 | `build_from_conversations(conversations, link_entities)` | `Dict` | Build graph from conversation data |
 | `link_graph(other_graph, source_node_id, target_node_id, link_type)` | `str` | Create cross-graph navigation link; returns `link_id` |
 | `navigate_to(link_id)` | `Tuple` | Follow a cross-graph link to `(target_graph, target_node_id)` |
@@ -448,7 +464,7 @@ print("Nodes: {}, Edges: {}".format(stats["node_count"], stats["edge_count"]))
 `ContextGraph` exposes a full Distance Intelligence API for exploring semantic neighborhoods and blending proximity into retrieval.
 
 <Info>
-  Full Distance Intelligence reference — distance matrices, API endpoints, embedding cache, Explorer UI — is covered in the dedicated [Distance Intelligence](distance) page. This section documents the context-layer API.
+  Full Distance Intelligence reference (distance matrices, API endpoints, embedding cache, Explorer UI) is covered in the dedicated [Distance Intelligence](/reference/distance) page. This section documents the context-layer API.
 </Info>
 
 ### Neighbors with Distance Metadata
@@ -479,7 +495,7 @@ for n in neighbors:
 | Added field | Type | Description |
 | :---------- | :---- | :----------- |
 | `distance_band` | `str` | `"direct"` (1 hop) / `"near"` (2) / `"mid-range"` (3–4) / `"distant"` (5+) |
-| `confidence_decay` | `float` | `edge_weight ^ hop_count` — decays with each hop |
+| `confidence_decay` | `float` | `edge_weight ^ hop_count`; decays with each hop |
 | `path_to_anchor` | `List[str]` | Shortest path from anchor node to this neighbor |
 | `hop_count` | `int` | BFS depth from anchor |
 
@@ -625,11 +641,107 @@ malformed or duplicate fields before changing memory, and re-importing unchanged
 files is idempotent. Memory-local `entities` and `relationships` are preserved as
 provenance but are not applied to `ContextGraph` by Markdown import. Use a dedicated
 export directory: matching files are overwritten, but unrelated or stale Markdown
-files are not deleted automatically. Export refuses to overwrite symbolic links and
-uses atomic file replacement. Timestamp offsets are preserved in Markdown and
+files are not deleted automatically. Export refuses to overwrite filesystem links and
+uses atomic file replacement; import also refuses symlinks, Windows directory
+junctions, and other Windows reparse points.
+Timestamp offsets are preserved in Markdown and
 normalized to UTC only for comparisons, so aware and local-naive records can be
 queried together safely. Vector-store writes are deferred until the in-memory import
 commits; adapter synchronization remains best-effort and logs failures.
+
+
+## ErasureCoordinator
+
+`ContextGraph.purge_node()` is scoped to one graph: the node is removed and a
+tombstone is written, but the same content can still be live as an `AgentMemory`
+item and as an embedding in the vector store. `ErasureCoordinator` drives the
+cascade across every bound store and returns an `ErasureReceipt` recording what
+each one reported.
+
+```python
+from semantica.context import AgentMemory, ContextGraph, ErasureCoordinator
+
+coordinator = ErasureCoordinator(graph=graph, memory=memory)
+
+receipt = coordinator.erase_entity(
+    "customer-4471",
+    reason="GDPR Art. 17 request #882",
+)
+
+if not receipt.complete:
+    # These stores may still hold the entity; handle them out of band.
+    print(receipt.incomplete_stores)
+```
+
+<Warning>
+Check the receipt. The call returning is not proof the data is gone. FAISS,
+Milvus, and Weaviate expose no delete method, so erasure cannot be completed on
+those backends today; the receipt reports `unsupported` rather than a success it
+did not achieve.
+</Warning>
+
+### Constructor Parameters
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `graph` | `ContextGraph` | `None` | Anything exposing `purge_node()` |
+| `memory` | `AgentMemory` | `None` | Anything exposing `find_by_entity()` and `batch_delete()` |
+| `vector_store` | `VectorStore` | `memory.vector_store` | Store holding entity-keyed embeddings; pass `False` to disable the leg |
+
+At least one store is required; a store that is not supplied reports
+`not_configured` rather than being silently skipped.
+
+### Methods
+
+| Method | Returns | Description |
+| :--- | :--- | :--- |
+| `erase_entity(entity_id, reason, at, vector_ids)` | `ErasureReceipt` | Erase one entity from every bound store |
+| `erase_entities(entity_ids, reason, at)` | `List[ErasureReceipt]` | One receipt per entity, in order; one failure does not stop the rest |
+
+### Store Statuses
+
+| Status | Meaning |
+| :--- | :--- |
+| `erased` | Reached, data removed. On the vectors leg this means the store accepted the delete for the ids given; backends offer no portable existence check, so it is not a count of embeddings that were really there |
+| `not_found` | Reached, held nothing for this entity |
+| `not_configured` | No such store was bound: normal, not a failure |
+| `unsupported` | The store cannot delete at all; retrying will not help |
+| `failed` | The store was reached and the deletion did not succeed |
+
+### ErasureReceipt
+
+| Member | Type | Description |
+| :--- | :--- | :--- |
+| `entity_id` | `str` | Entity the erasure was requested for |
+| `reason` | `Optional[str]` | Recorded in the receipt and the graph tombstone |
+| `erased_at` | `str` | ISO-8601; matches the tombstone's `purged_at` |
+| `stores` | `Dict[str, Dict]` | Per-store outcome keyed `vectors`, `memory`, `graph` |
+| `complete` | `bool` | `False` when any store reports `unsupported` or `failed` |
+| `incomplete_stores` | `List[str]` | Stores that may still hold the entity's data |
+| `to_dict()` | `Dict` | Serialized receipt, safe to persist as an audit record |
+
+```python
+receipt.to_dict()
+# {
+#   "entity_id": "customer-4471",
+#   "reason": "GDPR Art. 17 request #882",
+#   "erased_at": "2026-08-16T09:03:36.813220",
+#   "complete": False,
+#   "stores": {
+#     "vectors": {"status": "unsupported", "backend": "faiss",
+#                 "detail": "backend exposes no delete()/delete_vectors(); ..."},
+#     "memory":  {"status": "erased", "items": 14},
+#     "graph":   {"status": "erased", "nodes": 1, "edges": 3},
+#   },
+# }
+```
+
+Erasure runs outward-in: vectors, then memory, then the graph. The tombstone is
+the durable attestation that an erasure happened, so it is written last: a crash
+mid-cascade leaves the node present and the receipt incomplete, rather than a
+tombstone claiming more than actually happened. A store that raises is recorded
+as `failed` and the remaining stores are still erased. Erasing the same entity
+twice returns a receipt saying there was nothing left to do rather than raising.
 
 
 ## PolicyEngine
@@ -758,6 +870,146 @@ results = retriever.retrieve(
 for r in results:
     print("[{}] score={:.3f}: {}".format(r.source, r.score, r.content[:80]))
 ```
+
+
+## Support-Aware Retrieval (`truth_filter`)
+
+Cached vector or memory content can outlive the evidence that originally
+supported it. `ContextRetriever.retrieve(..., truth_filter=...)` accepts an
+opt-in `TruthMaintenanceContextFilter` that removes candidates whose declared
+dependencies are no longer supported, **before** ranking, while the stored
+records themselves are never modified.
+
+The example below runs standalone with no model, database, or network —
+only `semantica` itself:
+
+```python
+from semantica.context import ContextRetriever, TruthMaintenanceContextFilter
+from semantica.reasoning import FactSupport, Rule, TruthMaintenanceSession
+
+# A tiny read-only store standing in for any real vector backend.
+class StaticVectorStore:
+    def __init__(self, rows):
+        self.rows = [dict(row) for row in rows]
+
+    def search(self, *, query, limit):
+        return self.rows[:limit]
+
+def annotated_row(identifier, fact, score, text):
+    """One record whose content depends on one live fact."""
+    return {
+        "id": identifier,
+        "score": score,
+        "content": text,
+        "metadata": {
+            "truth_maintenance": {
+                "schema_version": 1,
+                "session_id": "employment-session-1",
+                "required_facts": [fact],
+                "required_support_ids": [],
+            }
+        },
+    }
+
+rules = [
+    Rule(
+        rule_id="employment",
+        name="employment",
+        conditions=["Employed(?x)"],
+        conclusion="Eligible(?x)",
+    ),
+]
+session = TruthMaintenanceSession(rules=rules)
+session.apply(assertions=[FactSupport("v1", "Employed(Alice)")])
+
+store = StaticVectorStore([
+    annotated_row("cached", "Eligible(Alice)", 0.9, "Alice is eligible"),
+])
+retriever = ContextRetriever(vector_store=store, use_graph_expansion=False)
+gate = TruthMaintenanceContextFilter(session, session_id="employment-session-1")
+
+checked = retriever.retrieve("eligibility", truth_filter=gate)
+assert [result.content for result in checked] == ["Alice is eligible"]
+assert (
+    checked[0].metadata["truth_maintenance_validation"]["version"]
+    == session.version
+)
+
+# The supporting evidence is withdrawn. The vector record stays stored,
+# but it no longer reaches the caller through the checked retrieval.
+session.apply(retractions=["v1"])
+checked = retriever.retrieve("eligibility", truth_filter=gate)
+assert checked == []
+assert store.rows[0]["content"] == "Alice is eligible"  # record untouched
+```
+
+### Manual annotation semantics
+
+The filter only validates what the application explicitly wrote into store
+metadata. It never infers dependencies, and it never annotates records on
+your behalf:
+
+- Each candidate must carry `metadata["truth_maintenance"]` with exactly four
+  keys: `schema_version` (currently `1`), `session_id` (must equal the
+  filter's `session_id`), `required_facts`, and `required_support_ids`.
+  At least one fact or support ID must be declared.
+- A candidate is kept only if every entry of `required_facts` is in the
+  snapshot's `facts` **and** every entry of `required_support_ids` is in the
+  snapshot's active supports. Unannotated candidates and candidates with malformed annotations
+  are removed whole — a record ID or node ID is never a trust signal.
+
+### Source-specific citations
+
+Two records may assert the same conclusion but cite different sources.
+`required_support_ids` binds each record to the evidence it actually used, so
+withdrawing one support invalidates only the records citing it, while records
+backed by an alternative derivation or an explicit support are kept.
+
+### Graph bundles
+
+For candidates retrieved from a `ContextGraph`, the root record **and** every
+member of `related_entities` / `related_relationships` must carry the same
+annotation shape on their own `metadata`. If the root or any attachment is
+unsupported, the entire candidate is excluded — a result never keeps its prose
+while silently dropping a stale attachment.
+
+### Behavior details
+
+- Filtering happens before ranking and before the legacy merge: a
+  high-scoring stale record cannot crowd out valid lower-scoring records,
+  and dependency metadata survives merging.
+- Survivors are returned as deep copies stamped with
+  `metadata["truth_maintenance_validation"]` (`session_id`, `version`).
+  Original candidates and stored records are never modified.
+- Each call validates against one immutable snapshot; if the session commits
+  a new version while retrieval is in flight, `retrieve` raises
+  `ProcessingError` instead of returning mixed-version results.
+- Vector, memory, and graph sources are filtered in the same pass: construct
+  the retriever with `memory_store=` or `knowledge_graph=` and pass
+  `truth_filter=` to `retrieve`, or to the `search`, `vector_search`, and
+  `graph_search` delegates (they forward to `retrieve`). `memory_search`
+  bypasses `retrieve` and does **not** apply the filter — use `retrieve` when
+  memory results must be grounded.
+
+### Unsupported entry points
+
+The filter is supported only by `ContextRetriever.retrieve(mode="local", ...)`
+(the default mode) and delegates that use that path. Passing `truth_filter` to
+`retrieve` with `mode="global"`, `"drift"`, or `"hybrid"` raises `ValidationError`
+before retrieval starts. Those modes and direct `retrieve_global` /
+`retrieve_drift` calls are outside the dependency-validation guarantee.
+
+`truth_filter` is intentionally **not** accepted on `AgentContext.retrieve`,
+`AgentContext.query_with_reasoning`, or `ContextRetriever.query_with_reasoning`
+— passing it there raises `ValidationError` immediately. Assemble the
+verified context yourself with `ContextRetriever.retrieve(...,
+truth_filter=...)` and feed it to the model.
+
+See [Truth Maintenance](/reference/truth_maintenance) for the session model
+behind the filter. For assembling model-ready context with citation
+footnotes, snapshot-consistent re-checks, and bitemporal historical
+reads, see [Grounded Context
+Assembly](/reference/grounded_context).
 
 
 ## Data Structures
@@ -990,10 +1242,10 @@ class EntityLink:
   </Tab>
 </Tabs>
 
-- [Vector Store](vector_store) — Embedding storage backend for memory retrieval.
-- [Knowledge Graph](kg) — Graph algorithms and analytics used inside ContextGraph.
-- [Reasoning](reasoning) — Logical inference layered on top of context.
-- [Provenance](provenance) — W3C PROV-O lineage for every stored fact.
+- [Vector Store](/reference/vector_store): embedding storage backend for memory retrieval.
+- [Knowledge Graph](/reference/kg): graph algorithms and analytics used inside ContextGraph.
+- [Reasoning](/guides/reasoning): logical inference layered on top of context.
+- [Provenance](/guides/provenance): W3C PROV-O lineage for every stored fact.
 
-- [Context Module](https://github.com/semantica-agi/semantica/blob/main/cookbook/introduction/19_Context_Module.ipynb) — Memory and decision tracking · Intermediate
-- [Advanced Context Engineering](https://github.com/semantica-agi/semantica/blob/main/cookbook/advanced/11_Advanced_Context_Engineering.ipynb) — Production FAISS + Neo4j setup · Advanced
+- [Context Module](https://github.com/semantica-agi/semantica/blob/main/cookbook/introduction/19_Context_Module.ipynb): memory and decision tracking · Intermediate
+- [Advanced Context Engineering](https://github.com/semantica-agi/semantica/blob/main/cookbook/advanced/11_Advanced_Context_Engineering.ipynb): production FAISS + Neo4j setup · Advanced

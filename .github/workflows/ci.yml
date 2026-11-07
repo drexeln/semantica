@@ -12,20 +12,70 @@ on:
       - '**/*.md'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'docs_check.py'
-      - '**/*.md'
 
 jobs:
+  # Detect whether this PR touches any source files (non-docs/non-markdown).
+  # The result drives the `build` job's `if:` condition so that:
+  #   - docs-only PRs: `build` is skipped (satisfies the required check).
+  #   - code PRs:      `build` runs exactly as before.
+  # Push events (to main) keep their own paths-ignore above and never reach
+  # this job, so the push optimization is unaffected.
+  changes:
+    runs-on: ubuntu-latest
+    # Only needed for pull_request events; push events are pre-filtered above.
+    if: github.event_name == 'pull_request'
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Fetch enough history to compute the merge base against the PR base.
+          fetch-depth: 0
+      - name: Check for source changes
+        id: filter
+        run: |
+          # List files changed in this PR relative to the true merge base.
+          # Using three-dot merge-base diff so changes on the base branch that
+          # are not part of this PR do not appear in the file list.
+          # If every changed file matches docs/** or *.md (any depth) or
+          # docs_check.py, this is a docs-only PR and src=false; otherwise
+          # src=true.
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          MERGE_BASE=$(git merge-base "$BASE" "$HEAD")
+          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+          NON_DOCS=$(echo "$CHANGED" | grep -Ev '^(docs/|docs_check\.py|.*\.md$)' || true)
+          if [ -n "$NON_DOCS" ]; then
+            echo "src=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "src=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: [changes]
+    # For pull_request events:
+    #   - skip only when changes ran successfully and explicitly set src=false
+    #     (i.e. a confirmed docs-only PR).
+    #   - run when changes succeeded with src=true (source changes present).
+    #   - run when changes failed or was cancelled (fail-closed: missing output
+    #     must not silently skip the build).
+    # For push/non-PR events: changes is skipped; always() prevents the build
+    # from being skipped due to a skipped needs dependency.
+    if: >-
+      always() && (
+        github.event_name != 'pull_request' ||
+        needs.changes.result != 'success' ||
+        needs.changes.outputs.src == 'true'
+      )
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -33,35 +83,195 @@ jobs:
       - name: Install Explorer frontend dependencies
         working-directory: explorer
         run: npm ci
+      - name: Install Playwright Chromium
+        working-directory: explorer
+        run: npx playwright install --with-deps chromium
       - name: Test Explorer frontend
         working-directory: explorer
         run: |
           npm run test:graph-store
           npm run test:graph-workspace
           npm run test:plugin-registry
+          npm run test:deterministic-e2e
+          npm run test:graph-legend-e2e
       - name: Build Explorer frontend
         working-directory: explorer
         run: npm run build
+      - name: Install core package and base dependencies
+        run: |
+          # Verify that core semantica installs cleanly with only its base dependencies
+          # (no optional extras) and that core imports and lazy missing-dependency hints work.
+          #
+          # --no-deps only skips *runtime* dependency resolution - `-e .`
+          # still does a PEP 517 build, which by default creates an isolated
+          # build env and fetches [build-system] requires (setuptools,
+          # wheel) completely outside any hash checking. Install
+          # pep517-build.txt (pins that exact build-system.requires) first
+          # and pass --no-build-isolation so pip reuses those hash-verified
+          # copies instead of fetching its own.
+          pip install -r .github/requirements/pep517-build.txt --require-hashes
+          pip install --no-deps --no-build-isolation -e .
+          pip install -r .github/requirements/base-deps.txt --require-hashes
+          pip install -r .github/requirements/pytest-tool.txt --require-hashes
+      - name: Verify core-only package importability and slim behavior
+        run: |
+          python -c "
+          import semantica
+          print('semantica', semantica.__version__, 'core installed and importable')
+          "
+          pytest -q tests/test_issue_1513_slim_core.py
+          pytest -q tests/test_docs_check.py
+          # semantica/reasoning imports nothing outside the standard library,
+          # so its suite runs against base dependencies without the extras
+          # installed later in this job.
+          pytest -q tests/reasoning/
+      - name: Install Explorer backend test dependencies
+        run: |
+          # Run the deterministic backend path before the all-extras CI
+          # environment is installed.  The Explorer extra supplies the
+          # production API dependencies without importing optional vector
+          # providers such as Pinecone during test collection.
+          #
+          # .github/requirements/explorer-extra-py311.txt is
+          # `uv pip compile pyproject.toml --extra explorer --python-version 3.11 --constraint requirements-ci.txt --generate-hashes`
+          # - regenerate it the same way if pyproject.toml's base/explorer
+          # deps change. Resolved specifically for this job's python 3.11
+          # (see the Dockerfile's explorer-extra-py313.txt for why this
+          # can't be shared with python 3.13: audioread needs extra
+          # standard-aifc/standard-sunau hashes only on 3.13+).
+          pip install -r .github/requirements/explorer-extra-py311.txt --require-hashes
+      - name: Test deterministic Explorer backend path
+        run: |
+          pytest -q tests/explorer/test_explorer_deterministic_rendering_e2e.py
       - name: Install pinned Python dependencies
         run: |
-          pip install -r requirements-ci.txt
+          pip install -r requirements-ci.txt --require-hashes
+      # The steps around this one each cover a slice: the reasoning suite above,
+      # the two integration directories at the end of the job. Everything else
+      # under tests/ has no gate at all, so a regression there is only found by
+      # whoever happens to run the suite by hand. This step closes that gap by
+      # running the whole suite against the pinned tree.
+      #
+      # It sits right after requirements-ci.txt on purpose: that is the
+      # environment the baseline in full-suite-known-failures.txt was measured
+      # in. The open-ontologies extra is layered on later in the job and would
+      # change which modules import, so running the suite before it keeps the
+      # two consistent.
+      #
+      # .github/full-suite-known-failures.txt lists the tests that already fail
+      # on an unmodified checkout. tests/conftest.py marks those ids `xfail`, so
+      # they keep running and an entry that starts passing reports XPASS and
+      # fails the job — that is what forces its line out of the file. (The
+      # marker is strict here because `CI` is set; outside CI the hook makes it
+      # non-strict, since the list is measured against this pinned tree and not
+      # against a developer's.) The loop below deselects only the entries the
+      # hook must not touch: the `# windows-only` ones, and only on Windows. The
+      # file is the record of the gap: fixing a defect means deleting its line.
+      # It is kept LF-only (.gitattributes); the loop below trims whitespace
+      # around each id, including a stray CR.
+      - name: Run the full test suite
+        timeout-minutes: 20
+        run: |
+          # A node id that no longer collects is a no-op for --deselect rather
+          # than an error, so a stale line cannot break the job. It is inert for
+          # the hook too, which only marks ids pytest actually collects: it
+          # neither runs nor reports XPASS, and the file's own review is what
+          # catches it.
+          #
+          # A line is deselected here only when it carries the `# windows-only`
+          # marker and this is a Windows runner. Every other line reaches the
+          # hook, which marks it xfail strictly here in CI.
+          #
+          # `# windows-only` is deselected on Windows alone — a symlink that
+          # needs a privilege, for instance. On Linux the line is left out, so
+          # the test runs, which is the only place the symlink rejection in
+          # tests/semantic_extract/test_cache_backends.py gets exercised at all;
+          # deselecting it unconditionally would drop a security check on the
+          # platform where it works. This job runs on ubuntu-latest, so the
+          # Windows branch never fires in CI today; it is kept for a Windows
+          # runner, where that id does fail, rather than dropped as dead weight.
+          deselect=()
+          known=0
+          deselected=0
+          while IFS= read -r line; do
+            case "$line" in
+              ''|'#'*) continue ;;
+            esac
+            known=$((known + 1))
+            case "$line" in
+              *'# windows-only'*)
+                if [ "${RUNNER_OS:-}" != "Windows" ]; then continue; fi
+                ;;
+              *) continue ;;
+            esac
+            node="${line%%#*}"
+            node="${node#"${node%%[![:space:]]*}"}"
+            node="${node%"${node##*[![:space:]]}"}"
+            deselect+=(--deselect "$node")
+            deselected=$((deselected + 1))
+          done < .github/full-suite-known-failures.txt
+          echo "known failures on the list: ${known}; deselected in this step: ${deselected}"
+
+          # The google_adk and open_ontologies directories have their own steps
+          # at the end of this job, each with its own dependency installation.
+          # Skipping them here keeps those assumptions intact and avoids
+          # running them twice.
+          #
+          # Everything else under tests/ runs here, integration marker or not:
+          # the integration tests outside those two directories need nothing
+          # beyond the pinned tree this step is measured against — they are
+          # offline and service-free — so leaving them unnamed would be the one
+          # slice that still had no gate.
+          pytest -q tests \
+            --ignore tests/integrations/google_adk/ \
+            --ignore tests/integrations/open_ontologies/ \
+            "${deselect[@]}"
       - name: Verify requirements-ci.txt is up to date
         run: |
-          pip install uv==0.12.1
+          pip install -r .github/requirements/uv-tool.txt --require-hashes
           # Re-resolve with the committed file as a constraint: upstream package
           # releases must NOT fail CI (deps only change when pyproject.toml
           # changes intentionally). Compare only version lines (pkg==ver),
           # ignoring the -c constraint comments and the `\` line continuations
           # that --generate-hashes emits.
+          # --group dev: the contributor tooling (pytest, black, ...) lives in
+          # the PEP 735 `dev` dependency group, not in the `all` extra.
           uv pip compile pyproject.toml --python-version 3.11 --extra all \
-            --constraint requirements-ci.txt -o /tmp/requirements-ci-check.txt
+            --group dev --constraint requirements-ci.txt \
+            -o /tmp/requirements-ci-check.txt
           diff \
             <(grep -E '^[a-zA-Z0-9._-]+==' requirements-ci.txt | sed 's/ \\$//') \
             <(grep -E '^[a-zA-Z0-9._-]+==' /tmp/requirements-ci-check.txt)
-      - run: pip install build
-      # wheel is build-time only (not in requirements-ci.txt) — install the
-      # same pinned version [build-system] declares so --no-isolation works.
-      - run: pip install wheel==0.48.0
+      - name: Verify open-ontologies-extra.txt is up to date
+        run: |
+          # Same freshness contract as requirements-ci.txt above, applied to
+          # the separately pinned open-ontologies extra. That extra is
+          # deliberately kept out of `all`, so the check above cannot see it:
+          # without this step a pyproject.toml change would leave the
+          # integration tests below running against a stale dependency graph.
+          # uv is already installed by the step above.
+          #
+          # The flags must match the header of the committed file exactly,
+          # --python-platform linux included, or the two resolutions can
+          # legitimately differ and this gate turns into noise.
+          uv pip compile pyproject.toml --python-version 3.11 --python-platform linux \
+            --extra open-ontologies --constraint requirements-ci.txt \
+            -o /tmp/open-ontologies-extra-check.txt
+          diff \
+            <(grep -E '^[a-zA-Z0-9._-]+==' .github/requirements/open-ontologies-extra.txt | sed 's/ \\$//') \
+            <(grep -E '^[a-zA-Z0-9._-]+==' /tmp/open-ontologies-extra-check.txt)
+      - name: Verify uv.lock is up to date
+        run: |
+          # uv.lock backs the `uv sync` contributor workflow. It is a universal
+          # lock, so this also fails if any dependency cannot resolve for every
+          # Python version in `requires-python` (the failure reported in #1506).
+          # Regenerate with `uv lock` (uv version pinned in uv-tool.txt) and
+          # commit the result.
+          uv lock --check
+      # build is a dev-time dependency; wheel is build-time only (neither is
+      # in requirements-ci.txt) — install the same pinned versions
+      # [build-system] declares so --no-isolation works below.
+      - run: pip install -r .github/requirements/build-tools.txt --require-hashes
       - name: Build package (no isolation — pinned deps)
         run: python -m build --no-isolation
       - name: Verify Explorer frontend is packaged
@@ -81,3 +291,18 @@ jobs:
 
           print("Explorer frontend is packaged")
           PY
+      - name: Run Google ADK Integration Tests
+        run: pytest tests/integrations/google_adk/
+      # The open-ontologies extra is deliberately not part of `all`, so
+      # requirements-ci.txt does not carry it and these tests would otherwise
+      # be silently skipped by their `importorskip`. Install it explicitly so
+      # the verified-export gate is actually exercised.
+      #
+      # .github/requirements/open-ontologies-extra.txt is
+      # `uv pip compile pyproject.toml --extra open-ontologies --python-version 3.11 --python-platform linux --constraint requirements-ci.txt --generate-hashes`
+      # - regenerate it the same way if pyproject.toml's open-ontologies dep changes.
+      - name: Run Open Ontologies Integration Tests
+        run: |
+          pip install -r .github/requirements/open-ontologies-extra.txt --require-hashes
+          python -c "import open_ontologies_lite"  # fail loudly rather than skip
+          pytest tests/integrations/open_ontologies/

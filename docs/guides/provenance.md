@@ -241,15 +241,14 @@ Every `ProvenanceEntry` carries a SHA-256 checksum computed at write time. If an
 Integrity verification is critical for regulatory compliance and forensic analysis. Run integrity checks as part of any compliance audit:
 
 ```python
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 raw_entries = prov.trace_lineage("cve-2024-3400")
 
 print("Integrity check:")
 for e in raw_entries:
     stored   = e.checksum
-    computed = compute_checksum(e)
-    status   = "OK" if stored == computed else "TAMPERED"
+    status   = "OK" if verify_checksum(e) else "TAMPERED"
     print(f"  [{status}] {e.entity_id[:50]}  {(stored or '')[:16]}...")
 ```
 
@@ -333,7 +332,7 @@ This summary is the starting point for a compliance attestation: you can state t
 
 **Overusing provenance in low-value scenarios.** Recording provenance for every intermediate calculation or temporary variable creates storage overhead without compliance benefit. Focus provenance tracking on entities, relationships, and properties that have legal, regulatory, or business significance.
 
-**Failing to validate integrity checksums.** Cryptographic integrity verification only works if you actually check it. Include regular `compute_checksum()` validation in audit workflows and incident response procedures.
+**Failing to validate integrity checksums.** Cryptographic integrity verification only works if you actually check it. Include regular `verify_checksum()` validation in audit workflows and incident response procedures.
 
 **Mixing provenance granularities.** Tracking some entities at the document level and others at the sentence level creates inconsistent audit trails. Establish consistent granularity standards for each data type and processing workflow.
 
@@ -424,7 +423,7 @@ The version chain created by repeated `track_entity()` calls on the same `entity
 ```python
 from semantica.provenance import ProvenanceManager
 from semantica.provenance.schemas import SourceReference
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 prov = ProvenanceManager(storage_path="soc_provenance.db")
 
@@ -466,7 +465,7 @@ print(f"Update count    : {lineage['entity_count']} records")
 # Integrity check before relying on the record for a patch decision
 entries = prov.trace_lineage("cve-2023-44487")
 for e in entries:
-    ok = compute_checksum(e) == e.checksum
+    ok = verify_checksum(e)
     print(f"  [{('OK' if ok else 'TAMPERED')}] {e.timestamp[:19]}  source={e.source_document}")
 ```
 
@@ -481,7 +480,7 @@ A clinical evidence graph tracks efficacy data from source publications through 
 ```python
 from semantica.provenance import ProvenanceManager
 from semantica.provenance.schemas import SourceReference
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 prov = ProvenanceManager(storage_path="clinical_provenance.db")
 
@@ -534,7 +533,7 @@ for entry in lineage["lineage_chain"]:
 # Integrity verification (21 CFR Part 11 requirement)
 entries = prov.trace_lineage("VE_primary_BNT162b2_C4591001")
 for e in entries:
-    status = "OK" if compute_checksum(e) == e.checksum else "TAMPERED"
+    status = "OK" if verify_checksum(e) else "TAMPERED"
     print(f"  Integrity [{status}]: {e.entity_id}")
 
 stats = prov.get_statistics()
@@ -639,7 +638,7 @@ Every `ProvenanceEntry` maps directly to W3C PROV-O terms. If your compliance te
 | — | `previous_version_id` | This entry corrects/replaces a prior version of the *same* fact |
 | `prov:wasDerivedFrom` | `derived_from_id` | This entry was derived from a *different* source entity |
 | `prov:used` | `used_entities` | Entity IDs consumed to produce this one |
-| `prov:generatedAtTime` | `timestamp` | ISO datetime, auto-set to `datetime.utcnow()` at write time |
+| `prov:generatedAtTime` | `timestamp` | ISO datetime, auto-set to `utc_now_iso()` at write time |
 | `prov:qualifiedInvalidation` | `invalidated`, `invalidated_at_time`, `invalidated_by`, `invalidation_reason` | A retraction/correction recorded as a tombstone via `ProvenanceManager.invalidate()`, never a hard delete |
 | `prov:startedAtTime` / `prov:endedAtTime` | `activity_started_at_time`, `activity_ended_at_time` | Typed Activity timing — pass an `ActivityRecord` via the `activity=` kwarg to set these together with `activity_id` |
 | `prov:qualifiedGeneration`/`Generation`, `qualifiedUsage`/`Usage`, `qualifiedDerivation`/`Derivation` | (derived from the fields above) | Additive qualified forms of `wasGeneratedBy`/`used`/`wasDerivedFrom`, emitted automatically alongside the plain triples |
@@ -659,7 +658,7 @@ Note: the banking example above passes `agent_id="credit_data_service_v2"` to `t
 
 ## Related Guides
 
-- [Semantic Extraction](semantic-extraction) — the NER and relation extraction pipeline that auto-generates provenance entries for every extracted entity
-- [Conflict Resolution](conflict-resolution) — provenance property sources feed directly into conflict detection; every resolved value is traceable to its source
-- [Deduplication](deduplication) — merge operations are recorded in merge history; pair with provenance for a complete lineage from source to canonical entity
+- [Semantic Extraction](/guides/semantic-extraction) — the NER and relation extraction pipeline that auto-generates provenance entries for every extracted entity
+- [Conflict Resolution](/guides/conflict-resolution) — provenance property sources feed directly into conflict detection; every resolved value is traceable to its source
+- [Deduplication](/guides/deduplication) — merge operations are recorded in merge history; pair with provenance for a complete lineage from source to canonical entity
 - [Provenance Reference](../reference/provenance) — full storage backend API, `InMemoryStorage`, `SQLiteStorage`, and `ProvenanceEntry` schema

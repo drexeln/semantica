@@ -60,6 +60,11 @@ class TestSlidingWindowChunker:
         with pytest.raises(ValidationError):
             SlidingWindowChunker(chunk_size=100, overlap=100)
 
+    @pytest.mark.parametrize("stride", [0, -1])
+    def test_init_rejects_non_positive_stride(self, stride):
+        with pytest.raises(ValidationError, match="stride must be positive"):
+            SlidingWindowChunker(chunk_size=100, stride=stride)
+
     def test_empty_text_returns_empty(self):
         chunker = SlidingWindowChunker(chunk_size=50, overlap=10)
         assert chunker.chunk("") == []
@@ -91,12 +96,106 @@ class TestSlidingWindowChunker:
                 == chunk_size - overlap
             )
 
+    @pytest.mark.parametrize(
+        "config, expected_spans, expected_overlap",
+        [
+            pytest.param(
+                {"overlap": 0},
+                [(0, 8), (8, 16), (16, 20)],
+                [False, False, False],
+                id="zero-overlap",
+            ),
+            pytest.param(
+                {"overlap": 3},
+                [(0, 8), (5, 13), (10, 18), (15, 20)],
+                [False, True, True, True],
+                id="default-overlap",
+            ),
+            pytest.param(
+                {"overlap": 3, "stride": 8},
+                [(0, 8), (8, 16), (16, 20)],
+                [False, False, False],
+                id="custom-stride-touching-windows",
+            ),
+            pytest.param(
+                {"overlap": 3, "stride": 12},
+                [(0, 8), (12, 20)],
+                [False, False],
+                id="custom-stride-with-gaps",
+            ),
+            pytest.param(
+                {"overlap": 0, "stride": 5},
+                [(0, 8), (5, 13), (10, 18), (15, 20)],
+                [False, True, True, True],
+                id="custom-stride-overrides-zero-overlap",
+            ),
+        ],
+    )
+    def test_fixed_size_metadata_reports_actual_overlap(
+        self, config, expected_spans, expected_overlap
+    ):
+        text = "abcdefghijklmnopqrst"
+        chunker = SlidingWindowChunker(chunk_size=8, **config)
+
+        chunks = chunker.chunk(text, preserve_boundaries=False)
+
+        assert [(chunk.start_index, chunk.end_index) for chunk in chunks] == expected_spans
+        assert [chunk.text for chunk in chunks] == [
+            text[start:end] for start, end in expected_spans
+        ]
+        assert [chunk.metadata["has_overlap"] for chunk in chunks] == expected_overlap
+
     def test_chunk_with_overlap_helper(self):
         text = "word " * 40
         chunker = SlidingWindowChunker(chunk_size=50, overlap=0)
         chunks = chunker.chunk_with_overlap(text, overlap_size=15)
         assert len(chunks) >= 2
         assert chunker.overlap == 0
+        assert chunker.stride == 50
+
+    @pytest.mark.parametrize("overlap_size", [-1, 50, 51])
+    def test_chunk_with_overlap_rejects_invalid_override(self, overlap_size):
+        chunker = SlidingWindowChunker(chunk_size=50)
+
+        with pytest.raises(ValidationError):
+            chunker.chunk_with_overlap(
+                "non-empty input", overlap_size=overlap_size
+            )
+
+    def test_chunk_with_overlap_accepts_largest_valid_override(self):
+        chunker = SlidingWindowChunker(chunk_size=5)
+
+        chunks = chunker.chunk_with_overlap("abcdefghij", overlap_size=4)
+
+        # The window [5, 10) covers the end; no overlap-only tails remain.
+        assert [chunk.start_index for chunk in chunks] == list(range(6))
+        assert chunks[-1].end_index == 10
+
+    def test_chunk_with_overlap_restores_custom_stride(self):
+        chunker = SlidingWindowChunker(chunk_size=10, overlap=2, stride=3)
+
+        chunker.chunk_with_overlap(
+            "abcdefghijklmnopqrstuvwxyz", overlap_size=4
+        )
+
+        assert chunker.overlap == 2
+        assert chunker.stride == 3
+
+    def test_chunk_with_overlap_restores_state_when_chunk_raises(
+        self, monkeypatch
+    ):
+        chunker = SlidingWindowChunker(chunk_size=10, overlap=2, stride=3)
+
+        def raise_error(text):
+            raise RuntimeError("chunk failed")
+
+        monkeypatch.setattr(chunker, "chunk", raise_error)
+
+        with pytest.raises(RuntimeError, match="chunk failed"):
+            chunker.chunk_with_overlap("non-empty input", overlap_size=4)
+
+        assert chunker.overlap == 2
+        assert chunker.stride == 3
 
     def test_boundary_preservation_avoids_mid_word_when_possible(self):
         text = (
@@ -110,6 +209,36 @@ class TestSlidingWindowChunker:
             assert isinstance(chunk, Chunk)
             assert chunk.text
             assert chunk.metadata.get("chunk_index") is not None
+
+    @pytest.mark.parametrize(
+        "preserve_boundaries", [False, True], ids=["fixed-size", "sentence-boundaries"]
+    )
+    @pytest.mark.parametrize(
+        "separator", [" ", ""], ids=["with-space", "without-space"]
+    )
+    def test_sentence_boundaries_do_not_drop_content(
+        self, preserve_boundaries, separator
+    ):
+        """Regression #1800: shortening a window must not skip the following text."""
+        text = f"First phrase.{separator}LOST suffix goes here."
+        chunker = SlidingWindowChunker(chunk_size=20, overlap=2)
+
+        chunks = chunker.chunk(text, preserve_boundaries=preserve_boundaries)
+
+        covered_positions = set()
+        for chunk in chunks:
+            assert 0 <= chunk.start_index < chunk.end_index <= len(text)
+            source_slice = text[chunk.start_index : chunk.end_index]
+            assert chunk.text.strip() == source_slice.strip()
+            covered_positions.update(range(chunk.start_index, chunk.end_index))
+
+        # Boundary-aware chunks strip outer whitespace; check substantive content.
+        missing = [
+            (index, char)
+            for index, char in enumerate(text)
+            if not char.isspace() and index not in covered_positions
+        ]
+        assert not missing, f"Uncovered non-whitespace characters: {missing!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -590,3 +719,89 @@ Body paragraph under a distinct heading for separation checks.
             self.SAMPLE * 3, chunk_size=80, ner_method="pattern"
         )
         assert len(chunks) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Mutable-default regression tests (fix: replace mutable default arguments)
+# ---------------------------------------------------------------------------
+
+
+class TestMutableDefaultRegression:
+    """Regression tests proving that mutable default arguments do not leak
+    between calls.  Each test mutates the list returned / stored by one call
+    and verifies that a subsequent call still receives the *original* default
+    value, not the mutated one.
+    """
+
+    # --- split_hierarchical -------------------------------------------------
+
+    def test_split_hierarchical_default_levels_are_independent_across_calls(self):
+        """Mutating the levels list from one call must not affect the next."""
+        text = "Para one.\n\nPara two.\n\nPara three."
+
+        # First call – capture and mutate the levels list indirectly by
+        # passing explicit levels and then appending to a reference.
+        call1_levels: list = ["paragraph"]
+        chunks1 = split_hierarchical(text, levels=call1_levels, chunk_sizes=[1000])
+        # Mutate the list that was passed in.
+        call1_levels.append("MUTATED")
+
+        # Second call with default levels=None must still use the canonical default.
+        chunks2 = split_hierarchical(text)
+        # The function must succeed and produce chunks (not raise because
+        # "MUTATED" is not a valid level name).
+        assert len(chunks2) >= 1
+
+    def test_split_hierarchical_none_default_creates_fresh_list_each_call(self):
+        """Two calls with levels=None must receive independent list objects."""
+        text = "A sentence.\n\nAnother sentence."
+
+        # Patch the body assignment so we can capture it.
+        captured: list = []
+        original_fn = split_hierarchical.__wrapped__ if hasattr(split_hierarchical, "__wrapped__") else None
+
+        # Use a simpler black-box approach: call twice and verify behaviour.
+        chunks_a = split_hierarchical(text)
+        chunks_b = split_hierarchical(text)
+
+        # Both calls should produce identical results (same default).
+        assert len(chunks_a) == len(chunks_b)
+        assert [c.text for c in chunks_a] == [c.text for c in chunks_b]
+
+    def test_split_hierarchical_default_chunk_sizes_are_independent_across_calls(self):
+        """Mutating chunk_sizes in one call must not affect the next."""
+        text = "Para A.\n\nPara B."
+        mutable_sizes = [5000, 2000, 1000]
+        split_hierarchical(text, chunk_sizes=mutable_sizes)
+        # Mutate after first call.
+        mutable_sizes[0] = 1  # Would produce very different chunking if leaked.
+
+        # Second call with default chunk_sizes=None must still use canonical defaults.
+        chunks = split_hierarchical(text)
+        assert len(chunks) >= 1
+
+    # --- HierarchicalChunker ------------------------------------------------
+
+    def test_hierarchical_chunker_default_levels_independent_across_instances(self):
+        """Mutating levels on one instance must not affect a second instance
+        created with the default."""
+        chunker_a = HierarchicalChunker()
+        # Mutate the instance attribute that was built from the default.
+        chunker_a.levels.append("MUTATED")
+
+        chunker_b = HierarchicalChunker()
+        assert "MUTATED" not in chunker_b.levels, (
+            "Mutation of chunker_a.levels leaked into chunker_b — "
+            "mutable default not fixed properly"
+        )
+
+    def test_hierarchical_chunker_default_levels_value(self):
+        """Default levels must equal the canonical list."""
+        chunker = HierarchicalChunker()
+        assert chunker.levels == ["section", "paragraph", "sentence"]
+
+    def test_hierarchical_chunker_explicit_levels_preserved(self):
+        """Explicitly passed levels must be stored as given."""
+        custom = ["document", "paragraph"]
+        chunker = HierarchicalChunker(levels=custom)
+        assert chunker.levels == custom

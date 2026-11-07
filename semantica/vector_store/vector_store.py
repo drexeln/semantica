@@ -65,18 +65,33 @@ Author: Semantica Contributors
 License: MIT
 """
 
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union, cast
 import concurrent.futures
 import inspect
+import threading
+import uuid
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union, cast
 
 import numpy as np
 
+from ..embeddings import EmbeddingGenerator
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
-from ..embeddings import EmbeddingGenerator
-from .hybrid_similarity import HybridSimilarityCalculator
 from .decision_embedding_pipeline import DecisionEmbeddingPipeline
+from .hybrid_similarity import HybridSimilarityCalculator
+
+
+def _serialized_operation(method):
+    """Keep backend I/O and mirror publication in one operation order."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._operation_lock:
+            return method(self, *args, **kwargs)
+
+    return guarded
+
 
 class SearchResult(TypedDict):
     """Canonical schema returned by VectorStore.search_vectors().
@@ -107,6 +122,11 @@ class VectorStore:
     • Manages vector metadata and provenance
     • Supports multiple vector store backends
     • Provides vector store operations
+
+    Mutations, coordinated erasure, save(), and load() are serialized within
+    each facade. Backend mutation and mirror publication finish before the
+    next operation begins, including operations on unrelated IDs. Backend I/O
+    does not hold the mirror lock.
     """
 
     SUPPORTED_BACKENDS = {"faiss", "weaviate", "qdrant", "milvus", "pinecone", "pgvector", "inmemory", "sqlite"}
@@ -138,10 +158,18 @@ class VectorStore:
             self._init_backend_store()
 
         # For in-memory backend, initialize local storage
-        if self.backend == "inmemory":
-            self.vectors: Dict[str, np.ndarray] = {}
-            self.metadata: Dict[str, Dict[str, Any]] = {}
+        self.vectors: Dict[str, np.ndarray] = {}
+        self.metadata: Dict[str, Dict[str, Any]] = {}
+        self._next_id: int = 0
+        # Serialize mutations and persistence within this facade, from before
+        # backend I/O through mirror publication. Erasure shares this guard.
+        # Lock order is _operation_lock, then _inmemory_lock; backend I/O must
+        # stay outside _inmemory_lock so mirror readers are not blocked by it.
+        self._operation_lock = threading.RLock()
+        self._inmemory_lock = threading.RLock()
 
+        if self.backend == "inmemory":
+            # self.vectors is now initialized universally
             # Initialize backend-specific indexer
             # Avoid duplicate dimension argument
             indexer_config = self.config.copy()
@@ -168,7 +196,7 @@ class VectorStore:
             if self.backend == "pgvector":
                 # Import PgVectorStore
                 from .pgvector_store import PgVectorStore
-                
+
                 # Required parameters for PgVectorStore
                 connection_string = self.config.get("connection_string")
                 table_name = self.config.get("table_name", "vectors")
@@ -482,11 +510,16 @@ class VectorStore:
                     doc_meta = doc.metadata
                 elif isinstance(doc, dict):
                     doc_meta = doc.get("metadata", {})
-                
+                elif isinstance(doc, str):
+                    # Plain-text documents: keep the text itself in the
+                    # payload, otherwise it is silently dropped.
+                    doc_meta = {"document": doc}
+
                 final_metadata[i].update(doc_meta)
         
         return self.store_vectors(vectors, metadata=final_metadata, **options)
 
+    @_serialized_operation
     def store_vectors(
         self,
         vectors: List[np.ndarray],
@@ -507,13 +540,14 @@ class VectorStore:
         # Delegate to backend store if available
         if self._backend_store:
             # Handle different method names across backend stores
+            ids = None
             if hasattr(self._backend_store, 'add'):
-                return self._backend_store.add(vectors, metadata, **options)
+                ids = self._backend_store.add(vectors, metadata, **options)
             elif hasattr(self._backend_store, 'add_vectors'):
                 # FAISSStore and others use add_vectors with different signature
                 if hasattr(self._backend_store, 'store_vectors'):
                     # Some stores have store_vectors method
-                    return self._backend_store.store_vectors(vectors, metadata=metadata, **options)
+                    ids = self._backend_store.store_vectors(vectors, metadata=metadata, **options)
                 else:
                     try:
                         add_vectors_params = inspect.signature(self._backend_store.add_vectors).parameters
@@ -523,10 +557,27 @@ class VectorStore:
                     except (ValueError, TypeError):
                         supports_metadata = True
                     if supports_metadata:
-                        return self._backend_store.add_vectors(vectors, metadata=metadata, **options)
-                    return self._backend_store.add_vectors(vectors, **options)
+                        ids = self._backend_store.add_vectors(vectors, metadata=metadata, **options)
+                    else:
+                        ids = self._backend_store.add_vectors(vectors, **options)
+            elif hasattr(self._backend_store, 'insert_vectors'):
+                # QdrantStore: insert_vectors(vectors, ids, payloads=None)
+                ids = options.pop('ids', None) or [str(uuid.uuid4()) for _ in range(len(vectors))]
+                self._backend_store.insert_vectors(vectors, ids, payloads=metadata, **options)
             else:
                 raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have add or add_vectors method")
+
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in range(len(vectors))]
+            elif len(ids) != len(vectors):
+                raise ProcessingError(f"Backend store returned {len(ids)} IDs for {len(vectors)} vectors")
+            
+            metadata = metadata or [{}] * len(vectors)
+            with self._inmemory_lock:
+                for i, vid in enumerate(ids):
+                    self.vectors[vid] = vectors[i]
+                    self.metadata[vid] = metadata[i]
+            return ids
         
         # Use in-memory implementation
         tracking_id = self.progress_tracker.start_tracking(
@@ -542,18 +593,47 @@ class VectorStore:
             self.progress_tracker.update_tracking(
                 tracking_id, message="Storing vectors..."
             )
-            start_idx = len(self.vectors)
-            for i, (vector, meta) in enumerate(zip(vectors, metadata)):
-                vector_id = f"vec_{start_idx + i}"
-                self.vectors[vector_id] = vector
-                self.metadata[vector_id] = meta
-                vector_ids.append(vector_id)
+            # Hold the lock for the entire ID-allocation → dict-write →
+            # index-rebuild sequence so concurrent callers cannot observe
+            # half-written state or generate the same candidate ID.
+            with self._inmemory_lock:
+                # Snapshot the live key-set at lock-entry so the generator
+                # and the within-batch de-dupe use a consistent view.
+                pre_existing = set(self.vectors)
+                # within_batch tracks IDs chosen during *this* call so the
+                # same candidate is never returned twice in one batch.
+                within_batch: set = set()
 
-            # Update index
-            self.progress_tracker.update_tracking(
-                tracking_id, message="Updating vector index..."
-            )
-            self.indexer.create_index(list(self.vectors.values()), vector_ids)
+                for vector, meta in zip(vectors, metadata):
+                    # Advance the monotonic counter until we find a candidate
+                    # that is free both in the live store and in this batch.
+                    #
+                    # The counter is never decremented on deletion, so under
+                    # normal operation every candidate it produces is genuinely
+                    # fresh.  The only reason a candidate can be occupied is
+                    # that a caller pre-inserted a ``vec_N`` key ahead of the
+                    # counter (e.g. manually writing to self.vectors).  Skipping
+                    # over such keys is intentional and matches FAISSStore's
+                    # identical behaviour.  Nothing is overwritten: the loop
+                    # breaks only on a candidate that is absent from both
+                    # pre_existing and within_batch.
+                    while True:
+                        candidate = f"vec_{self._next_id}"
+                        self._next_id += 1
+                        if candidate not in pre_existing and candidate not in within_batch:
+                            break
+
+                    within_batch.add(candidate)
+                    self.vectors[candidate] = vector
+                    self.metadata[candidate] = meta
+                    vector_ids.append(candidate)
+
+                # Update index inside the lock so readers always see a
+                # consistent (vectors, index) pair.
+                self.progress_tracker.update_tracking(
+                    tracking_id, message="Updating vector index..."
+                )
+                self.indexer.create_index(list(self.vectors.values()), list(self.vectors.keys()))
 
             self.progress_tracker.stop_tracking(
                 tracking_id,
@@ -566,6 +646,8 @@ class VectorStore:
                 tracking_id, status="failed", message=str(e)
             )
             raise
+
+    @_serialized_operation
     def save(self, path: str) -> None:
         """
         Save vector store to disk.
@@ -589,20 +671,30 @@ class VectorStore:
         # Save Python-level data using JSON (safe serialization).
         # pickle is intentionally avoided to prevent arbitrary code execution
         # if a malicious .pkl file is placed in the store directory.
-        data = {
-            "vectors": {k: v.tolist() if hasattr(v, "tolist") else list(v)
-                    for k, v in getattr(self, "vectors", {}).items()},
-            "metadata": getattr(self, "metadata", {}),
-            "config": self.config,
-            "backend": self.backend,
-            "dimension": self.dimension
-        }
+        # The operation guard keeps the saved index and this snapshot in the
+        # same completed state. Release the mirror lock before writing JSON.
+        with self._inmemory_lock:
+            data = {
+                "vectors": {
+                    k: v.tolist() if hasattr(v, "tolist") else list(v)
+                    for k, v in self.vectors.items()
+                },
+                "metadata": dict(self.metadata),
+                "config": dict(self.config),
+                "backend": self.backend,
+                "dimension": self.dimension,
+                # Persist the monotonic counter so that load() can restore it
+                # rather than re-deriving it from len(vectors), which would be
+                # too small after a deletion and cause ID collisions (#1029).
+                "next_id": self._next_id,
+            }
         
         with open(os.path.join(path, "store_data.json"), "w", encoding="utf-8") as f:
             json.dump(data, f)
             
         self.logger.info(f"Saved vector store to {path}")
 
+    @_serialized_operation
     def load(self, path: str) -> None:
         """
         Load vector store from disk.
@@ -637,11 +729,35 @@ class VectorStore:
         with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
-        self.vectors = data.get("vectors", {})
-        self.metadata = data.get("metadata", {})
-        self.config = data.get("config", {})
-        self.backend = data.get("backend", "faiss")
-        self.dimension = data.get("dimension", 768)
+        if not hasattr(self, "_inmemory_lock"):
+            self._inmemory_lock = threading.RLock()
+
+        with self._inmemory_lock:
+            vectors_raw = data.get("vectors", {})
+            self.vectors = {
+                k: np.array(v, dtype=np.float32) for k, v in vectors_raw.items()
+            }
+            self.metadata = data.get("metadata", {})
+            self.config = data.get("config", {})
+            self.backend = data.get("backend", "faiss")
+            self.dimension = data.get("dimension", 768)
+
+            # Restore the monotonic ID counter. Always clamp to at least
+            # max(vec_N suffix)+1 so a stale or missing persisted value (e.g.
+            # written before this field was added, or before a deletion that
+            # lowered the count) cannot collide with existing IDs (#1029).
+            _vec_nums = [
+                int(v[4:]) + 1
+                for v in self.vectors
+                if v.startswith("vec_") and v[4:].isdigit()
+            ]
+            _inferred = max(_vec_nums) if _vec_nums else 0
+            persisted_next_id = data.get("next_id")
+            if persisted_next_id is not None:
+                self._next_id = max(int(persisted_next_id), _inferred)
+            else:
+                # Older store files lack this field; use the safe inferred value.
+                self._next_id = _inferred
         
         # Restore backend-specific index
         indexer = getattr(self, "indexer", None)
@@ -722,14 +838,25 @@ class VectorStore:
                 )
                 return []
 
+            # Snapshot vectors and metadata together under the lock so a
+            # concurrent delete_vectors / store_vectors cannot cause
+            # "RuntimeError: dictionary changed size during iteration" and
+            # cannot produce an inconsistent (values, keys) pair where one
+            # list is shorter than the other.  The lock is released before
+            # the (potentially slow) similarity computation.
+            with self._inmemory_lock:
+                snapshot_vectors = list(self.vectors.values())
+                snapshot_keys = list(self.vectors.keys())
+                snapshot_metadata = dict(self.metadata)
+
             # Use retriever for similarity search
             self.progress_tracker.update_tracking(
                 tracking_id, message="Performing similarity search..."
             )
             results = self.retriever.search_similar(
                 query_vector,
-                list(self.vectors.values()),
-                list(self.vectors.keys()),
+                snapshot_vectors,
+                snapshot_keys,
                 k=k,
                 **options,
             )
@@ -737,8 +864,8 @@ class VectorStore:
             # Add metadata to results; guarantee the key always exists.
             for result in results:
                 vector_id = result.get("id")
-                if vector_id and vector_id in self.metadata:
-                    result["metadata"] = self.metadata[vector_id]
+                if vector_id and vector_id in snapshot_metadata:
+                    result["metadata"] = snapshot_metadata[vector_id]
                 elif "metadata" not in result:
                     result["metadata"] = {}
 
@@ -754,6 +881,7 @@ class VectorStore:
             )
             raise
 
+    @_serialized_operation
     def update_vectors(
         self, vector_ids: List[str], new_vectors: List[np.ndarray], metadata: Optional[List[Dict[str, Any]]] = None, **options
     ) -> bool:
@@ -761,48 +889,100 @@ class VectorStore:
         # Delegate to backend store if available
         if self._backend_store:
             if hasattr(self._backend_store, 'update'):
-                return self._backend_store.update(ids=vector_ids, vectors=new_vectors, metadata=metadata, **options)
+                result = self._backend_store.update(ids=vector_ids, vectors=new_vectors, metadata=metadata, **options)
             elif hasattr(self._backend_store, 'update_vectors'):
-                return self._backend_store.update_vectors(vector_ids, new_vectors, **options)
+                result = self._backend_store.update_vectors(vector_ids, new_vectors, **options)
             else:
                 raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have update or update_vectors method")
 
-        for vec_id, new_vec in zip(vector_ids, new_vectors):
-            if vec_id in self.vectors:
-                self.vectors[vec_id] = new_vec
+            # A backend that rejects the update keeps its old values, so
+            # leave the mirror untouched and pass the result through.
+            if result is False:
+                return result
 
-        if metadata:
-            for vec_id, meta in zip(vector_ids, metadata):
-                if vec_id in self.metadata:
-                    self.metadata[vec_id] = meta
-
-        # Rebuild index
-        self.indexer.create_index(
-            list(self.vectors.values()), list(self.vectors.keys())
-        )
-
-        return True
-
-    def delete_vectors(self, vector_ids: List[str], **options) -> bool:
-        """Delete vectors from store."""
-        # Delegate to backend store if available
-        if self._backend_store:
-            if hasattr(self._backend_store, 'delete'):
-                return self._backend_store.delete(ids=vector_ids, **options)
-            elif hasattr(self._backend_store, 'delete_vectors'):
-                return self._backend_store.delete_vectors(vector_ids, **options)
+            # A list is the ids this UPDATE matched. Refresh only those
+            # mirror entries, so a zero-row update cannot paint new values
+            # onto the mirror and a later save() cannot persist them. A
+            # bare True does not identify rows, so every mirrored id in
+            # the request is refreshed.
+            if isinstance(result, (list, tuple, set)):
+                confirmed = set(result)
             else:
-                raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have delete or delete_vectors method")
+                confirmed = None
 
-        for vec_id in vector_ids:
-            self.vectors.pop(vec_id, None)
-            self.metadata.pop(vec_id, None)
+            with self._inmemory_lock:
+                for vec_id, new_vec in zip(vector_ids, new_vectors):
+                    if confirmed is not None and vec_id not in confirmed:
+                        continue
+                    if vec_id in self.vectors:
+                        self.vectors[vec_id] = new_vec
+                if metadata:
+                    for vec_id, meta in zip(vector_ids, metadata):
+                        if confirmed is not None and vec_id not in confirmed:
+                            continue
+                        if vec_id in self.metadata:
+                            self.metadata[vec_id] = meta
+            return True
 
-        # Rebuild index
-        if self.vectors:
+        with self._inmemory_lock:
+            for vec_id, new_vec in zip(vector_ids, new_vectors):
+                if vec_id in self.vectors:
+                    self.vectors[vec_id] = new_vec
+
+            if metadata:
+                for vec_id, meta in zip(vector_ids, metadata):
+                    if vec_id in self.metadata:
+                        self.metadata[vec_id] = meta
+
+            # Rebuild index under the lock so readers see a consistent
+            # (vectors, index) pair, matching store_vectors and delete_vectors.
             self.indexer.create_index(
                 list(self.vectors.values()), list(self.vectors.keys())
             )
+
+        return True
+
+    @_serialized_operation
+    def delete_vectors(
+        self, vector_ids: List[str], namespace: Optional[str] = None, **options
+    ) -> bool:
+        """Delete vectors from store.
+
+        Args:
+            vector_ids: Vector IDs to delete.
+            namespace: Native backend namespace, when supported by the
+                configured backend.
+            **options: Additional backend-specific options.
+        """
+        # Delegate to backend store if available
+        if self._backend_store:
+            if namespace is not None and self.backend == "pinecone":
+                options["namespace"] = namespace
+            success = False
+            if hasattr(self._backend_store, 'delete'):
+                success = self._backend_store.delete(ids=vector_ids, **options)
+            elif hasattr(self._backend_store, 'delete_vectors'):
+                success = self._backend_store.delete_vectors(vector_ids, **options)
+            else:
+                raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have delete or delete_vectors method")
+            
+            with self._inmemory_lock:
+                for vec_id in vector_ids:
+                    self.vectors.pop(vec_id, None)
+                    self.metadata.pop(vec_id, None)
+            return success
+
+        with self._inmemory_lock:
+            for vec_id in vector_ids:
+                self.vectors.pop(vec_id, None)
+                self.metadata.pop(vec_id, None)
+
+            # Rebuild index under the lock so a concurrent search cannot
+            # see vectors without a corresponding index entry.
+            if self.vectors:
+                self.indexer.create_index(
+                    list(self.vectors.values()), list(self.vectors.keys())
+                )
 
         return True
 
@@ -823,6 +1003,79 @@ class VectorStore:
             return self._backend_store.get_metadata(vector_id)
         else:
             raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not implement get_metadata")
+
+    def scan_vectors(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Page through stored vectors, backend-agnostic.
+
+        Follows the get_vector()/get_metadata() precedent (#843): the inmemory
+        backend pages its local dict directly, a persistent backend delegates
+        to a scan_vectors() on the wrapped store when available, and one that
+        cannot enumerate its contents raises NotImplementedError rather than
+        silently returning an empty page.
+
+        Args:
+            offset: Number of vectors to skip
+            limit: Maximum number of vectors to return
+
+        Returns:
+            List of result dicts with 'id', 'metadata', and 'vector'
+        """
+        if limit <= 0:
+            return []
+
+        if self.backend == "inmemory":
+            ids_page = list(self.vectors.keys())[offset:offset + limit]
+            return [
+                {
+                    "id": vec_id,
+                    "metadata": self.metadata.get(vec_id, {}),
+                    "vector": self.vectors.get(vec_id),
+                }
+                for vec_id in ids_page
+            ]
+        elif self._backend_store and hasattr(self._backend_store, "scan_vectors"):
+            return self._backend_store.scan_vectors(offset=offset, limit=limit)
+        else:
+            raise NotImplementedError(
+                f"Backend store {type(self._backend_store).__name__} does not "
+                "implement scan_vectors(). Add a scan_vectors() method to the "
+                "backend store adapter to enable enumeration for this backend."
+            )
+
+    def iter_vectors(self, batch_size: int = 500, namespace: Optional[str] = None):
+        """
+        Iterate over every stored vector, one page at a time.
+
+        Cursor-based backends expose iter_all() because they cannot support a
+        positional offset; it takes precedence when present. Everything else
+        falls through to the scan_vectors() offset loop.
+
+        Args:
+            batch_size: Number of vectors to fetch per underlying call
+            namespace: Native backend namespace, when supported by the
+                configured backend
+
+        Yields:
+            Result dicts with 'id', 'metadata', and 'vector', in scan order
+        """
+        if self.backend != "inmemory" and self._backend_store is not None:
+            iter_all = getattr(self._backend_store, "iter_all", None)
+            if callable(iter_all):
+                if namespace is not None and self.backend == "pinecone":
+                    yield from iter_all(batch_size=batch_size, namespace=namespace)
+                    return
+                yield from iter_all(batch_size=batch_size)
+                return
+
+        offset = 0
+        while True:
+            page = self.scan_vectors(offset=offset, limit=batch_size)
+            if not page:
+                return
+            for item in page:
+                yield item
+            offset += len(page)
 
     def count(self) -> int:
         """Return the number of vectors in the store, backend-agnostic.

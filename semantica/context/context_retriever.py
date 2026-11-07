@@ -78,7 +78,7 @@ License: MIT
 
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
@@ -88,6 +88,9 @@ from ..kg.path_finder import PathFinder
 from ..kg.centrality_calculator import CentralityCalculator
 from ..kg.community_detector import CommunityDetector
 from ..kg.similarity_calculator import SimilarityCalculator
+from ..utils.exceptions import ValidationError
+from .truth_maintenance_filter import TruthMaintenanceContextFilter
+from .tiers import TierCalculator, TrustTier
 try:
     from ..kg.temporal_query import TemporalGraphQuery as _TemporalGraphQuery
     from ..kg.temporal_model import parse_temporal_value as _parse_temporal_value
@@ -122,12 +125,22 @@ class ContextRetriever:
     • Real-time context updates
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, **kwargs):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        community_hierarchy: Optional[Any] = None,
+        community_reports: Optional[Any] = None,
+        llm: Optional[Any] = None,
+        **kwargs,
+    ):
         """
         Initialize context retriever.
 
         Args:
             config: Configuration dictionary
+            community_hierarchy: Optional CommunityHierarchy instance
+            community_reports: Optional community reports collection
+            llm: Optional LLM instance for global/drift synthesis
             **kwargs: Additional configuration options:
                 - memory_store: Memory store instance
                 - knowledge_graph: Knowledge graph instance
@@ -136,6 +149,10 @@ class ContextRetriever:
                 - max_expansion_hops: Maximum graph expansion hops (default: 2)
                 - hybrid_alpha: Weight for hybrid retrieval (0=vector only, 1=graph
                   only, default: 0.5)
+                - tier_calculator: Optional TierCalculator override for
+                  evidence grading
+                - provenance_manager: Optional provenance manager for
+                  corroboration lookup by node id
         """
         self.logger = get_logger("context_retriever")
         self.config = config or {}
@@ -144,6 +161,22 @@ class ContextRetriever:
         self.memory_store = self.config.get("memory_store")
         self.knowledge_graph = self.config.get("knowledge_graph")
         self.vector_store = self.config.get("vector_store")
+
+        self.community_hierarchy = (
+            community_hierarchy
+            if community_hierarchy is not None
+            else self.config.get("community_hierarchy")
+        )
+        self.community_reports = (
+            community_reports
+            if community_reports is not None
+            else self.config.get("community_reports")
+        )
+        self.llm = (
+            llm
+            if llm is not None
+            else self.config.get("llm")
+        )
 
         self.use_graph_expansion = self.config.get("use_graph_expansion", True)
         self.max_expansion_hops = self.config.get("max_expansion_hops", 2)
@@ -158,7 +191,7 @@ class ContextRetriever:
         # Initialize decision-specific components
         self.hybrid_calculator = HybridSimilarityCalculator()
         self.decision_pipeline: Optional[DecisionEmbeddingPipeline] = None
-        
+
         # Initialize KG algorithms if knowledge graph available
         if self.knowledge_graph:
             self.path_finder = PathFinder()
@@ -170,7 +203,7 @@ class ContextRetriever:
             self.centrality_calculator = None
             self.community_detector = None
             self.similarity_calculator = None
-        
+
         # Initialize decision pipeline if vector store available
         if self.vector_store:
             self.decision_pipeline = DecisionEmbeddingPipeline(
@@ -179,12 +212,22 @@ class ContextRetriever:
                 use_graph_features=True
             )
 
+        # Trust-tiering: grade each retrieved fact on evidence quality so
+        # downstream consumers can downrank or filter low-trust context. Tiers
+        # are derived on demand from signals already present in the retrieval
+        # result (graph node confidence + corroboration count), never persisted.
+        self.tier_calculator = self.config.get("tier_calculator") or TierCalculator()
+        self.provenance_manager = self.config.get("provenance_manager")
+
     def retrieve(
         self,
         query: str,
         max_results: int = 5,
         use_graph_expansion: Optional[bool] = None,
         min_relevance_score: float = 0.0,
+        mode: str = "local",
+        truth_filter: Optional[TruthMaintenanceContextFilter] = None,
+        min_trust_tier: Optional[TrustTier] = None,
         **options,
     ) -> List[RetrievedContext]:
         """
@@ -195,6 +238,23 @@ class ContextRetriever:
             max_results: Maximum number of results
             use_graph_expansion: Use graph expansion (overrides config)
             min_relevance_score: Minimum relevance score
+            mode: Retrieval mode ('local', 'global', 'drift', 'hybrid')
+            truth_filter: Optional truth-maintenance filter for local mode only;
+                candidates are validated against a session snapshot before
+                ranking and the snapshot version is re-checked before
+                results are returned
+            min_trust_tier: Optional minimum TrustTier. When set, each result
+                is graded on evidence quality (see the "trust_tier" key in
+                RetrievedContext.metadata) and only results meeting the
+                minimum are returned. Graph facts without readable signals
+                grade to quarantine. Without a ``provenance_manager`` (or a
+                ``corroboration_count`` in metadata) facts have no
+                corroboration signal and grade bronze at best, so a silver or
+                gold threshold needs one. In local mode, results that carry no
+                tier signal (vector chunks with neither a graph node id nor a
+                confidence reading) are excluded too; global, drift and
+                hybrid keep such unscored summaries so a threshold cannot
+                empty the response.
             **options: Additional options:
                 - entity_ids: Filter by entity IDs
                 - node_types: Filter by node types
@@ -203,7 +263,134 @@ class ContextRetriever:
         Returns:
             List of retrieved context items
         """
-        # Track context retrieval
+        norm_mode = str(mode).lower().strip()
+        if truth_filter is not None and norm_mode != "local":
+            raise ValidationError(
+                "truth_filter is supported only with mode='local'; "
+                "other retrieval modes do not validate truth dependencies",
+                validation_context={
+                    "method": "ContextRetriever.retrieve",
+                    "mode": norm_mode,
+                },
+            )
+        if norm_mode == "global":
+            return self.retrieve_global(
+                query,
+                max_results=max_results,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                min_trust_tier=min_trust_tier,
+                **options,
+            )
+        elif norm_mode == "drift":
+            return self.retrieve_drift(
+                query,
+                max_results=max_results,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                min_trust_tier=min_trust_tier,
+                **options,
+            )
+        elif norm_mode == "hybrid":
+            local_res = self.retrieve(
+                query,
+                max_results=max_results * 2,
+                use_graph_expansion=use_graph_expansion,
+                min_relevance_score=min_relevance_score,
+                mode="local",
+                min_trust_tier=min_trust_tier,
+                **options,
+            )
+            global_res = self.retrieve_global(
+                query,
+                max_results=max_results * 2,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                min_trust_tier=min_trust_tier,
+                **options,
+            )
+            merged = self._rank_and_merge(local_res + global_res, query)
+            eff_min_score = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
+            filtered = [r for r in merged if r.score >= eff_min_score]
+            # Tiers were attached and the threshold applied inside each
+            # sub-retrieval: the local leg drops unscored items, while the
+            # global leg keeps structurally unscored summaries. Filtering the
+            # merged list again would strip those summaries out.
+            self._attach_trust_tiers(filtered)
+            return filtered[:max_results]
+        elif norm_mode != "local":
+            raise ValueError(
+                f"Unsupported retrieval mode '{mode}'. Supported modes: "
+                "'local', 'global', 'drift', 'hybrid'"
+            )
+
+        def prepare():
+            if truth_filter is None:
+                return None, None
+            if not isinstance(truth_filter, TruthMaintenanceContextFilter):
+                raise ValidationError(
+                    "truth_filter must be a TruthMaintenanceContextFilter " "instance",
+                    validation_context={"method": "ContextRetriever.retrieve"},
+                )
+            snapshot = truth_filter.snapshot()
+
+            def candidate_filter(candidates):
+                return truth_filter.filter_contexts(candidates, snapshot=snapshot)
+
+            def final_check():
+                truth_filter.assert_current(snapshot)
+
+            return candidate_filter, final_check
+
+        return self._retrieve_local(
+            query,
+            max_results=max_results,
+            use_graph_expansion=use_graph_expansion,
+            min_relevance_score=min_relevance_score,
+            prepare=prepare,
+            merge_duplicates=truth_filter is None,
+            min_trust_tier=min_trust_tier,
+            options=options,
+        )
+
+    def _retrieve_local(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        use_graph_expansion: bool | None = None,
+        min_relevance_score: float = 0.0,
+        prepare=None,
+        merge_duplicates: bool = True,
+        limit_results: bool = True,
+        candidate_limit: Optional[int] = None,
+        min_trust_tier: Optional[TrustTier] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> list[RetrievedContext]:
+        """
+        Shared local-retrieval seam for retrieve and grounded assembly.
+
+        The public :meth:`retrieve` keeps mode dispatch, then delegates here.
+        This helper owns tracking, source collection, ranking, thresholding
+        and top-k selection. ``prepare`` runs inside the tracked block before
+        any source is read and returns ``(candidate_filter, final_check)``:
+        ``candidate_filter`` receives the combined candidate list before
+        ranking and returns the candidates to keep, and ``final_check`` runs
+        after thresholding and before the tracker is stopped successfully, so
+        a failed setup or a stale view still fails the tracking unit.
+        ``candidate_limit`` sets how many candidates each source returns
+        (default ``max_results * 2``). ``limit_results=False`` returns the
+        whole ranked pool for budget admission. ``options`` carries the
+        caller's retrieval options (``max_hops``).
+        """
+
+        options = options or {}
+        per_source = candidate_limit or max_results * 2
+
         tracking_id = self.progress_tracker.start_tracking(
             file=None,
             module="context",
@@ -212,6 +399,9 @@ class ContextRetriever:
         )
 
         try:
+            candidate_filter, final_check = (
+                prepare() if prepare is not None else (None, None)
+            )
             use_expansion = (
                 use_graph_expansion
                 if use_graph_expansion is not None
@@ -224,7 +414,7 @@ class ContextRetriever:
             self.progress_tracker.update_tracking(
                 tracking_id, message="Retrieving from vector store..."
             )
-            vector_results = self._retrieve_from_vector(query, max_results * 2)
+            vector_results = self._retrieve_from_vector(query, per_source)
             all_results.extend(vector_results)
 
             # Graph-based retrieval
@@ -236,7 +426,7 @@ class ContextRetriever:
                 query_intent = self._extract_query_intent(query)
                 graph_results = self._retrieve_from_graph(
                     query,
-                    max_results * 2,
+                    per_source,
                     max_hops=options.get("max_hops", self.max_expansion_hops),
                     query_intent=query_intent,
                 )
@@ -247,33 +437,355 @@ class ContextRetriever:
                 self.progress_tracker.update_tracking(
                     tracking_id, message="Retrieving from memory..."
                 )
-                memory_results = self._retrieve_from_memory(query, max_results * 2)
+                memory_results = self._retrieve_from_memory(query, per_source)
                 all_results.extend(memory_results)
 
             # Combine and rank results
             self.progress_tracker.update_tracking(
                 tracking_id, message="Ranking and merging results..."
             )
-            ranked_results = self._rank_and_merge(all_results, query)
+            if candidate_filter is not None:
+                all_results = candidate_filter(all_results)
+            ranked_results = self._rank_and_merge(
+                all_results, query, merge_duplicates=merge_duplicates
+            )
 
             # Filter by minimum score
-            filtered_results = [
-                r for r in ranked_results if r.score >= min_relevance_score
-            ]
+            eff_min_score = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
+            filtered_results = [r for r in ranked_results if r.score >= eff_min_score]
+            self._attach_trust_tiers(filtered_results)
+            if min_trust_tier is not None:
+                filtered_results = self.filter_by_tier(filtered_results, min_trust_tier)
 
+            if final_check is not None:
+                final_check()
+
+            results = (
+                filtered_results[:max_results] if limit_results else filtered_results
+            )
             self.progress_tracker.stop_tracking(
                 tracking_id,
                 status="completed",
-                message=f"Retrieved {len(filtered_results[:max_results])} results",
+                message=f"Retrieved {len(results)} results",
             )
-            # Return top results
-            return filtered_results[:max_results]
+            return results
 
         except Exception as e:
             self.progress_tracker.stop_tracking(
                 tracking_id, status="failed", message=str(e)
             )
             raise
+
+    # ------------------------------------------------------------------
+    # Trust tiering (issue #1557, phase 2)
+    # ------------------------------------------------------------------
+
+    def _tier_signals_for(
+        self, context: "RetrievedContext"
+    ) -> Tuple[Optional[int], Optional[float]]:
+        """
+        Pull the two signals a TrustTier needs from a retrieved context.
+
+        Corroboration count comes from the provenance manager when one is
+        wired and the context carries a node id; otherwise it falls back to a
+        ``corroboration_count`` already present in metadata. The provenance
+        count is the number of distinct ``source`` values, since a lineage
+        trace can list the same document more than once. Confidence comes
+        from ``metadata["confidence"]``. Either signal may be None when the
+        retrieval source does not expose it (e.g. a vector chunk with no graph
+        provenance).
+
+        Args:
+            context: A retrieved context item.
+
+        Returns:
+            Tuple of (corroboration_count, confidence); None for a missing
+            signal.
+        """
+        node_id = context.metadata.get("node_id")
+        confidence = context.metadata.get("confidence")
+
+        corroboration: Optional[int] = None
+        if self.provenance_manager is not None and node_id:
+            try:
+                sources = self.provenance_manager.get_all_sources(node_id) or []
+                corroboration = len({
+                    s.get("source")
+                    for s in sources
+                    if isinstance(s, dict) and s.get("source")
+                })
+            except Exception:
+                corroboration = None
+        if corroboration is None:
+            candidate = context.metadata.get("corroboration_count")
+            if isinstance(candidate, int):
+                corroboration = candidate
+
+        return corroboration, confidence
+
+    def _attach_trust_tiers(self, results: List["RetrievedContext"]) -> None:
+        """
+        Grade each result on evidence quality and record it in metadata.
+
+        Graph facts (results carrying a ``node_id``, and edge facts carrying
+        ``source``, ``relation`` and ``target`` such as DRIFT's verified local
+        facts) always receive a tier: when neither corroboration nor
+        confidence is readable, the calculator degrades them to quarantine
+        instead of leaving the grade blank, so a missing signal is never
+        treated as if it had been measured. Other results (for example vector
+        chunks or community summaries with no confidence reading) are left
+        unscored. An existing ``trust_tier`` is
+        recomputed from current signals on every pass, so a grade cannot
+        outlive the evidence it was derived from.
+
+        The tier is recorded on a copy of the result's metadata. Metadata
+        dicts on retrieved contexts can be shared with the underlying vector
+        store or memory, and writing in place would persist a query-time
+        grade into stored state, where it would go stale as sources change.
+
+        Args:
+            results: Retrieved contexts to grade in place.
+        """
+        for context in results:
+            corroboration, confidence = self._tier_signals_for(context)
+            meta = context.metadata
+            is_graph_fact = bool(meta.get("node_id")) or bool(
+                meta.get("source") and meta.get("relation") and meta.get("target")
+            )
+            if not is_graph_fact and corroboration is None and confidence is None:
+                continue
+            try:
+                tier = self.tier_calculator.calculate(corroboration, confidence)
+            except Exception:
+                continue
+            context.metadata = {**context.metadata, "trust_tier": tier.value}
+
+    def filter_by_tier(
+        self,
+        results: List["RetrievedContext"],
+        minimum: "TrustTier",
+        include_unscored: bool = False,
+    ) -> List["RetrievedContext"]:
+        """
+        Keep only results whose trust tier meets a minimum threshold.
+
+        Args:
+            results: Retrieved contexts, ideally already graded via
+                ``_attach_trust_tiers`` (or ``retrieve`` with tiering enabled).
+            minimum: Lowest acceptable tier.
+            include_unscored: When True, results that carry no tier at all are
+                also kept; when False (default) they are dropped, because a
+                caller asking for "at least silver" should not receive context
+                whose evidence quality is unknown.
+
+        Returns:
+            The subset of results meeting the threshold.
+
+        Raises:
+            TypeError: If minimum is not a TrustTier.
+
+        Example:
+            >>> from semantica.context.tiers import TrustTier
+            >>> r_gold = RetrievedContext(content="g", score=1.0,
+            ...     metadata={"trust_tier": "gold"})
+            >>> r_bronze = RetrievedContext(content="b", score=1.0,
+            ...     metadata={"trust_tier": "bronze"})
+            >>> r_none = RetrievedContext(content="n", score=1.0)
+            >>> retriever = ContextRetriever()
+            >>> kept = retriever.filter_by_tier(
+            ...     [r_gold, r_bronze, r_none], TrustTier.SILVER)
+            >>> [r.content for r in kept]
+            ['g']
+            >>> kept_all = retriever.filter_by_tier(
+            ...     [r_gold, r_bronze, r_none], TrustTier.SILVER,
+            ...     include_unscored=True)
+            >>> sorted(r.content for r in kept_all)
+            ['g', 'n']
+        """
+        if not isinstance(minimum, TrustTier):
+            raise TypeError(
+                f"minimum must be a TrustTier, got {type(minimum).__name__}"
+            )
+        kept: List[RetrievedContext] = []
+        for context in results:
+            raw = context.metadata.get("trust_tier")
+            if raw is None:
+                if include_unscored:
+                    kept.append(context)
+                continue
+            try:
+                tier = TrustTier(raw)
+            except ValueError:
+                if include_unscored:
+                    kept.append(context)
+                continue
+            if tier.meets(minimum):
+                kept.append(context)
+        return kept
+
+    def retrieve_global(
+        self,
+        query: str,
+        level: Optional[int] = None,
+        max_results: int = 5,
+        min_relevance_score: float = 0.0,
+        as_contexts: bool = False,
+        min_trust_tier: Optional["TrustTier"] = None,
+        **options,
+    ) -> Union[Any, List[RetrievedContext]]:
+        """
+        Execute global search over community reports.
+
+        Args:
+            query: Search query
+            level: Target coarsening hierarchy level
+            max_results: Maximum results when returning contexts
+            min_relevance_score: Minimum relevance score
+            as_contexts: If True, return List[RetrievedContext];
+                if False, return GlobalSearchResult
+            min_trust_tier: Optional trust threshold. Summaries with no
+                evidence signal stay unscored and are always kept when a
+                threshold is set; contexts that do carry a signal are graded
+                and filtered like any other result.
+            **options: Additional options passed to GlobalGraphRetriever
+
+        Returns:
+            GlobalSearchResult or List[RetrievedContext]
+        """
+        from .global_retriever import GlobalGraphRetriever
+
+        reports = options.pop("reports", None)
+        if reports is None:
+            reports = options.pop("community_reports", self.community_reports)
+        else:
+            options.pop("community_reports", None)
+
+        hierarchy = options.pop("hierarchy", None)
+        if hierarchy is None:
+            hierarchy = options.pop("community_hierarchy", self.community_hierarchy)
+        else:
+            options.pop("community_hierarchy", None)
+
+        llm = options.pop("llm", self.llm)
+
+        retriever = GlobalGraphRetriever(
+            reports=reports,
+            hierarchy=hierarchy,
+            llm=llm,
+            min_relevance_score=min_relevance_score,
+            **options,
+        )
+        res = retriever.search(
+            query,
+            level=level,
+            min_relevance_score=min_relevance_score,
+            **options,
+        )
+        if as_contexts:
+            context_threshold = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
+            contexts = [
+                c for c in res.to_retrieved_contexts()
+                if c.score >= context_threshold
+            ]
+            self._attach_trust_tiers(contexts)
+            if min_trust_tier is not None:
+                # Summaries with no evidence signal stay unscored; dropping
+                # them for "missing tier" would empty the result. Keep them;
+                # only graded items are filtered.
+                contexts = self.filter_by_tier(
+                    contexts, min_trust_tier, include_unscored=True
+                )
+            return contexts[:max_results]
+        return res
+
+    def retrieve_drift(
+        self,
+        query: str,
+        max_depth: int = 2,
+        max_results: int = 5,
+        min_relevance_score: float = 0.0,
+        as_contexts: bool = False,
+        min_trust_tier: Optional["TrustTier"] = None,
+        **options,
+    ) -> Union[Any, List[RetrievedContext]]:
+        """
+        Execute DRIFT hybrid search combining global framing and local graph traversal.
+
+        Args:
+            query: Search query
+            max_depth: Maximum graph expansion depth
+            max_results: Maximum results when returning contexts
+            min_relevance_score: Minimum relevance score
+            as_contexts: If True, return List[RetrievedContext];
+                if False, return DriftSearchResult
+            min_trust_tier: Optional trust threshold. The DRIFT answer is a
+                summary with no evidence signal and is always kept when a
+                threshold is set. Verified local facts are graph edges, so
+                they are always graded (quarantine without signals) and
+                filtered.
+            **options: Additional options passed to DriftSearchEngine
+
+        Returns:
+            DriftSearchResult or List[RetrievedContext]
+        """
+        from .drift_search import DriftSearchEngine
+
+        kg = options.pop("knowledge_graph", None)
+        if kg is None:
+            kg = options.pop("graph", self.knowledge_graph)
+        else:
+            options.pop("graph", None)
+
+        reports = options.pop("reports", None)
+        if reports is None:
+            reports = options.pop("community_reports", self.community_reports)
+        else:
+            options.pop("community_reports", None)
+
+        hierarchy = options.pop("hierarchy", None)
+        if hierarchy is None:
+            hierarchy = options.pop("community_hierarchy", self.community_hierarchy)
+        else:
+            options.pop("community_hierarchy", None)
+
+        llm = options.pop("llm", self.llm)
+
+        engine = DriftSearchEngine(
+            knowledge_graph=kg,
+            reports=reports,
+            hierarchy=hierarchy,
+            llm=llm,
+            max_depth=max_depth,
+            **options,
+        )
+        res = engine.search(query, max_depth=max_depth, **options)
+        if as_contexts:
+            context_threshold = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
+            contexts = [
+                c for c in res.to_retrieved_contexts()
+                if c.score >= context_threshold
+            ]
+            self._attach_trust_tiers(contexts)
+            if min_trust_tier is not None:
+                # The DRIFT answer is an unscored summary and is kept; the
+                # verified local facts are graded as graph facts and filtered.
+                contexts = self.filter_by_tier(
+                    contexts, min_trust_tier, include_unscored=True
+                )
+            return contexts[:max_results]
+        return res
 
     def _retrieve_from_vector(
         self, query: str, max_results: int
@@ -348,8 +860,10 @@ class ContextRetriever:
                         content = res.get("content") or res.get("node", {}).get(
                             "content"
                         )
-                        metadata = res.get("metadata") or res.get("node", {}).get(
-                            "metadata"
+                        metadata = (
+                            res.get("metadata")
+                            or res.get("node", {}).get("metadata")
+                            or res.get("node", {}).get("properties")
                         )
 
                     score = res.get("score", 0.0)
@@ -549,6 +1063,12 @@ class ContextRetriever:
                                     related_entities.append(e)
                                     break
                     
+                    # Cap relationship attachments before rendering prose so the
+                    # validated bundle and the rendered content stay aligned: the
+                    # filter only sees the first 10 relationships, so the prose
+                    # must describe no more than those 10.
+                    related_relationships = related_relationships[:10]
+
                     # Generate comprehensive content from entity and relationships
                     entity_display = entity.get('name', entity_id)
                     
@@ -662,7 +1182,7 @@ class ContextRetriever:
                                 **entity.get("metadata", {}),
                             },
                             related_entities=related_entities[:10],  # Limit entities
-                            related_relationships=related_relationships[:10],  # Limit relationships
+                            related_relationships=related_relationships,  # Already capped above
                         )
                     )
 
@@ -735,55 +1255,101 @@ class ContextRetriever:
             return []
 
     def _rank_and_merge(
-        self, results: List[RetrievedContext], query: str
+        self,
+        results: List[RetrievedContext],
+        query: str,
+        *,
+        merge_duplicates: bool = True,
     ) -> List[RetrievedContext]:
         """Rank and merge results from multiple sources with GraphRAG optimization."""
+        def is_graph_source(s: Optional[str]) -> bool:
+            if not s:
+                return False
+            return (
+                s.startswith("graph")
+                or s.startswith("global")
+                or s.startswith("drift")
+                or s.startswith("community")
+                or s in ("global_search", "drift_search", "local_graph")
+            )
+
         # Separate results by source (handle None source gracefully)
         vector_results = [r for r in results if r.source and r.source.startswith("vector:")]
-        graph_results = [r for r in results if r.source and r.source.startswith("graph:")]
+        graph_results = [r for r in results if is_graph_source(r.source)]
         memory_results = [r for r in results if r.source and r.source.startswith("memory:")]
+        other_results = [
+            r for r in results
+            if (
+                r not in vector_results
+                and r not in graph_results
+                and r not in memory_results
+            )
+        ]
         
         # Normalize scores within each source (0-1 range)
         def normalize_scores(source_results):
-            if not source_results:
+            unweighted = [
+                r for r in source_results
+                if not (r.metadata and r.metadata.get("_source_weighted"))
+            ]
+            if not unweighted:
                 return source_results
-            scores = [r.score for r in source_results]
+            scores = [r.score for r in unweighted]
             if not scores:
                 return source_results
             min_score, max_score = min(scores), max(scores)
             if max_score > min_score:
-                for r in source_results:
+                for r in unweighted:
                     r.score = (r.score - min_score) / (max_score - min_score)
             return source_results
-        
+
         vector_results = normalize_scores(vector_results)
         graph_results = normalize_scores(graph_results)
         memory_results = normalize_scores(memory_results)
-        
+        other_results = normalize_scores(other_results)
+
         # Apply hybrid_alpha weighting: 0=vector only, 1=graph only, 0.5=balanced
         alpha = self.hybrid_alpha
         for r in vector_results:
-            r.score = r.score * (1 - alpha)  # Weight vector results
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * (1 - alpha)  # Weight vector results
+                r.metadata["_source_weighted"] = True
         for r in graph_results:
-            r.score = r.score * alpha  # Weight graph results
-            # Boost graph results with more context (more related entities/relationships)
-            context_boost = min(
-                0.2,  # Max 20% boost
-                (len(r.related_entities) + len(r.related_relationships or [])) * 0.01
-            )
-            r.score += context_boost
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * alpha  # Weight graph results
+                # Boost graph results with more context
+                context_boost = min(
+                    0.2,  # Max 20% boost
+                    (len(r.related_entities) + len(r.related_relationships or [])) * 0.01
+                )
+                r.score += context_boost
+                r.metadata["_source_weighted"] = True
         for r in memory_results:
-            r.score = r.score * 0.3  # Lower weight for memory
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * 0.3  # Lower weight for memory
+                r.metadata["_source_weighted"] = True
+        for r in other_results:
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * 0.5  # Neutral weight for other
+                r.metadata["_source_weighted"] = True
         
         # Deduplicate by entity ID (for graph) or content (for others)
         seen_entities = {}  # entity_id -> result
         seen_content = {}   # content_hash -> result
         
-        all_results = vector_results + graph_results + memory_results
+        all_results = vector_results + graph_results + memory_results + other_results
         
-        for result in all_results:
+        for result in (all_results if merge_duplicates else []):
             # For graph results, deduplicate by entity ID
-            if result.source and result.source.startswith("graph:"):
+            if is_graph_source(result.source):
                 entity_id = result.metadata.get("node_id")
                 if entity_id:
                     if entity_id not in seen_entities:
@@ -817,7 +1383,7 @@ class ContextRetriever:
                                 if rel_key not in existing_rel_ids:
                                     existing.related_relationships.append(rel)
                                     existing_rel_ids.add(rel_key)
-                        continue
+                    continue
             
             # For non-graph results, deduplicate by content
             content_key = result.content[:100] if result.content else ""
@@ -829,10 +1395,18 @@ class ContextRetriever:
                 existing.metadata.update(result.metadata)
         
         # Combine deduplicated results
-        merged_results = list(seen_entities.values()) + [
-            r for r in seen_content.values() 
-            if not (r.source and r.source.startswith("graph:")) or r.metadata.get("node_id") not in seen_entities
-        ]
+        if merge_duplicates:
+            merged_results = list(seen_entities.values()) + [
+                r for r in seen_content.values()
+                if (
+                    not is_graph_source(r.source)
+                    or r.metadata.get("node_id") not in seen_entities
+                )
+            ]
+        else:
+            # Grounded retrieval: every validated candidate is kept; merging
+            # could mix provenance across rows that reference the same node.
+            merged_results = list(all_results)
         
         # Re-rank with query relevance boost
         if self.vector_store and hasattr(self.vector_store, 'embed'):
@@ -966,6 +1540,8 @@ class ContextRetriever:
                                             "id": target_id,
                                             "type": node.get("type"),
                                             "content": node.get("content"),
+                                            "metadata": node.get("metadata")
+                                            or node.get("properties"),
                                             "relationship": edge.get("type"),
                                             "hop": hop + 1,
                                         }
@@ -984,6 +1560,8 @@ class ContextRetriever:
                                             "id": source_id,
                                             "type": node.get("type"),
                                             "content": node.get("content"),
+                                            "metadata": node.get("metadata")
+                                            or node.get("properties"),
                                             "relationship": edge.get("type"),
                                             "hop": hop + 1,
                                         }
@@ -1514,7 +2092,8 @@ Answer:"""
                 ``{at_time}`` and ``{source}`` placeholders are substituted;
                 any other braces are left as-is.  Defaults to
                 ``"[Graph context valid as of: {at_time} UTC | Source: {source}]"``.
-            **kwargs: Additional retrieval options passed to ``retrieve()``
+            **kwargs: Additional retrieval options passed to ``retrieve()``; ``truth_filter`` is
+                rejected here, use ``retrieve()`` directly instead
 
         Returns:
             Dictionary with:
@@ -1533,6 +2112,15 @@ Answer:"""
             ... )
             >>> print(result['response'])
         """
+        if kwargs.get("truth_filter") is not None:
+            raise ValidationError(
+                "truth_filter is not supported on query_with_reasoning; use "
+                "ContextRetriever.retrieve(..., truth_filter=...) directly and "
+                "assemble the verified context before reasoning",
+                validation_context={
+                    "method": "ContextRetriever.query_with_reasoning"
+                },
+            )
         tracking_id = self.progress_tracker.start_tracking(
             file=None,
             module="context",
@@ -2129,18 +2717,20 @@ Answer:"""
                 # Use community detection for contextually related entities
                 if self.community_detector:
                     try:
-                        communities = self.community_detector.detect_communities(self.knowledge_graph)
-                        
+                        community_result = self.community_detector.detect_communities(
+                            self.knowledge_graph
+                        )
+                        node_assignments = community_result.get("node_assignments", {})
+
                         # Find community of current entity
-                        entity_community = None
-                        for comm_id, comm_nodes in communities.items():
-                            if entity_name in comm_nodes:
-                                entity_community = comm_id
-                                break
-                        
+                        entity_community = node_assignments.get(entity_name)
+
                         # Add other entities from same community
                         if entity_community is not None:
-                            same_community_entities = communities[entity_community]
+                            same_community_entities = [
+                                node for node, community_id in node_assignments.items()
+                                if community_id == entity_community
+                            ]
                             for comm_entity in same_community_entities:
                                 if comm_entity != entity_name and comm_entity not in [e["name"] for e in expanded_entities]:
                                     expanded_entities.append({

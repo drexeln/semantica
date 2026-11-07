@@ -94,6 +94,7 @@ from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.helpers import ensure_directory
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import canonical_endpoints, first_set_id, has_endpoints
 
 # Explicit Arrow Schemas (no inference)
 if ARROW_AVAILABLE:
@@ -213,7 +214,7 @@ class ArrowExporter:
         file_path: Union[str, Path],
         schema: Optional["pa.Schema"] = None,
         **options,
-    ) -> None:
+    ) -> List[Path]:
         """
         Export data to Arrow IPC file(s).
 
@@ -227,6 +228,11 @@ class ArrowExporter:
             file_path: Output file path (base path for dict exports)
             schema: Arrow schema to use (default: auto-select based on data)
             **options: Additional options
+
+        Returns:
+            The files written. A dictionary is written one file per key, so
+            this is how a caller learns which files a multi-file export
+            produced; a list is written to ``file_path``.
 
         Raises:
             ValidationError: If data type is unsupported
@@ -264,6 +270,17 @@ class ArrowExporter:
                 )
                 for key, value in data.items():
                     if isinstance(value, list):
+                        if not value:
+                            # An empty collection has nothing to write and
+                            # _write_arrow refuses it, which aborts the call
+                            # and leaves the remaining collections unwritten.
+                            # export_knowledge_graph() below and
+                            # ParquetExporter's dictionary branch skip it the
+                            # same way.
+                            self.logger.debug(
+                                f"Skipping key '{key}': collection is empty"
+                            )
+                            continue
                         output_path = file_path.parent / f"{file_path.stem}_{key}.arrow"
 
                         # Select schema based on key
@@ -292,6 +309,7 @@ class ArrowExporter:
                     status="completed",
                     message=f"Exported {len(exported_files)} Arrow files",
                 )
+                return exported_files
             elif isinstance(data, list):
                 # Single Arrow file
                 self.progress_tracker.update_tracking(
@@ -305,6 +323,7 @@ class ArrowExporter:
                     status="completed",
                     message=f"Exported Arrow to: {file_path}",
                 )
+                return [file_path]
             else:
                 raise ValidationError(
                     f"Unsupported data type: {type(data)}. "
@@ -466,15 +485,17 @@ class ArrowExporter:
 
         # Normalize relationship data to consistent format
         normalized_rels = []
-        for i, rel in enumerate(relationships):
+        for i, rel in enumerate(canonical_endpoints(relationships)):
             if not isinstance(rel, dict):
                 self.logger.warning(f"Relationship {i} is not a dictionary, skipping")
                 continue
 
             # Extract and normalize fields
             rel_id = rel.get("id", f"rel_{i}")
-            source_id = rel.get("source_id") or rel.get("source", "")
-            target_id = rel.get("target_id") or rel.get("target", "")
+            source_id = first_set_id(rel, ("source_id", "source"))
+            target_id = first_set_id(rel, ("target_id", "target"))
+            source_id = "" if source_id is None else source_id
+            target_id = "" if target_id is None else target_id
             rel_type = rel.get("type") or rel.get("relationship_type", "")
             confidence = rel.get("confidence")
 
@@ -515,7 +536,7 @@ class ArrowExporter:
 
     def export_knowledge_graph(
         self, knowledge_graph: Dict[str, Any], base_path: Union[str, Path], **options
-    ) -> None:
+    ) -> List[Path]:
         """
         Export knowledge graph to multiple Arrow IPC files.
 
@@ -534,6 +555,11 @@ class ArrowExporter:
             base_path: Base path for output files (without extension)
             **options: Additional options passed to export methods
 
+        Returns:
+            The files written, in the order they were exported. An empty
+            collection is not written, so a graph with no relationships
+            produces one file rather than two.
+
         Example:
             >>> kg = {
             ...     "entities": [...],
@@ -548,7 +574,7 @@ class ArrowExporter:
             f"Exporting knowledge graph to Arrow files: base_path={base_path}"
         )
 
-        exported_files = []
+        exported_files: List[Path] = []
 
         # Export entities
         entities = knowledge_graph.get("entities", [])
@@ -581,6 +607,8 @@ class ArrowExporter:
             )
         else:
             self.logger.warning("No data found in knowledge graph to export")
+
+        return exported_files
 
     def _dict_to_struct(self, metadata: Dict[str, Any]) -> Dict[str, List]:
         """
@@ -645,14 +673,10 @@ class ArrowExporter:
             # Try to detect if data looks like entities or relationships
             sample = data[0] if data else {}
 
-            # Check for relationship-specific fields
-            has_source = any(k in sample for k in ["source_id", "source"])
-            has_target = any(k in sample for k in ["target_id", "target"])
-
             # Check for entity-specific fields
             has_text = any(k in sample for k in ["text", "label", "name"])
 
-            if has_source and has_target:
+            if has_endpoints(sample):
                 schema = RELATIONSHIP_SCHEMA
                 self.logger.debug("Auto-detected relationship schema")
             elif has_text or "type" in sample:
@@ -665,6 +689,13 @@ class ArrowExporter:
                     "Provide explicit schema or use "
                     "export_entities/export_relationships methods."
                 )
+
+        if schema == RELATIONSHIP_SCHEMA:
+            data = [dict(record) for record in canonical_endpoints(data)]
+            for record in data:
+                for key in ("id", "source_id", "target_id"):
+                    if record.get(key) is not None:
+                        record[key] = str(record[key])
 
         self.logger.debug(
             f"Writing Arrow IPC file: {len(data)} row(s), "

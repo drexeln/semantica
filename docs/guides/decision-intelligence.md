@@ -102,9 +102,8 @@ The `Decision` dataclass that backs this node has the following fields — these
 from semantica.context import Decision
 from datetime import datetime
 
-# Constructing a Decision explicitly (alternative to record_decision)
 d = Decision(
-    decision_id    = "dec_001",           # UUID — auto-generated if omitted via record_decision
+    decision_id    = None,                # required arg — None/"" auto-generates a UUID
     category       = "threat_classification",
     scenario       = "Unattributed C2 cluster",
     reasoning      = "Infrastructure overlaps APT29 ASN",
@@ -117,8 +116,28 @@ d = Decision(
     valid_until    = "2025-09-30T23:59:59",   # ISO datetime
     metadata       = {"source_feed": "isac_partner_b"},
 )
-graph.add_decision(d)
 ```
+
+To actually store a decision built this way, pass its fields to `ContextGraph.add_decision()` as keyword arguments — this is the alternative to `record_decision()` for cases where you want `valid_from`/`valid_until` or extra metadata fields alongside the required ones:
+
+```python
+decision_id = graph.add_decision(
+    category       = "threat_classification",
+    scenario       = "Unattributed C2 cluster",
+    reasoning      = "Infrastructure overlaps APT29 ASN",
+    outcome        = "classified_as_apt29_cluster",
+    confidence     = 0.88,               # float 0.0–1.0
+    decision_maker = "cti_pipeline_v2",
+    # optional fields:
+    valid_from     = "2025-07-01T00:00:00",   # ISO datetime
+    valid_until    = "2025-09-30T23:59:59",   # ISO datetime
+    source_feed    = "isac_partner_b",        # extra kwargs are stored as metadata
+)
+```
+
+<Info>
+`add_decision()` also accepts a pre-built `Decision` object: `graph.add_decision(Decision(...))`. Both forms are indexed the same way, so the decision is visible to `find_precedents()`, `get_decision_insights()`, `analyze_decision_influence()` and `trace_decision_causality()` as soon as it is added. The object form keeps the `decision_id` you set on it. The keyword form, like `record_decision()`, generates its own `decision_id` and returns it. Entries in `Decision.metadata` are stored on the node but cannot override the decision's own fields such as `category` or `confidence`.
+</Info>
 
 ## Searching Precedents Before Deciding
 
@@ -137,7 +156,7 @@ for p in precedents:
     print("  Similarity: {:.3f}".format(p.metadata.get("similarity_score", 0)))
 ```
 
-Hybrid search blends two signals: semantic similarity over the `scenario` and `reasoning` text (weight 0.7), and structural graph proximity via Node2Vec embeddings (weight 0.3). The result is a ranked list of `Decision` objects — the most similar past decisions float to the top regardless of how differently they were phrased.
+Hybrid search blends two signals: lexical overlap between the query and each decision's `scenario`, `reasoning`, and `entities` text (weight 0.7 — word-level Jaccard similarity, with a character-bigram fallback for CJK-style queries), and structural similarity based on how many other nodes each decision connects to in the graph (weight 0.3, only computed when the graph was built with `advanced_analytics=True`). The result is a ranked list of `Decision` objects, filtered to those scoring at least `similarity_threshold` (default 0.5) — because the match is lexical rather than embedding-based, precedents phrased very differently from the query may not surface even if they describe a similar scenario.
 
 ## Building a Causal Chain
 
@@ -262,13 +281,15 @@ d = Decision(
 )
 
 if engine.check_compliance(d, "cti_confidence_gate"):
-    graph.add_decision(d)
-    engine.record_policy_application(d.decision_id, "cti_confidence_gate", "1.0")
+    decision_id = graph.add_decision(d)
+    engine.record_policy_application(decision_id, "cti_confidence_gate", "1.0")
     print("Decision recorded — policy compliant.")
 else:
     print("Decision blocked — confidence 0.62 below policy minimum 0.80.")
     # → "Decision blocked — confidence 0.62 below policy minimum 0.80."
 ```
+
+A `False` return from `check_compliance` means the rules were evaluated and the decision did not satisfy them. If the check itself cannot be executed — for example, a policy rule that cannot be compared against the decision's data — the call raises `ProcessingError` instead of returning `False`, so an evaluation failure is never reported as a compliance verdict. See the [Policy Engine guide](policy-engine) for the full contract.
 
 When a high-urgency situation requires bypassing the policy gate, record the exception with the approver identity and justification:
 
@@ -290,7 +311,27 @@ print("Policy exception recorded:", exception_id)
 
 For multi-level approval workflows, use `DecisionRecorder.record_approval_chain()` with a graph database backend (for example Neo4j/FalkorDB). The in-memory `ContextGraph` examples used in this guide do not support approval-chain persistence via `execute_query()`.
 
+## Scoring Decisions Automatically on Record
 
+`DecisionRecorder` (and `AgentContext`, for its `graph_store` decision-tracking backend) can run `semantica.evals` evaluators automatically every time a decision is recorded, storing the result on `Decision.metadata`. This is opt-in — pass `evaluators`/`eval_config` at construction time, or leave them unset and `record_decision()` behaves exactly as before.
+
+```python
+from semantica.context import DecisionRecorder
+
+recorder = DecisionRecorder(
+    graph_store=graph,
+    evaluators=["decision_scores"],
+    eval_config={"decision_scores": {"policy_engine": engine, "policy_id": "cti_confidence_gate"}},
+)
+decision_id = recorder.record_decision(d, entities=[], source_documents=[])
+
+# d.metadata now also has:
+#   eval_score:   0.83   (mean score across configured evaluators)
+#   eval_passed:  False
+#   eval_details: {"decision_scores": {"score": ..., "passed": ..., "meta": {...}}}
+```
+
+If an evaluator raises, the failure is logged and the decision is still recorded without `eval_*` metadata — a broken evaluator never blocks decision persistence. `AgentContext(..., decision_tracking=True, evaluators=[...], eval_config={...})` threads the same configuration into the `DecisionRecorder` it constructs for the `graph_store` backend; the `context_graph` backend does not yet run evaluators.
 
 ## Generating a Decision Audit Report
 
@@ -583,6 +624,8 @@ d = Decision(
     decision_maker = "credit_model_v3",
 )
 
+# False = evaluated and non-compliant; if the check cannot run at
+# all, check_compliance raises ProcessingError (see policy-engine guide).
 if engine.check_compliance(d, "lending_policy_v3"):
     loan_id = context.record_decision(
         category=d.category, scenario=d.scenario,
@@ -590,7 +633,7 @@ if engine.check_compliance(d, "lending_policy_v3"):
         decision_maker=d.decision_maker,
     )
     graph.add_causal_relationship(stress_id, loan_id, "INFLUENCED")
-    engine.record_policy_application(d.decision_id, "lending_policy_v3", "3.0")
+    engine.record_policy_application(loan_id, "lending_policy_v3", "3.0")
     print("Loan decision recorded — policy compliant.")
 
     # SR 11-7 explainability report
@@ -638,8 +681,8 @@ results = context.find_precedents("APT29 infrastructure attribution", limit=5)
 
 ## Related Guides
 
-- [Context Graphs](context-graphs) — how `ContextGraph` stores decision nodes and causal edges
-- [Distance Intelligence](distance-intelligence) — `trace_decision_causality()` annotates causal chains with confidence decay and distance bands
-- [Provenance](provenance) — W3C PROV-O audit trail that wraps decision records in standards-compliant provenance
-- [MCP Server](mcp-server) — expose decision recording and precedent search to LLM agents via the `record_decision` and `find_precedents` tools
-- [Change Management](change-management) — checkpoint decision state with `flush_checkpoint()` for versioned snapshots
+- [Context Graphs](/guides/context-graphs) — how `ContextGraph` stores decision nodes and causal edges
+- [Distance Intelligence](/guides/distance-intelligence) — `trace_decision_causality()` annotates causal chains with confidence decay and distance bands
+- [Provenance](/guides/provenance) — W3C PROV-O audit trail that wraps decision records in standards-compliant provenance
+- [MCP Server](/guides/mcp-server) — expose decision recording and precedent search to LLM agents via the `record_decision` and `find_precedents` tools
+- [Change Management](/guides/change-management) — checkpoint decision state with `flush_checkpoint()` for versioned snapshots

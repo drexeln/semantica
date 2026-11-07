@@ -30,6 +30,17 @@ from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.helpers import ensure_directory
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import (
+    SOURCE_ENDPOINT_NAMES,
+    TARGET_ENDPOINT_NAMES,
+    first_set_id,
+    is_unset_id,
+)
+
+
+def _id_text(value: Any) -> str:
+    """An id as text: unset ids are empty, and ``0`` stays ``"0"``."""
+    return "" if is_unset_id(value) else str(value)
 
 
 class GraphExporter:
@@ -246,7 +257,7 @@ class GraphExporter:
         entities = kg.get("entities", [])
         for entity in entities:
             node = {
-                "id": entity.get("id") or entity.get("entity_id"),
+                "id": first_set_id(entity, ("id", "entity_id")),
                 "label": (
                     entity.get("text")
                     or entity.get("label")
@@ -269,8 +280,8 @@ class GraphExporter:
         relationships = kg.get("relationships", [])
         for rel in relationships:
             edge = {
-                "source": rel.get("source_id") or rel.get("source"),
-                "target": rel.get("target_id") or rel.get("target"),
+                "source": first_set_id(rel, SOURCE_ENDPOINT_NAMES),
+                "target": first_set_id(rel, TARGET_ENDPOINT_NAMES),
                 "type": rel.get("type") or rel.get("relationship_type", "related_to"),
             }
 
@@ -329,12 +340,27 @@ class GraphExporter:
         lines.append('         http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">')
         lines.append("")
 
-        # Define attribute keys
+        # Define attribute keys.
+        # GraphML requires every key id referenced by a <data> element to be
+        # declared here with a matching <key> element.
+        #
+        # for="all"  — key is valid on both nodes and edges
+        # for="node" — key is valid on nodes only
+        # for="edge" — key is valid on edges only
+        #
+        # label    : used on <node> (human-readable label) and <edge> (type).
+        #            Declared for="all" so both uses are schema-valid.
+        # type     : node entity type; only written on nodes.
+        # confidence: written on both nodes and edges when include_attributes
+        #             is True; declared for="all" so edge confidence is valid.
+        lines.append(
+            '  <key id="label" for="all" attr.name="label" attr.type="string"/>'
+        )
         lines.append(
             '  <key id="type" for="node" attr.name="type" attr.type="string"/>'
         )
         lines.append(
-            '  <key id="confidence" for="node" attr.name="confidence" attr.type="double"/>'
+            '  <key id="confidence" for="all" attr.name="confidence" attr.type="double"/>'
         )
         lines.append("")
 
@@ -342,23 +368,31 @@ class GraphExporter:
         lines.append('  <graph id="G" edgedefault="directed">')
         lines.append("")
 
+        # xml.sax.saxutils helpers:
+        #   escape(v)     – escapes & < > in text node content
+        #   quoteattr(v)  – escapes & < > " ' and wraps in the
+        #                   appropriate quote character for use as an
+        #                   XML attribute value (including the quotes)
+        from xml.sax.saxutils import escape, quoteattr
+
         # Export nodes
         nodes = graph_data.get("nodes", [])
         for node in nodes:
-            node_id = node.get("id", "")
-            label = node.get("label", "")
-            node_type = node.get("type", "")
+            node_id = _id_text(node.get("id"))
+            label = str(node.get("label") or "")
+            node_type = str(node.get("type") or "")
 
-            lines.append(f'    <node id="{node_id}">')
-            lines.append(f'      <data key="label">{label}</data>')
-            lines.append(f'      <data key="type">{node_type}</data>')
+            # quoteattr produces the surrounding quotes; do NOT add extra "…"
+            lines.append(f"    <node id={quoteattr(node_id)}>")
+            lines.append(f"      <data key=\"label\">{escape(label)}</data>")
+            lines.append(f"      <data key=\"type\">{escape(node_type)}</data>")
 
             # Add attributes if requested
             if self.include_attributes and "attributes" in node:
                 attrs = node["attributes"]
                 if "confidence" in attrs:
                     lines.append(
-                        f'      <data key="confidence">{attrs["confidence"]}</data>'
+                        f"      <data key=\"confidence\">{escape(str(attrs['confidence']))}</data>"
                     )
 
             lines.append("    </node>")
@@ -368,19 +402,19 @@ class GraphExporter:
         # Export edges
         edges = graph_data.get("edges", [])
         for edge in edges:
-            source = edge.get("source", "")
-            target = edge.get("target", "")
-            edge_type = edge.get("type", "")
+            source = _id_text(edge.get("source"))
+            target = _id_text(edge.get("target"))
+            edge_type = str(edge.get("type") or "")
 
-            lines.append(f'    <edge source="{source}" target="{target}">')
-            lines.append(f'      <data key="label">{edge_type}</data>')
+            lines.append(f"    <edge source={quoteattr(source)} target={quoteattr(target)}>")
+            lines.append(f"      <data key=\"label\">{escape(edge_type)}</data>")
 
             # Add attributes if requested
             if self.include_attributes and "attributes" in edge:
                 attrs = edge["attributes"]
                 if "confidence" in attrs:
                     lines.append(
-                        f'      <data key="confidence">{attrs["confidence"]}</data>'
+                        f"      <data key=\"confidence\">{escape(str(attrs['confidence']))}</data>"
                     )
 
             lines.append("    </edge>")
@@ -489,7 +523,7 @@ class GraphExporter:
         nodes = graph_data.get("nodes", [])
         for node in nodes:
             # Escape quotes in IDs and labels
-            node_id = node.get("id", "").replace('"', '\\"')
+            node_id = _id_text(node.get("id")).replace('"', '\\"')
             label = node.get("label", "").replace('"', '\\"')
             node_type = node.get("type", "")
 
@@ -507,8 +541,8 @@ class GraphExporter:
         edges = graph_data.get("edges", [])
         for edge in edges:
             # Escape quotes in source, target, and type
-            source = edge.get("source", "").replace('"', '\\"')
-            target = edge.get("target", "").replace('"', '\\"')
+            source = _id_text(edge.get("source")).replace('"', '\\"')
+            target = _id_text(edge.get("target")).replace('"', '\\"')
             edge_type = edge.get("type", "").replace('"', '\\"')
 
             # Build edge attributes

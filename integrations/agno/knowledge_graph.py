@@ -277,25 +277,22 @@ class AgnoKnowledgeGraph(_KnowledgeBase):  # type: ignore[misc]
     def load_urls(self, urls: List[str]) -> None:
         """Fetch each URL and ingest the response body.
 
-        Only ``http`` and ``https`` schemes are permitted to prevent SSRF.
+        Uses the shared SSRF guard so that ``http`` and ``https`` are the only
+        permitted schemes, private/loopback/link-local/cloud-metadata addresses
+        are blocked by default, DNS resolution is validated, and every redirect
+        hop is re-checked before being followed.
         """
-        import urllib.request
-        from urllib.parse import urlparse
+        from semantica.ingest.ssrf import request_with_ssrf_guard
+        from semantica.utils.exceptions import ValidationError
 
         for url in urls:
-            parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https"):
-                logger.warning(
-                    "Skipping URL with disallowed scheme '%s': %s",
-                    parsed.scheme,
-                    url,
-                )
-                continue
             try:
-                with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310
-                    text = resp.read().decode("utf-8", errors="replace")
+                response = request_with_ssrf_guard("GET", url, timeout=10)
+                text = response.text
                 self._ingest_text(text, source=url)
                 logger.info("Loaded URL: %s", url)
+            except ValidationError as exc:
+                logger.warning("Skipping URL (SSRF check failed) %s: %s", url, exc)
             except Exception as exc:
                 logger.warning("Failed to fetch %s: %s", url, exc)
 
@@ -331,9 +328,9 @@ class AgnoKnowledgeGraph(_KnowledgeBase):  # type: ignore[misc]
             neighbours = self._graph.get_neighbors(node_id=entity, hops=1)
             for n in (neighbours or [])[:10]:
                 if isinstance(n, dict):
-                    node_id = n.get("node_id", "")
-                    ntype = n.get("node_type", "")
-                    edge_type = n.get("edge_type", "related_to")
+                    node_id = n.get("id", "")
+                    ntype = n.get("type", "")
+                    edge_type = n.get("relationship", "related_to")
                     suffix = f" (type: {ntype})" if ntype else ""
                     lines.append(f"  --[{edge_type}]--> {node_id}{suffix}")
                 else:
@@ -382,7 +379,7 @@ class AgnoKnowledgeGraph(_KnowledgeBase):  # type: ignore[misc]
             ner_result: List[Any] = []
             try:
                 ner_result = self._ner.extract_entities(chunk) or []
-                chunk_entities = [getattr(e, "name", str(e)) for e in ner_result]
+                chunk_entities = [getattr(e, "text", str(e)) for e in ner_result]
                 all_entities.extend(chunk_entities)
             except Exception as exc:
                 logger.debug("NER failed for chunk in '%s': %s", source, exc)
@@ -461,9 +458,9 @@ class AgnoKnowledgeGraph(_KnowledgeBase):  # type: ignore[misc]
                 neighbours = self._graph.get_neighbors(node_id=entity, hops=1)
                 for n in (neighbours or [])[:3]:
                     if isinstance(n, dict):
-                        node_id = n.get("node_id", "")
-                        ntype = n.get("node_type", "")
-                        edge_type = n.get("edge_type", "related_to")
+                        node_id = n.get("id", "")
+                        ntype = n.get("type", "")
+                        edge_type = n.get("relationship", "related_to")
                         lines.append(
                             f"- {entity} --[{edge_type}]--> {node_id}"
                             + (f" ({ntype})" if ntype else "")

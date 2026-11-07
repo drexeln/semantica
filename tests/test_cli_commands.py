@@ -13,9 +13,15 @@ Strategy:
 - Service commands: subprocess.Popen is mocked so nothing actually launches.
 """
 
+import builtins
 import json
 import os
+import sys
+import time
+import re
 import stat
+import sys
+import tarfile
 import types
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -25,6 +31,20 @@ from click.testing import CliRunner
 
 import semantica.cli as cli_module
 
+# The ImportError-path tests below patch `builtins.__import__` and fall through
+# to `__import__` for the modules they do not want to block. Inside that patch
+# the name resolves to the patched builtin, so the fall-through called the mock
+# again and recursed until the interpreter ran out of stack — a hard crash on
+# Windows, a bare RecursionError (which the command's error handler then turned
+# into a passing "clean error") elsewhere. Keep the real function to fall back to.
+_real_import = builtins.__import__
+
+# A prefix check on the patched name never fires for the CLI's backend modules:
+# `cli.py` imports them relatively (`from .parse import ...`), so `__import__`
+# is called with the bare local name at level 1 (`'parse'`, never
+# `'semantica.parse'`). Those tests block the module by putting None in
+# `sys.modules` instead, which raises ImportError however the import is spelled.
+
 
 # ─── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +52,18 @@ import semantica.cli as cli_module
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture
+def graph_cfg(tmp_path) -> str:
+    """A config that points the memory graph backend at a throwaway file.
+
+    Keeps commands that read the configured graph away from the developer's own
+    ``~/.semantica/context_graph.json``.
+    """
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(f"graph_db:\n  backend: memory\n  path: {tmp_path / 'graph.json'}\n")
+    return str(cfg)
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +99,77 @@ def _json_output(result) -> Any:
     """Parse JSON from command output; raises on bad JSON."""
     assert result.exit_code == 0, f"exit={result.exit_code}: {result.output}"
     return json.loads(result.output.strip())
+
+
+def _wire_inmemory_vector_store(monkeypatch, namespaces, built=None):
+    """Point the CLI at a real in-memory VectorStore, one vector per namespace.
+
+    store flush reads what the backend actually holds, so its tests drive the
+    real VectorStore API instead of stubbing delete_vectors() — a
+    ``lambda **kw`` stub is what hid the original TypeError (#1943). Only the
+    constructor call is redirected; its kwargs are appended to ``built`` so a
+    test can assert which backend and config the CLI asked for. Returns the
+    store so a test can inspect what survived.
+    """
+    import sys as _sys
+
+    import numpy as np
+
+    from semantica.vector_store import VectorStore as _RealVectorStore
+    from semantica.vector_store import vector_store as _vs_mod
+
+    class _StubEmbedder:
+        """Offline stand-in: a real EmbeddingGenerator probes HuggingFace."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def get_embedding_dimension(self) -> int:
+            return 4
+
+        def embed(self, text: str) -> Any:
+            return np.zeros(4)
+
+    monkeypatch.setattr(_vs_mod, "EmbeddingGenerator", _StubEmbedder)
+
+    store = _RealVectorStore(backend="inmemory", config={"dimension": 4})
+    if namespaces:
+        store.store_vectors(
+            [np.zeros(4) for _ in namespaces],
+            metadata=[{"namespace": name} for name in namespaces],
+        )
+    def _construct(**kwargs: Any) -> Any:
+        if built is not None:
+            built.append(kwargs)
+        return store
+
+    monkeypatch.setitem(
+        _sys.modules,
+        "semantica.vector_store",
+        _fake_module(VectorStore=_construct),
+    )
+    return store
+
+
+def _flatten(output: str) -> str:
+    """Undo Rich panel wrapping for substring assertions on error text.
+
+    Rich wraps long messages across multiple bordered lines (each with its
+    own leading/trailing "│"), so a naive whitespace join still leaves those
+    border characters between words that were split across lines. Strip the
+    box-drawing characters first, then collapse whitespace.
+    """
+    for ch in "┌┐└┘│─":
+        output = output.replace(ch, " ")
+    return " ".join(output.split())
+
+
+def _iter_subcommands(group, prefix=()):
+    """Yield the CLI path of every registered subcommand, depth first."""
+    for name, command in getattr(group, "commands", {}).items():
+        path = prefix + (name,)
+        yield path
+        yield from _iter_subcommands(command, path)
 
 
 # ─── Global flags ─────────────────────────────────────────────────────────────
@@ -172,6 +275,40 @@ class TestGlobalFlags:
 # ─── kg subcommands ───────────────────────────────────────────────────────────
 
 
+# Graph handed to the kg wrappers by these tests. The old versions replaced
+# `semantica.kg` wholesale with MagicMocks whose method signatures did not
+# match the real classes, so every defect in #1941 passed the suite: the
+# assertions were made against the fake, never against the code. Patching
+# only _kg_graph() lets the real GraphAnalyzer / PathFinder / EntityResolver /
+# LinkPredictor / GraphValidator run against a known graph instead.
+FIXTURE_KG = {
+    "entities": [
+        {"id": "Alice", "type": "person", "text": "Alice"},
+        {"id": "Bob", "type": "person", "text": "Bob"},
+        {"id": "Acme", "type": "org", "text": "Acme"},
+    ],
+    "relationships": [
+        {"id": "r1", "source": "Alice", "target": "Bob",
+         "type": "knows", "weight": 1.0},
+        {"id": "r2", "source": "Bob", "target": "Acme",
+         "type": "works_at", "weight": 1.0},
+    ],
+}
+
+
+def _fixture_graph(monkeypatch) -> None:
+    """Point the kg CLI at FIXTURE_KG, leaving the real KG classes in place.
+
+    Normalization runs too: the memory backend path applies it before handing
+    the graph to GraphValidator, which requires an entity ``name``.
+    """
+    monkeypatch.setattr(
+        cli_module,
+        "_kg_graph",
+        lambda cli_ctx: cli_module._normalize_kg_dict(FIXTURE_KG),
+    )
+
+
 class TestKgSubcommands:
     @pytest.mark.parametrize("sub", ["query", "stats", "analyze", "find-path",
                                       "resolve", "predict", "validate"])
@@ -195,74 +332,202 @@ class TestKgSubcommands:
         # Either exits 0 (fallback) or non-0 (clean error) — never traceback
         assert "Traceback" not in result.output
 
-    def test_kg_stats_json_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            GraphAnalyzer=lambda **kw: MagicMock(
-                compute_metrics=lambda: {"nodes": 10, "edges": 25, "density": 0.5}
-            ),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
+    def test_kg_stats_json_with_fixture_graph(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
         result = runner.invoke(cli_module.main, ["kg", "stats", "--json"])
-        _ok(result)
         data = _json_output(result)
-        assert isinstance(data, dict)
-        assert "nodes" in data
+        assert data["num_nodes"] == len(FIXTURE_KG["entities"])
+        assert data["num_edges"] == len(FIXTURE_KG["relationships"])
 
-    def test_kg_analyze_json_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            GraphAnalyzer=lambda **kw: MagicMock(
-                analyze=lambda mode: {"mode": mode, "communities": 3}
-            ),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
-        result = runner.invoke(cli_module.main, ["kg", "analyze", "--mode", "community", "--json"])
-        _ok(result)
+    def test_kg_analyze_community_runs_only_community(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "analyze",
+                                      "--mode", "community", "--json"])
         data = _json_output(result)
         assert isinstance(data, dict)
+        # `mode` used to be swallowed by GraphAnalyzer's **options, so
+        # --mode community ran the whole analysis; only the community
+        # detector reports an assignment map (#1941).
+        assert "node_assignments" in data
+        assert set(data["node_assignments"]) == {
+            e["id"] for e in FIXTURE_KG["entities"]
+        }
+
+    def test_kg_analyze_centrality_runs_only_centrality(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "analyze",
+                                      "--mode", "centrality", "--json"])
+        data = _json_output(result)
+        assert isinstance(data, dict)
+        assert "node_assignments" not in data
 
     def test_kg_find_path_requires_from_and_to(self, runner):
         result = runner.invoke(cli_module.main, ["kg", "find-path"])
         assert result.exit_code != 0
 
-    def test_kg_find_path_json_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            PathFinder=lambda **kw: MagicMock(
-                find_path=lambda f, t, path_type: {"from": f, "to": t, "path": [f, t]}
-            ),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
+    def test_kg_find_path_json_traverses_fixture_graph(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
         result = runner.invoke(cli_module.main, ["kg", "find-path",
-                                      "--from", "Alice", "--to", "Acme", "--json"])
-        _ok(result)
+                                      "--from", "Alice", "--to", "Acme",
+                                      "--json"])
         data = _json_output(result)
-        assert "from" in data
+        # PathFinder duck-types against neighbors()/get_edge_data(); handed
+        # the {"entities", "relationships"} dict it cannot traverse and
+        # reports "Source node Alice not found" on a graph that contains
+        # Alice (#1725). The CLI must pass the NetworkX projection.
+        assert data["path"] == ["Alice", "Bob", "Acme"]
 
-    def test_kg_resolve_exits_0_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            EntityResolver=lambda **kw: MagicMock(resolve=lambda: {"resolved": 5}),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
-        result = runner.invoke(cli_module.main, ["kg", "resolve"])
-        assert result.exit_code == 0
+    def test_kg_find_path_unknown_node_errors_cleanly(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "find-path",
+                                      "--from", "nobody", "--to", "Acme",
+                                      "--json"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
 
-    def test_kg_predict_exits_0_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            LinkPredictor=lambda **kw: MagicMock(predict=lambda: {"predictions": []}),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
-        result = runner.invoke(cli_module.main, ["kg", "predict"])
-        assert result.exit_code == 0
+    def test_kg_find_path_unsupported_type_errors_cleanly(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "find-path",
+                                      "--from", "Alice", "--to", "Acme",
+                                      "--type", "causal", "--json"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
 
-    def test_kg_validate_exits_0_with_mock(self, runner, monkeypatch):
-        fake_kg = _fake_module(
-            GraphValidator=lambda **kw: MagicMock(
-                validate=lambda: {"valid": True},
-                integrity_check=lambda: {"valid": True},
-            ),
+    def test_kg_find_path_accepts_entity_name_when_id_differs(self, runner, monkeypatch):
+        # --from/--to are documented as names; the projection is keyed by ID.
+        graph = {
+            "entities": [
+                {"id": "n1", "name": "Alice", "type": "person"},
+                {"id": "n2", "name": "Bob", "type": "person"},
+            ],
+            "relationships": [
+                {"id": "r1", "source": "n1", "target": "n2", "type": "knows"},
+            ],
+        }
+        monkeypatch.setattr(
+            cli_module, "_kg_graph",
+            lambda cli_ctx: cli_module._normalize_kg_dict(graph),
         )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.kg", fake_kg)
-        result = runner.invoke(cli_module.main, ["kg", "validate"])
-        assert result.exit_code == 0
+        result = runner.invoke(cli_module.main, ["kg", "find-path",
+                                      "--from", "Alice", "--to", "Bob", "--json"])
+        _ok(result)
+        body = json.dumps(_json_output(result))
+        assert "n1" in body and "n2" in body
+
+    def test_graph_store_context_by_id_keeps_same_name_nodes_apart(self, monkeypatch):
+        # Using the display name as the ID merges same-name store nodes.
+        class _GS:
+            def get_nodes(self, limit=None):
+                return [
+                    {"id": "n1", "properties": {"name": "Alice"}, "labels": ["Person"]},
+                    {"id": "n2", "properties": {"name": "Alice"}, "labels": ["Person"]},
+                ]
+
+            def get_relationships(self, limit=None):
+                return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx, **kw: _GS())
+        by_name = cli_module._graph_store_as_context(None)
+        by_id = cli_module._graph_store_as_context(None, by_id=True)
+        assert [e["id"] for e in by_name["entities"]] == ["Alice", "Alice"]
+        assert [e["id"] for e in by_id["entities"]] == ["n1", "n2"]
+        assert [e["name"] for e in by_id["entities"]] == ["Alice", "Alice"]
+
+    def test_kg_resolve_reports_merged_entities_read_only(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "resolve", "--json"])
+        data = _json_output(result)
+        assert data["input"] == len(FIXTURE_KG["entities"])
+        assert data["input"] == data["resolved"] + data["merged"]
+        assert len(data["entities"]) == data["resolved"]
+        # Nothing is written back, so the text output must not imply it was.
+        text = runner.invoke(cli_module.main, ["kg", "resolve"]).output
+        assert "read-only" in _flatten(text)
+
+    def test_kg_predict_json_predicts_over_fixture_graph(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "predict", "--json"])
+        data = _json_output(result)
+        assert data["count"] == len(data["predictions"])
+        # LinkPredictor enumerates candidate nodes through get_all_nodes(),
+        # which the dict and ContextGraph shapes do not provide: on the old
+        # code this was 0 predictions on a populated graph (#1941).
+        assert data["count"] > 0
+        assert {"source", "target", "score"} <= set(data["predictions"][0])
+
+    def test_kg_predict_reports_each_unlinked_pair_once(self, runner, monkeypatch):
+        # The scores are symmetric, so scoring ordered pairs would list every
+        # prediction twice and suggest reversing edges that already exist.
+        graph = {
+            "entities": [{"id": n, "name": n, "type": "t"} for n in "ABCD"],
+            "relationships": [
+                {"id": f"r{i}", "source": s, "target": t, "type": "e"}
+                for i, (s, t) in enumerate(
+                    [("C", "A"), ("C", "B"), ("A", "D"), ("B", "D")]
+                )
+            ],
+        }
+        monkeypatch.setattr(
+            cli_module, "_kg_graph",
+            lambda cli_ctx: cli_module._normalize_kg_dict(graph),
+        )
+        result = runner.invoke(cli_module.main, ["kg", "predict", "--json"])
+        pairs = [
+            frozenset((p["source"], p["target"]))
+            for p in _json_output(result)["predictions"]
+        ]
+        assert sorted(pairs, key=sorted) == [frozenset("AB"), frozenset("CD")]
+
+    def test_kg_validate_json_validates_fixture_graph(self, runner, monkeypatch):
+        _fixture_graph(monkeypatch)
+        result = runner.invoke(cli_module.main, ["kg", "validate", "--json"])
+        data = _json_output(result)
+        assert data["is_valid"] is True
+        assert data["stats"]["total_entities"] == len(FIXTURE_KG["entities"])
+        assert data["stats"]["total_relationships"] == len(
+            FIXTURE_KG["relationships"]
+        )
+
+
+class TestNormalizeKgDict:
+    """The memory backend's to_kg_dict() is not the shape the kg classes read.
+
+    It emits source_id/target_id and carries the node name under `text`;
+    GraphValidator and GraphAnalyzer read source/target and `name`, so
+    un-normalized input reads as 0 relationships and nameless entities
+    (#1941).
+    """
+
+    def test_adds_source_and_target_without_dropping_source_id(self):
+        out = cli_module._normalize_kg_dict({
+            "entities": [],
+            "relationships": [
+                {"source_id": "a", "target_id": "b", "type": "knows"},
+            ],
+        })
+        rel = out["relationships"][0]
+        assert rel["source"] == "a"
+        assert rel["target"] == "b"
+        assert rel["source_id"] == "a"
+
+    def test_derives_name_from_text_and_id(self):
+        out = cli_module._normalize_kg_dict({
+            "entities": [
+                {"id": "e1", "text": "Alice"},
+                {"id": "e2", "properties": {"name": "Bob"}},
+                {"id": "e3"},
+            ],
+            "relationships": [],
+        })
+        by_id = {e["id"]: e for e in out["entities"]}
+        assert by_id["e1"]["name"] == "Alice"
+        assert by_id["e2"]["name"] == "Bob"
+        assert by_id["e3"]["name"] == "e3"
+
+    def test_is_idempotent_on_an_already_normalized_graph(self):
+        out = cli_module._normalize_kg_dict(FIXTURE_KG)
+        assert out["relationships"] == FIXTURE_KG["relationships"]
+        assert cli_module._normalize_kg_dict(out) == out
 
 
 # ─── ingest ───────────────────────────────────────────────────────────────────
@@ -318,6 +583,35 @@ class TestIngest:
         assert captured["kwargs"]["batch_size"] == 500
         assert captured["kwargs"]["format"] == "csv"
 
+    @pytest.mark.parametrize("fmt", ["ndjson", "jsonl"])
+    def test_ingest_format_line_delimited_json(self, runner, monkeypatch, fmt):
+        captured = {}
+
+        def fake_ingest_file(sources, **kwargs):
+            captured["sources"] = sources
+            captured["kwargs"] = kwargs
+            return [{"path": sources}]
+
+        monkeypatch.setattr("semantica.ingest.methods.ingest_file", fake_ingest_file)
+
+        result = runner.invoke(
+            cli_module.main,
+            ["ingest", f"data.{fmt}", "--type", "file", "--format", fmt, "--json"],
+        )
+
+        _ok(result)
+        data = _json_output(result)
+        assert data["files"] == [{"path": f"data.{fmt}"}]
+        assert captured["sources"] == f"data.{fmt}"
+        assert captured["kwargs"]["method"] == "file"
+        assert captured["kwargs"]["format"] == fmt
+
+    def test_watch_help_shows_line_delimited_json_patterns(self, runner):
+        result = runner.invoke(cli_module.main, ["watch", "--help"])
+        _ok(result)
+        assert "*.jsonl" in result.output
+        assert "*.ndjson" in result.output
+
     def test_runtime_path_passes_source_positionally_with_auto_detection(self, runner, monkeypatch):
         captured = {}
 
@@ -336,16 +630,85 @@ class TestIngest:
         assert captured["sources"] == "README.md"
         assert captured["kwargs"]["method"] == "file"
 
+    def test_configured_graph_backend_does_not_report_false_success(
+        self, runner, monkeypatch
+    ):
+        monkeypatch.setenv("GRAPH_STORE_DEFAULT_BACKEND", "neo4j")
+        monkeypatch.setattr(
+            "semantica.ingest.methods.ingest_file",
+            lambda sources, **kwargs: [{"path": sources}],
+        )
+
+        result = runner.invoke(cli_module.main, ["ingest", "README.md"])
+        output = _flatten(result.output)
+
+        assert result.exit_code != 0
+        assert "does not write to graph stores" in output
+        assert "Ingested:" not in output
+
+    def test_configured_graph_backend_error_does_not_recommend_broken_kg_build(
+        self, runner, monkeypatch
+    ):
+        # kg build also does not persist to a configured graph store
+        # (tracked separately as #1352), so the error must not send users to
+        # a command that will silently no-op the same way.
+        monkeypatch.setenv("GRAPH_STORE_DEFAULT_BACKEND", "neo4j")
+        monkeypatch.setattr(
+            "semantica.ingest.methods.ingest_file",
+            lambda sources, **kwargs: [{"path": sources}],
+        )
+
+        result = runner.invoke(cli_module.main, ["ingest", "README.md"])
+        output = _flatten(result.output)
+
+        assert result.exit_code != 0
+        assert "kg build" not in output
+
+    def test_output_flag_writes_real_content_and_bypasses_graph_error(
+        self, runner, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("GRAPH_STORE_DEFAULT_BACKEND", "neo4j")
+        monkeypatch.setattr(
+            "semantica.ingest.methods.ingest_file",
+            lambda sources, **kwargs: [{"path": sources}],
+        )
+        out_path = tmp_path / "out.json"
+
+        result = runner.invoke(
+            cli_module.main, ["ingest", "README.md", "--output", str(out_path)]
+        )
+
+        _ok(result, substr="Wrote")
+        written = json.loads(out_path.read_text(encoding="utf-8"))
+        assert written == {"files": [{"path": "README.md"}]}
+
+    def test_store_and_output_are_not_forwarded_to_ingest_backend(
+        self, runner, monkeypatch, tmp_path
+    ):
+        captured = {}
+
+        def fake_ingest_file(sources, **kwargs):
+            captured["kwargs"] = kwargs
+            return [{"path": sources}]
+
+        monkeypatch.setattr("semantica.ingest.methods.ingest_file", fake_ingest_file)
+        out_path = tmp_path / "out.json"
+
+        result = runner.invoke(
+            cli_module.main,
+            ["ingest", "README.md", "--store", "neo4j", "--output", str(out_path)],
+        )
+
+        _ok(result)
+        assert "store" not in captured["kwargs"]
+        assert "output" not in captured["kwargs"]
+
     def test_import_error_is_clean(self, runner, monkeypatch):
-        monkeypatch.setattr(cli_module, "__import__", _import_side_effect, raising=False)
-        original_import = __import__
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if n.startswith("semantica.ingest") else original_import(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["ingest", "data.pdf"])
+        monkeypatch.setitem(sys.modules, "semantica.ingest", None)
+        result = runner.invoke(cli_module.main, ["ingest", "data.pdf"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+        assert "semantica.ingest" in result.output
 
     def test_type_choice_validation(self, runner):
         result = runner.invoke(cli_module.main, ["ingest", "x.pdf", "--type", "invalid_type"])
@@ -381,15 +744,12 @@ class TestParse:
         result = runner.invoke(cli_module.main, ["parse", "no_such_file.pdf"])
         assert result.exit_code != 0
 
-    def test_parse_real_file(self, runner):
+    def test_parse_real_file(self, runner, monkeypatch):
         with runner.isolated_filesystem():
             with open("doc.txt", "w") as f:
                 f.write("Hello world")
-            with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-                (_ for _ in ()).throw(ImportError(n))
-                if n.startswith("semantica.parse") else __import__(n, *a, **k)
-            )):
-                result = runner.invoke(cli_module.main, ["parse", "doc.txt"])
+            monkeypatch.setitem(sys.modules, "semantica.parse", None)
+            result = runner.invoke(cli_module.main, ["parse", "doc.txt"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -414,15 +774,12 @@ class TestSplit:
         result = runner.invoke(cli_module.main, ["split"])
         assert result.exit_code != 0
 
-    def test_split_with_import_error(self, runner):
+    def test_split_with_import_error(self, runner, monkeypatch):
         with runner.isolated_filesystem():
             with open("doc.txt", "w") as f:
                 f.write("content")
-            with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-                (_ for _ in ()).throw(ImportError(n))
-                if n.startswith("semantica.split") else __import__(n, *a, **k)
-            )):
-                result = runner.invoke(cli_module.main, ["split", "doc.txt"])
+            monkeypatch.setitem(sys.modules, "semantica.split", None)
+            result = runner.invoke(cli_module.main, ["split", "doc.txt"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -536,12 +893,138 @@ class TestExtract:
         )
         _ok(result)
 
-    def test_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if n.startswith("semantica.semantic_extract") else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["extract", "text"])
+    def test_default_mode_runs_every_extractor(self, runner, monkeypatch):
+        """#1789 — the default --mode all must dispatch, not raise."""
+        _ner_result = [MagicMock(text="Alice", label="PER", confidence=0.9,
+                                  start_char=0, end_char=5, metadata={})]
+        fake_ext = _fake_module(
+            NERExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: _ner_result),
+            RelationExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            TripletExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            EventDetector=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.semantic_extract", fake_ext
+        )
+        # No --mode: fall back to the command default.
+        result = runner.invoke(
+            cli_module.main, ["extract", "Alice works at Acme.", "--json"]
+        )
+        _ok(result)
+        data = _json_output(result)
+        assert set(data) == {"ner", "relations", "triplets", "events"}
+
+    def test_mode_choices_include_all_and_coreference(self):
+        """#1850 — every advertised mode must be a real `--mode` choice.
+
+        `all` is the *default* mode, yet the smoke loop in
+        ``tests/verify_rich_cli.py`` used to hardcode a list that silently
+        omitted it — which is why #1789 shipped unnoticed. Pin the full
+        ``choices`` set (and the default) so that loop stays aligned with the
+        command contract.
+        """
+        mode_param = next(
+            p for p in cli_module.extract.params if p.name == "mode"
+        )
+        choices = list(mode_param.type.choices)
+        assert mode_param.default == "all"
+        assert "all" in choices, f"'all' missing from choices: {choices}"
+        assert set(choices) == {
+            "ner", "relations", "triplets", "events", "coreference", "all",
+        }
+
+    def test_explicit_all_mode_returns_every_stage(self, runner, monkeypatch):
+        """#1850 — an explicit `--mode all` (not just the default) runs all stages."""
+        _ner_result = [MagicMock(text="Alice", label="PER", confidence=0.9,
+                                  start_char=0, end_char=5, metadata={})]
+        fake_ext = _fake_module(
+            NERExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: _ner_result),
+            RelationExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            TripletExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            EventDetector=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.semantic_extract", fake_ext
+        )
+        result = runner.invoke(
+            cli_module.main,
+            ["extract", "Alice works at Acme.", "--mode", "all", "--json"],
+        )
+        _ok(result)
+        assert set(_json_output(result)) == {"ner", "relations", "triplets", "events"}
+
+    def test_coreference_mode_is_a_clean_placeholder_error(self, runner, monkeypatch):
+        """#1850 — `coreference` is a listed choice but has no extractor yet.
+
+        Until it is wired it must fail with a clean "not yet wired" error (and
+        no traceback), rather than silently succeeding or crashing.
+        """
+        fake_ext = _fake_module(
+            NERExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            RelationExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            TripletExtractor=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+            EventDetector=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.semantic_extract", fake_ext
+        )
+        result = runner.invoke(
+            cli_module.main,
+            ["extract", "Alice works at Acme.", "--mode", "coreference"],
+        )
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "not yet wired" in _flatten(result.output)
+
+    def test_all_mode_reuses_ner_and_relations(self, runner, monkeypatch):
+        """#1789 (Qodo) — 'all' must not recompute NER/relations per stage."""
+        calls = {"ner": 0, "relations": 0, "triplets": 0}
+        seen = {}
+        ner_result = [MagicMock(text="Alice", label="PER", confidence=0.9,
+                                start_char=0, end_char=5, metadata={})]
+        relation_result = [MagicMock(subject="Alice", predicate="works_at",
+                                     object="Acme", confidence=0.9, metadata={})]
+
+        def _triplet_extract(text, entities=None, relations=None, **kw):
+            seen["entities"] = entities
+            seen["relations"] = relations
+            return []
+
+        fake_ext = _fake_module(
+            NERExtractor=lambda **kw: (
+                calls.__setitem__("ner", calls["ner"] + 1)
+                or MagicMock(extract=lambda text, **kw2: ner_result)
+            ),
+            RelationExtractor=lambda **kw: (
+                calls.__setitem__("relations", calls["relations"] + 1)
+                or MagicMock(extract=lambda text, entities=None, **kw2: relation_result)
+            ),
+            TripletExtractor=lambda **kw: (
+                calls.__setitem__("triplets", calls["triplets"] + 1)
+                or MagicMock(extract=_triplet_extract)
+            ),
+            EventDetector=lambda **kw: MagicMock(extract=lambda text, **kw2: []),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.semantic_extract", fake_ext
+        )
+        result = runner.invoke(
+            cli_module.main, ["extract", "Alice works at Acme.", "--json"]
+        )
+        _ok(result)
+        # NER (for the ner stage) and relations run once each; the triplet
+        # stage reuses their output instead of building a second NER/relation
+        # extractor of its own.
+        assert calls["ner"] == 1
+        assert calls["relations"] == 1
+        assert calls["triplets"] == 1
+        # ...and the triplet stage actually received that shared output.
+        assert seen["entities"] is ner_result
+        assert seen["relations"] is relation_result
+
+    def test_import_error_is_clean(self, runner, monkeypatch):
+        monkeypatch.setitem(sys.modules, "semantica.semantic_extract", None)
+        result = runner.invoke(cli_module.main, ["extract", "text"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -579,7 +1062,7 @@ class TestEmbed:
     def test_generate_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "embeddings" in n else __import__(n, *a, **k)
+            if "embeddings" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["embed", "generate", "entities.json"])
         assert result.exit_code != 0
@@ -588,7 +1071,7 @@ class TestEmbed:
     def test_search_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "vector_store" in n else __import__(n, *a, **k)
+            if "vector_store" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["embed", "search", "CEO query"])
         assert result.exit_code != 0
@@ -718,7 +1201,7 @@ class TestDeduplicate:
     def test_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "deduplication" in n else __import__(n, *a, **k)
+            if "deduplication" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["deduplicate"])
         assert result.exit_code != 0
@@ -765,11 +1248,682 @@ class TestReason:
     def test_run_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "reasoning" in n else __import__(n, *a, **k)
+            if "reasoning" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["reason", "run"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+
+    def test_run_infers_from_graph_store_facts(self, runner, monkeypatch, tmp_path):
+        # reason run used to call Reasoner.run(), which does not exist
+        # (#1354); it must feed graph store facts + --rules into
+        # Reasoner.infer_facts().
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text(
+            '- IF Person(?x) THEN Human(?x)\n'
+            '- IF MANAGES(?x, ?y) THEN Manager(?x)\n'
+            '- IF Employee(?x) THEN Staff(?x)\n',
+            encoding="utf-8")
+
+        class _FakeStore:
+            # Same dict schema as the real backends: nodes carry
+            # labels/properties, relationships carry start_node_id/end_node_id.
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"],
+                         "properties": {"name": "Alice"}},
+                        {"id": 2, "labels": ["Person", "Employee"],
+                         "properties": {"name": "Bob"}}]
+
+            def get_relationships(self, limit=None):
+                return [{"id": 9, "type": "MANAGES",
+                         "start_node_id": 1, "end_node_id": 2}]
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--rules", str(rules_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        # Person(Alice), Person(Bob), Employee(Bob), MANAGES(Alice, Bob)
+        assert data["facts"] == 4
+        assert "Human(Alice)" in data["inferred_facts"]
+        # Relationship endpoints resolve node ids to names.
+        assert "Manager(Alice)" in data["inferred_facts"]
+        # Secondary labels also become facts.
+        assert "Staff(Bob)" in data["inferred_facts"]
+        assert data["inferred_count"] == len(data["inferred_facts"])
+
+    def test_run_rejects_unwired_engine(self, runner):
+        result = runner.invoke(cli_module.main,
+                               ["reason", "run", "--engine", "sparql"])
+        assert result.exit_code != 0
+        # _flatten() undoes the Rich panel's line-wrap borders, which would
+        # otherwise split "reason query" mid-word and break a raw substring
+        # check.
+        normalized = _flatten(result.output)
+        assert "not wired" in normalized
+        assert "reason query" in normalized
+        assert "Traceback" not in result.output
+
+    def test_run_reasoning_local_json_flag_suppresses_spinner(self, runner, monkeypatch):
+        """`reason run --json` (the command's own flag, not the global one)
+        must not enter the Rich status spinner. console.status() writes to
+        stdout; entering it under the local-only flag would put status text
+        ahead of the JSON payload in the same stream."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        status_calls = []
+        real_status = cli_module.console.status
+
+        def _spy_status(*a, **kw):
+            status_calls.append((a, kw))
+            return real_status(*a, **kw)
+
+        monkeypatch.setattr(cli_module.console, "status", _spy_status)
+        result = runner.invoke(cli_module.main, ["reason", "run", "--json"])
+        _ok(result)
+        assert status_calls == []
+
+    def test_run_deductive_falls_back_to_graph_store_facts(self, runner, monkeypatch, tmp_path):
+        """--engine deductive without --premises should build Premises from
+        the graph store, matching the rete/datalog fallback convention."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text(
+            "- IF Person(?x) THEN Human(?x)\n"
+            "- IF MANAGES(?x, ?y) THEN Manager(?x)\n",
+            encoding="utf-8")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}},
+                        {"id": 2, "labels": ["Person", "Employee"], "properties": {"name": "Bob"}}]
+
+            def get_relationships(self, limit=None):
+                return [{"id": 9, "type": "MANAGES", "start_node_id": 1, "end_node_id": 2}]
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "deductive", "--rules", str(rules_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["engine"] == "deductive"
+        assert data["facts"] == 4
+        assert "Human(Alice)" in data["inferred_facts"]
+        assert "Human(Bob)" in data["inferred_facts"]
+        assert "Manager(Alice)" in data["inferred_facts"]
+        assert data["inferred_count"] == len(data["inferred_facts"])
+
+    def test_run_deductive_uses_premises_file(self, runner, monkeypatch, tmp_path):
+        """--premises should be used instead of the graph store when given,
+        and accept both plain strings and {statement, confidence} entries."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text("- IF Person(?x) THEN Human(?x)\n", encoding="utf-8")
+        premises_file = tmp_path / "premises.yaml"
+        premises_file.write_text(
+            "- Person(Alice)\n"
+            "- {statement: 'Person(Bob)', confidence: 0.7}\n",
+            encoding="utf-8")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "deductive",
+             "--rules", str(rules_file), "--premises", str(premises_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["facts"] == 2
+        assert "Human(Alice)" in data["inferred_facts"]
+        assert "Human(Bob)" in data["inferred_facts"]
+
+    def test_run_deductive_reaches_fixpoint_across_rule_order(self, runner, monkeypatch, tmp_path):
+        """DeductiveReasoner.apply_logic() scans its rules once, not to a
+        fixpoint -- a single call would miss Human(Bob) here since the rule
+        deriving it needs Employee(Bob), which is itself only derived by a
+        *later* rule in this same call. reason run must loop apply_logic()
+        until no new conclusions appear so rule order doesn't silently drop
+        valid transitive conclusions."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text(
+            "- IF Employee(?x) THEN Human(?x)\n"
+            "- IF Manager(?x) THEN Employee(?x)\n",
+            encoding="utf-8")
+        premises_file = tmp_path / "premises.yaml"
+        premises_file.write_text("- Manager(Bob)\n", encoding="utf-8")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "deductive",
+             "--rules", str(rules_file), "--premises", str(premises_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert "Employee(Bob)" in data["inferred_facts"]
+        assert "Human(Bob)" in data["inferred_facts"]
+
+    def test_run_abductive_requires_observations(self, runner, monkeypatch):
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(cli_module.main, ["reason", "run", "--engine", "abductive"])
+        assert result.exit_code != 0
+        assert "--observations" in result.output
+        assert "Traceback" not in result.output
+
+    def test_run_abductive_finds_explanations(self, runner, monkeypatch, tmp_path):
+        """--engine abductive should find rules whose conclusion explains
+        each observation, not force everything through infer_facts()."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text("- IF Person(?x) THEN Human(?x)\n", encoding="utf-8")
+        obs_file = tmp_path / "observations.yaml"
+        obs_file.write_text("- Human(Alice)\n", encoding="utf-8")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}}]
+
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "abductive",
+             "--rules", str(rules_file), "--observations", str(obs_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["engine"] == "abductive"
+        assert data["observations"] == 1
+        assert len(data["explanations"]) == 1
+        exp = data["explanations"][0]
+        assert exp["observation"] == "Human(Alice)"
+        assert exp["best_hypothesis"] is not None
+        assert exp["hypotheses_considered"] == 1
+
+    def test_run_abductive_no_matching_rule_returns_empty_explanation(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """An observation no loaded rule can explain must report cleanly
+        (no hypotheses), not crash or fabricate an explanation."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text("- IF Person(?x) THEN Human(?x)\n", encoding="utf-8")
+        obs_file = tmp_path / "observations.yaml"
+        obs_file.write_text("- Unicorn(Alice)\n", encoding="utf-8")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "abductive",
+             "--rules", str(rules_file), "--observations", str(obs_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        exp = data["explanations"][0]
+        assert exp["best_hypothesis"] is None
+        assert exp["hypotheses_considered"] == 0
+
+    def test_run_abductive_does_not_require_graph_store(self, runner, monkeypatch, tmp_path):
+        """A fully self-contained abductive run (--rules + --observations)
+        must not depend on the configured graph store being reachable.
+        AbductiveReasoner doesn't currently consume knowledge_base at all,
+        so calling _graph_store_facts() here would only add a failure mode
+        with no corresponding benefit."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text("- IF Person(?x) THEN Human(?x)\n", encoding="utf-8")
+        obs_file = tmp_path / "observations.yaml"
+        obs_file.write_text("- Human(Alice)\n", encoding="utf-8")
+
+        def _unreachable_store(ctx):
+            raise RuntimeError("graph store should not be contacted")
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", _unreachable_store)
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "abductive",
+             "--rules", str(rules_file), "--observations", str(obs_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["explanations"][0]["best_hypothesis"] is not None
+
+    def test_run_datalog_derives_facts_from_graph_store(self, runner, monkeypatch, tmp_path):
+        """--engine datalog should run DatalogReasoner.derive_all(), not infer_facts()."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        # Predicate case matches the graph's own label/relationship-type
+        # spelling (title-case "Person", upper-case "MANAGES") -- only
+        # arguments get lowercased into Datalog constants, not predicates.
+        rules_file = tmp_path / "rules.dl"
+        rules_file.write_text(
+            "Human(X) :- Person(X).\n"
+            "Manager(X) :- MANAGES(X, Y).\n",
+            encoding="utf-8")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}},
+                        {"id": 2, "labels": ["Person", "Employee"], "properties": {"name": "Bob"}}]
+
+            def get_relationships(self, limit=None):
+                return [{"id": 9, "type": "MANAGES", "start_node_id": 1, "end_node_id": 2}]
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "datalog", "--rules", str(rules_file)],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["engine"] == "datalog"
+        # Person(alice), Person(bob), Employee(bob), MANAGES(alice, bob)
+        assert data["facts"] == 4
+        assert "Human(alice)" in data["inferred_facts"]
+        assert "Human(bob)" in data["inferred_facts"]
+        assert "Manager(alice)" in data["inferred_facts"]
+        # Base facts must not be reported back as "inferred".
+        assert "Person(alice)" not in data["inferred_facts"]
+        assert data["inferred_count"] == len(data["inferred_facts"])
+
+    def test_run_datalog_lowercases_args_only_not_predicate(self):
+        """Regression for a case-mismatch bug: lowercasing the whole fact
+        string (not just its arguments) made facts like "person(alice)"
+        unmatchable by rules written against the graph's real label
+        spelling, e.g. "Human(X) :- Person(X)."."""
+        assert cli_module._lowercase_datalog_args("Person(Alice)") == "Person(alice)"
+        assert cli_module._lowercase_datalog_args(
+            "MANAGES(Alice, Bob)") == "MANAGES(alice, bob)"
+
+    def test_run_datalog_rejects_ifthen_rules_cleanly(self, runner, monkeypatch, tmp_path):
+        """A rete-style '--rules' file (IF/THEN) is not valid Datalog syntax;
+        it must surface as a clean error, not a Traceback."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        rules_file = tmp_path / "rules.yaml"
+        rules_file.write_text("- IF Person(?x) THEN Human(?x)\n", encoding="utf-8")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(
+            cli_module.main,
+            ["reason", "run", "--engine", "datalog", "--rules", str(rules_file)],
+        )
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+
+    def test_run_datalog_no_rules_uses_empty_ruleset(self, runner, monkeypatch):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}}]
+
+            def get_relationships(self, limit=None):
+                return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(
+            cli_module.main, ["--json", "reason", "run", "--engine", "datalog"])
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["facts"] == 1
+        assert data["inferred_count"] == 0
+        assert data["inferred_facts"] == []
+
+    def test_run_graph_requires_query(self, runner, monkeypatch):
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(cli_module.main, ["reason", "run", "--engine", "graph"])
+        assert result.exit_code != 0
+        assert "--query" in result.output
+        assert "Traceback" not in result.output
+
+    def test_run_graph_dispatches_to_graph_reasoner(self, runner, monkeypatch, tmp_path):
+        """--engine graph should call GraphReasoner.reason(graph, query) and
+        surface its natural-language answer, not the facts-count shape.
+
+        Also regression-guards three context-building gaps: a node with
+        multiple labels must keep all of them (not just labels[0]), a
+        relationship's properties must reach GraphReasoner (not just its
+        source/target/type), and start_node_id/end_node_id must resolve to
+        the actual node names rather than leaking raw internal ids into the
+        graph context sent to the LLM.
+        """
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person", "Manager"], "properties": {"name": "Alice"}},
+                        {"id": 2, "labels": ["Person"], "properties": {"name": "Bob"}}]
+
+            def get_relationships(self, limit=None):
+                return [{"id": 9, "type": "MANAGES", "start_node_id": 1, "end_node_id": 2,
+                          "properties": {"since": "2020"}}]
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+
+        class _FakeGraphReasoner:
+            def __init__(self, config=None, **kwargs):
+                pass
+
+            def reason(self, graph, query, **options):
+                assert graph["entities"][0]["name"] == "Alice"
+                assert graph["entities"][0]["type"] == "Person/Manager"
+                assert graph["relationships"][0]["type"] == "MANAGES"
+                assert graph["relationships"][0]["properties"] == {"since": "2020"}
+                # start_node_id/end_node_id (1, 2) must resolve to node
+                # names, not leak raw internal ids into the LLM's context.
+                assert graph["relationships"][0]["source"] == "Alice"
+                assert graph["relationships"][0]["target"] == "Bob"
+                assert query == "Who manages Bob?"
+                return "Alice manages Bob."
+
+        monkeypatch.setattr(
+            "semantica.reasoning.GraphReasoner", _FakeGraphReasoner, raising=False)
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "reason", "run", "--engine", "graph",
+             "--query", "Who manages Bob?"],
+        )
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["engine"] == "graph"
+        assert data["query"] == "Who manages Bob?"
+        assert data["answer"] == "Alice manages Bob."
+        assert data["facts"] == 3
+
+    def test_run_graph_surfaces_reasoner_failure_as_error(self, runner, monkeypatch):
+        """GraphReasoner.reason() never raises on an LLM-side failure -- it
+        returns a string starting with "Error" instead. reason run must
+        surface that as a real command failure, not exit 0 with a fake
+        "answer"."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+
+        class _FailingGraphReasoner:
+            def __init__(self, config=None, **kwargs):
+                pass
+
+            def reason(self, graph, query, **options):
+                return "Error: LLM provider not initialized for GraphReasoner. Check your configuration."
+
+        monkeypatch.setattr(
+            "semantica.reasoning.GraphReasoner", _FailingGraphReasoner, raising=False)
+        result = runner.invoke(
+            cli_module.main, ["reason", "run", "--engine", "graph", "--query", "anything?"])
+        assert result.exit_code != 0
+        assert "LLM provider not initialized" in result.output
+        assert "Traceback" not in result.output
+
+    def test_run_graph_surfaces_generation_failure_as_error(self, runner, monkeypatch):
+        """The second GraphReasoner error path -- a generation-time failure
+        (e.g. provider initialized but the call itself fails) returns
+        "Error during reasoning: ..." rather than the "not initialized"
+        string. reason run must surface this as a real command failure too,
+        not just the first error string."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+
+        class _FailingGraphReasoner:
+            def __init__(self, config=None, **kwargs):
+                pass
+
+            def reason(self, graph, query, **options):
+                return "Error during reasoning: connection timed out"
+
+        monkeypatch.setattr(
+            "semantica.reasoning.GraphReasoner", _FailingGraphReasoner, raising=False)
+        result = runner.invoke(
+            cli_module.main, ["reason", "run", "--engine", "graph", "--query", "anything?"])
+        assert result.exit_code != 0
+        assert "Error during reasoning" in result.output
+        assert "Traceback" not in result.output
+
+    def test_load_rule_definitions_formats(self, tmp_path):
+        yaml_list = tmp_path / "list.yaml"
+        yaml_list.write_text('- IF A(?x) THEN B(?x)\n- IF B(?x) THEN C(?x)\n',
+                             encoding="utf-8")
+        assert cli_module._load_rule_definitions(str(yaml_list)) == [
+            "IF A(?x) THEN B(?x)", "IF B(?x) THEN C(?x)"]
+
+        yaml_map = tmp_path / "map.yaml"
+        yaml_map.write_text('rules:\n  - IF A(?x) THEN B(?x)\n', encoding="utf-8")
+        assert cli_module._load_rule_definitions(str(yaml_map)) == [
+            "IF A(?x) THEN B(?x)"]
+
+        plain = tmp_path / "rules.dl"
+        plain.write_text('# comment\nIF A(?x) THEN B(?x)\n\n', encoding="utf-8")
+        assert cli_module._load_rule_definitions(str(plain)) == [
+            "IF A(?x) THEN B(?x)"]
+
+    def test_run_empty_graph_returns_zero_facts(self, runner, monkeypatch):
+        """reason run with an empty graph store should not crash and report 0 facts."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(cli_module.main, ["--json", "reason", "run"])
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["facts"] == 0
+        assert data["inferred_count"] == 0
+        assert data["inferred_facts"] == []
+
+    def test_run_graph_store_error_surfaces_cleanly(self, runner, monkeypatch):
+        """A graph-store connectivity error must surface as a clean error, not a Traceback."""
+
+        def _bad_store(ctx):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", _bad_store)
+        result = runner.invoke(cli_module.main, ["reason", "run"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "connection refused" in result.output
+
+    def test_run_no_rules_uses_empty_ruleset(self, runner, monkeypatch):
+        """reason run without --rules should still succeed (zero rules -> zero inferences)."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _FakeStore:
+            def get_nodes(self, limit=None):
+                return [{"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}}]
+
+            def get_relationships(self, limit=None):
+                return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _FakeStore())
+        result = runner.invoke(cli_module.main, ["--json", "reason", "run"])
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["facts"] == 1
+        assert data["inferred_count"] == 0
+
+    def test_load_rule_definitions_yaml_mapping_without_rules_key_raises(self, tmp_path):
+        """A YAML mapping with no 'rules' key must raise ClickException, not silently
+        pass the raw YAML lines as rules."""
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("some_key: some_value\nother_key: other_value\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="no 'rules' key"):
+            cli_module._load_rule_definitions(str(bad))
+
+    def test_load_rule_definitions_empty_file_returns_empty_list(self, tmp_path):
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("", encoding="utf-8")
+        assert cli_module._load_rule_definitions(str(empty)) == []
+
+    def test_load_rule_definitions_yaml_rules_null_falls_to_plaintext(self, tmp_path):
+        """rules: null is valid YAML with the key present; the null value is
+        not a list, so the function falls through to plain-text parsing and
+        returns the literal line (one no-op rule).  This documents the edge
+        case rather than asserting a specific useful behaviour."""
+        f = tmp_path / "null_rules.yaml"
+        f.write_text("rules: null\n", encoding="utf-8")
+        result = cli_module._load_rule_definitions(str(f))
+        # Plain-text fallback: the non-comment, non-blank line becomes a rule.
+        assert result == ["rules: null"]
+
+    def test_load_premises_formats(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        plain = tmp_path / "plain.yaml"
+        plain.write_text("- Person(Alice)\n- Person(Bob)\n", encoding="utf-8")
+        premises = cli_module._load_premises(str(plain))
+        assert [p.statement for p in premises] == ["Person(Alice)", "Person(Bob)"]
+        assert [p.confidence for p in premises] == [1.0, 1.0]
+
+        with_confidence = tmp_path / "confidence.yaml"
+        with_confidence.write_text(
+            "- {statement: 'Person(Alice)', confidence: 0.5}\n", encoding="utf-8")
+        premises = cli_module._load_premises(str(with_confidence))
+        assert premises[0].statement == "Person(Alice)"
+        assert premises[0].confidence == 0.5
+
+        mapping = tmp_path / "mapping.yaml"
+        mapping.write_text("premises:\n  - Person(Alice)\n", encoding="utf-8")
+        premises = cli_module._load_premises(str(mapping))
+        assert [p.statement for p in premises] == ["Person(Alice)"]
+
+    def test_load_premises_missing_statement_raises(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("- {confidence: 0.5}\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="missing 'statement'"):
+            cli_module._load_premises(str(bad))
+
+    def test_load_premises_null_key_value_raises(self, tmp_path):
+        """A 'premises' key present but not a list (e.g. YAML null) must be
+        a clear error, not silently reinterpreted as one raw-text line
+        ("premises: null" itself becoming a bogus premise)."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("premises: null\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="not a list"):
+            cli_module._load_premises(str(bad))
+
+    def test_load_premises_empty_list_raises(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("premises: []\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="no premises"):
+            cli_module._load_premises(str(empty))
+
+    def test_load_observations_formats(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        plain = tmp_path / "plain.yaml"
+        plain.write_text("- Human(Alice)\n", encoding="utf-8")
+        observations = cli_module._load_observations(str(plain))
+        assert [o.description for o in observations] == ["Human(Alice)"]
+
+        with_facts = tmp_path / "with_facts.yaml"
+        with_facts.write_text(
+            "- {description: 'Human(Alice)', facts: ['Person(Alice)']}\n", encoding="utf-8")
+        observations = cli_module._load_observations(str(with_facts))
+        assert observations[0].description == "Human(Alice)"
+        assert observations[0].facts == ["Person(Alice)"]
+
+        mapping = tmp_path / "mapping.yaml"
+        mapping.write_text("observations:\n  - Human(Alice)\n", encoding="utf-8")
+        observations = cli_module._load_observations(str(mapping))
+        assert [o.description for o in observations] == ["Human(Alice)"]
+
+    def test_load_observations_missing_description_raises(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("- {facts: []}\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="missing 'description'"):
+            cli_module._load_observations(str(bad))
+
+    def test_load_observations_null_key_value_raises(self, tmp_path):
+        """A 'observations' key present but not a list (e.g. YAML null)
+        must be a clear error. Previously this fell through to
+        reinterpreting the raw file text as plain lines, turning
+        "observations: null" itself into one bogus Observation and letting
+        `reason run --engine abductive` report a misleading success."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("observations: null\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="not a list"):
+            cli_module._load_observations(str(bad))
+
+    def test_load_observations_empty_list_raises(self, tmp_path):
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("observations: []\n", encoding="utf-8")
+        import click as _click
+        with pytest.raises(_click.ClickException, match="no observations"):
+            cli_module._load_observations(str(empty))
+
+    def test_run_deductive_no_rules_uses_empty_ruleset(self, runner, monkeypatch):
+        """--engine deductive is wired to DeductiveReasoner.apply_logic() (#1478);
+        it must no longer be rejected -- zero rules just means zero conclusions,
+        matching the rete/datalog no-op-ruleset convention."""
+        pytest.importorskip("numpy", reason="semantica.reasoning needs numpy")
+
+        class _EmptyStore:
+            def get_nodes(self, limit=None): return []
+            def get_relationships(self, limit=None): return []
+
+        monkeypatch.setattr(cli_module, "_get_graph_store", lambda ctx: _EmptyStore())
+        result = runner.invoke(
+            cli_module.main, ["--json", "reason", "run", "--engine", "deductive"])
+        _ok(result)
+        data = json.loads(result.output.strip())
+        assert data["engine"] == "deductive"
+        assert data["facts"] == 0
+        assert data["inferred_count"] == 0
+        assert data["inferred_facts"] == []
 
     def test_explain_requires_conclusion(self, runner):
         result = runner.invoke(cli_module.main, ["reason", "explain"])
@@ -778,7 +1932,7 @@ class TestReason:
     def test_explain_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "reasoning" in n else __import__(n, *a, **k)
+            if "reasoning" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["reason", "explain", "Alice is-manager-of Eng"])
         assert result.exit_code != 0
@@ -787,7 +1941,7 @@ class TestReason:
     def test_query_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "reasoning" in n else __import__(n, *a, **k)
+            if "reasoning" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["reason", "query", "SELECT ?x WHERE {}"])
         assert result.exit_code != 0
@@ -822,12 +1976,9 @@ class TestDecision:
         data = _json_output(result)
         assert data["dry_run"] is True
 
-    def test_record_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "semantica.context" in n else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["decision", "record", "--title", "X"])
+    def test_record_import_error_is_clean(self, runner, monkeypatch):
+        monkeypatch.setitem(sys.modules, "semantica.context", None)
+        result = runner.invoke(cli_module.main, ["decision", "record", "--title", "X"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -847,15 +1998,87 @@ class TestDecision:
                             "semantica.context.decision_query", fake_decision_query)
         monkeypatch.setitem(__import__("sys").modules,
                             "semantica.graph_store", fake_graph_store)
-        result = runner.invoke(cli_module.main, ["decision", "list", "--format", "json"])
+        result = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
         _ok(result)
 
-    def test_trace_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "semantica.context" in n else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["decision", "trace", "dec_123"])
+    # (filter, matching category, decoy category the mangled filter also hits)
+    # lstrip("tag:") strips leading t/a/g/: characters, so "tag:auth" became
+    # "uth" — which still substring-matches "auth", but ALSO matches "south".
+    @pytest.mark.parametrize("tag,decoy", [
+        ("auth", "south"),
+        ("git", "editor"),
+        ("testing", "nesting"),
+        ("tag", "anything-at-all"),
+    ])
+    def test_query_tag_filter_does_not_match_on_mangled_prefix(
+        self, runner, monkeypatch, tag, decoy
+    ):
+        """--filter tag:<value> must strip the prefix, not leading characters."""
+        fake_dq = MagicMock()
+
+        def _decision(did, category):
+            d = MagicMock()
+            d.decision_id, d.scenario, d.category = did, "T", category
+            d.outcome, d.confidence = "ok", 1.0
+            return d
+
+        fake_dq.find_by_time_range.return_value = [
+            _decision("d1", tag), _decision("d2", decoy),
+        ]
+        monkeypatch.setitem(__import__("sys").modules,
+                            "semantica.context.decision_query",
+                            _fake_module(DecisionQuery=lambda *a, **kw: fake_dq))
+        monkeypatch.setitem(__import__("sys").modules, "semantica.graph_store",
+                            _fake_module(GraphStore=MagicMock(return_value=MagicMock())))
+
+        # --store neo4j: these mock DecisionQuery/GraphStore, so they must name
+        # the database path explicitly rather than inherit the default backend,
+        # which is memory and would read an empty ContextGraph.
+        result = runner.invoke(
+            cli_module.main,
+            ["--store", "neo4j", "decision", "query", "--filter", f"tag:{tag}",
+             "--format", "json"],
+        )
+        _ok(result)
+        ids = [d["id"] for d in json.loads(result.output)]
+        assert ids == ["d1"], (
+            f"tag:{tag} matched {decoy!r} too — the prefix was stripped as "
+            f"characters, leaving a shorter filter"
+        )
+
+    def test_query_tag_filter_value_strips_prefix_only(self):
+        assert cli_module._tag_filter_value("tag:auth") == "auth"
+        assert cli_module._tag_filter_value("tag:git") == "git"
+        assert cli_module._tag_filter_value("tag:tag") == "tag"
+        assert cli_module._tag_filter_value("plain") == "plain"
+
+    @pytest.mark.parametrize("filter_str", ["tag:", ""])
+    def test_query_empty_tag_filter_is_rejected(self, runner, monkeypatch, filter_str):
+        """An empty tag value matched every decision; it must be a usage error."""
+        fake_dq = MagicMock()
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.context.decision_query",
+            _fake_module(DecisionQuery=lambda *a, **kw: fake_dq),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.graph_store",
+            _fake_module(GraphStore=MagicMock(return_value=MagicMock())),
+        )
+
+        result = runner.invoke(
+            cli_module.main,
+            ["decision", "query", "--filter", filter_str, "--format", "json"],
+        )
+        assert result.exit_code != 0
+        fake_dq.find_by_time_range.assert_not_called()
+
+    def test_trace_import_error_is_clean(self, runner, monkeypatch):
+        monkeypatch.setitem(sys.modules, "semantica.context", None)
+        result = runner.invoke(cli_module.main, ["decision", "trace", "dec_123"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
@@ -867,6 +2090,359 @@ class TestDecision:
     def test_sub_requires_id(self, runner, sub):
         result = runner.invoke(cli_module.main, ["decision", sub])
         assert result.exit_code != 0
+
+
+class TestMemoryGraphBackend:
+    """The `memory` backend routes through ContextGraph instead of GraphStore.
+
+    GraphStore has no `memory` backend, so before #1481 every one of these
+    commands died with `ValidationError: Unknown backend: memory` — which is
+    what `semantica init` writes by default.
+    """
+
+    @pytest.fixture
+    def memory_cfg(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "graph_db:\n"
+            "  backend: memory\n"
+            f"  path: {tmp_path / 'graph.json'}\n"
+        )
+        return str(cfg)
+
+    def _record(self, runner, memory_cfg, title, tags, rationale=None):
+        args = ["--config", memory_cfg, "decision", "record", "--title", title,
+                "--tags", tags]
+        if rationale:
+            args += ["--rationale", rationale]
+        result = runner.invoke(cli_module.main, args)
+        _ok(result)
+        return result
+
+    def test_record_then_list_persists_across_invocations(self, runner, memory_cfg):
+        """A CLI is one process per command, so the graph must be written back."""
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        rows = json.loads(result.output)
+        assert [r["title"] for r in rows] == ["Adopt Postgres"]
+        assert rows[0]["tags"] == ["database"]
+
+    def test_record_without_rationale_succeeds(self, runner, memory_cfg):
+        """--rationale is optional; ContextGraph rejects empty reasoning."""
+        self._record(runner, memory_cfg, "Use OAuth", "auth")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        assert [r["title"] for r in json.loads(result.output)] == ["Use OAuth"]
+
+    def test_query_filters_by_tag(self, runner, memory_cfg):
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        self._record(runner, memory_cfg, "Use OAuth", "auth", "standard")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "query", "--filter", "tag:database",
+             "--format", "json"],
+        )
+        _ok(result)
+        rows = json.loads(result.output)
+        assert [r["scenario"] for r in rows] == ["Adopt Postgres"]
+
+    def test_export_reads_the_context_graph(self, runner, memory_cfg):
+        self._record(runner, memory_cfg, "Adopt Postgres", "database", "cheaper")
+        result = runner.invoke(
+            cli_module.main, ["--config", memory_cfg, "export", "--format", "json"]
+        )
+        _ok(result)
+        payload = json.loads(result.output)
+        titles = [e.get("text") or e.get("name") for e in payload["entities"]]
+        assert "Adopt Postgres" in titles
+
+    def test_list_is_empty_before_anything_is_recorded(self, runner, memory_cfg):
+        """A missing graph file is an empty graph, not an error."""
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", memory_cfg, "decision", "list", "--format", "json"],
+        )
+        _ok(result)
+        assert json.loads(result.output) == []
+
+    def test_check_names_the_decision_when_absent(self, runner, memory_cfg):
+        result = runner.invoke(
+            cli_module.main, ["--config", memory_cfg, "decision", "check", "nope"]
+        )
+        assert result.exit_code != 0
+        assert "nope" in result.output
+        assert "Traceback" not in result.output
+
+    def test_doctor_reports_memory_without_probing_a_server(self, runner, memory_cfg):
+        result = runner.invoke(cli_module.main, ["--config", memory_cfg, "doctor"])
+        graph_rows = [
+            line for line in result.output.splitlines() if "Graph store" in line
+        ]
+        assert graph_rows, result.output
+        assert "memory" in graph_rows[0]
+        assert "Neo4j" not in graph_rows[0]
+
+    def _ctx(self, memory_cfg, store_backend=None):
+        cfg = cli_module._build_runtime_config(memory_cfg, None)
+        return cli_module.CLIContext(
+            config_path=memory_cfg, config=cfg, log_level="INFO",
+            store_backend=store_backend,
+        )
+
+    def test_resolve_backend_reads_the_config(self, memory_cfg):
+        ctx = self._ctx(memory_cfg)
+        assert cli_module._resolve_graph_backend(ctx) == "memory"
+        assert cli_module._uses_memory_graph(ctx) is True
+
+    def test_resolve_backend_prefers_the_store_flag(self, memory_cfg):
+        """--store must win over the config file, as it does for every command."""
+        ctx = self._ctx(memory_cfg, store_backend="neo4j")
+        assert cli_module._resolve_graph_backend(ctx) == "neo4j"
+        assert cli_module._uses_memory_graph(ctx) is False
+
+    def test_graph_path_is_configurable(self, memory_cfg, tmp_path):
+        ctx = self._ctx(memory_cfg)
+        assert cli_module._memory_graph_path(ctx) == tmp_path / "graph.json"
+
+    def test_validity_flags_reach_the_graph_not_just_metadata(
+        self, runner, memory_cfg, tmp_path
+    ):
+        """ContextGraph tracks node validity itself (Qodo #2 on PR #1765).
+
+        Passing --valid-from/--valid-until only inside metadata left the
+        decision active outside its window.
+        """
+        result = runner.invoke(cli_module.main, [
+            "--config", memory_cfg, "decision", "record", "--title", "Trial run",
+            "--tags", "pilot", "--rationale", "time-boxed",
+            "--valid-from", "2026-01-01T00:00:00",
+            "--valid-until", "2026-02-01T00:00:00",
+        ])
+        _ok(result)
+        saved = json.loads((tmp_path / "graph.json").read_text())
+        blob = json.dumps(saved)
+        assert "2026-01-01" in blob and "2026-02-01" in blob
+
+    def test_check_sees_the_stored_reasoning_and_decision_maker(
+        self, runner, memory_cfg
+    ):
+        """check_decision_rules indexes decision["reasoning"] (Qodo #4).
+
+        The display mapping used by list/query omits it, so policy checks were
+        evaluating a decision that looked emptier than what was stored.
+        """
+        self._record(runner, memory_cfg, "Adopt Postgres", "database",
+                     "cheaper to operate")
+        ctx = self._ctx(memory_cfg)
+        stored = cli_module._memory_decisions(ctx)
+        assert stored, "nothing recorded"
+        assert stored[0]["reasoning"] == "cheaper to operate"
+        assert "decision_maker" in stored[0]
+
+    def test_concurrent_records_do_not_lose_each_other(self, memory_cfg, tmp_path):
+        """Two processes recording at once must not drop a decision (Qodo #1).
+
+        record is a load-modify-save of the whole graph, so without a lock the
+        later save replaces the earlier decision, silently.
+        """
+        import subprocess
+        import sys as _sys
+
+        procs = [
+            subprocess.Popen(
+                [_sys.executable, "-m", "semantica.cli", "--config", memory_cfg,
+                 "decision", "record", "--title", f"Decision {i}",
+                 "--tags", f"tag{i}", "--rationale", "concurrent"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            for i in range(4)
+        ]
+        assert all(p.wait(timeout=120) == 0 for p in procs)
+
+        ctx = self._ctx(memory_cfg)
+        titles = {d["scenario"] for d in cli_module._memory_decisions(ctx)}
+        assert titles == {f"Decision {i}" for i in range(4)}, titles
+
+    def test_an_old_lock_held_by_a_live_writer_is_not_stolen(self, memory_cfg):
+        """Age must never grant entry while the holder is alive.
+
+        An mtime-based "reclaim a lock older than N" rule lets a second writer
+        into the critical section whenever the first is merely slow or
+        suspended. The second saves, the first then saves its older snapshot,
+        and the second decision disappears with no error anywhere.
+        """
+        import subprocess
+        import sys as _sys
+
+        ctx = self._ctx(memory_cfg)
+        lock = cli_module._memory_graph_path(ctx).with_suffix(".lock")
+
+        with cli_module._memory_graph_lock(ctx):
+            graph = cli_module._load_context_graph(ctx)
+            graph.record_decision(category="a", scenario="A", reasoning="r",
+                                  outcome="recorded", confidence=1.0)
+            # Make the lock look ancient while this writer still holds it.
+            lock.touch()
+            old = time.time() - 86_400
+            os.utime(lock, (old, old))
+
+            other = subprocess.run(
+                [_sys.executable, "-m", "semantica.cli", "--config", memory_cfg,
+                 "decision", "record", "--title", "B", "--tags", "b",
+                 "--rationale", "r"],
+                capture_output=True, text=True, timeout=120,
+            )
+            # B must be kept out, not allowed in to have its write erased.
+            assert other.returncode != 0, other.stdout + other.stderr
+            assert cli_module._memory_decisions(ctx) == [] or all(
+                d["scenario"] != "B" for d in cli_module._memory_decisions(ctx)
+            )
+            cli_module._save_context_graph(ctx, graph)
+
+        assert [d["scenario"] for d in cli_module._memory_decisions(ctx)] == ["A"]
+
+    def test_lock_is_released_when_the_holder_exits(self, memory_cfg):
+        """The OS drops an advisory lock on process death, so no timeout guess."""
+        ctx = self._ctx(memory_cfg)
+        with cli_module._memory_graph_lock(ctx):
+            pass
+        with cli_module._memory_graph_lock(ctx):  # immediately re-acquirable
+            pass
+
+    def test_init_then_plain_commands_need_no_config_flag(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """The workflow #1481 is actually about: init, then plain commands.
+
+        `semantica init` writes ~/.semantica/config.yaml, but nothing read it,
+        so accepting its `memory` default still left every command on the
+        built-in fallback. Supplying --config in tests hid this entirely.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+
+        init = runner.invoke(cli_module.main, ["init"], input="memory\nfaiss\nnone\n")
+        _ok(init)
+        assert "backend: memory" in (home / ".semantica" / "config.yaml").read_text()
+
+        # No --config from here on.
+        rec = runner.invoke(cli_module.main, [
+            "decision", "record", "--title", "First", "--tags", "pilot",
+            "--rationale", "trying it out",
+        ])
+        _ok(rec)
+        listed = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
+        _ok(listed)
+        assert [d["title"] for d in json.loads(listed.output)] == ["First"]
+
+        exported = runner.invoke(cli_module.main, ["export", "--format", "json"])
+        _ok(exported)
+        assert "First" in exported.output
+
+    def test_default_backend_is_memory_with_no_config_at_all(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """A user who never ran init gets a working local graph, not a Neo4j error."""
+        home = tmp_path / "empty-home"
+        home.mkdir()
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        result = runner.invoke(
+            cli_module.main, ["decision", "list", "--format", "json"]
+        )
+        _ok(result)
+        assert json.loads(result.output) == []
+
+    def test_explicit_config_still_wins_over_the_default_file(
+        self, runner, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home2"
+        (home / ".semantica").mkdir(parents=True)
+        (home / ".semantica" / "config.yaml").write_text(
+            "graph_db:\n  backend: memory\n"
+        )
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        explicit = tmp_path / "explicit.yaml"
+        explicit.write_text("graph_db:\n  backend: falkordb\n")
+        ctx_cfg = cli_module._build_runtime_config(str(explicit), None)
+        ctx = cli_module.CLIContext(
+            config_path=str(explicit), config=ctx_cfg, log_level="INFO"
+        )
+        assert cli_module._resolve_graph_backend(ctx) == "falkordb"
+
+    @staticmethod
+    def _init_home(monkeypatch, tmp_path, name):
+        """A HOME whose ~/.semantica/config.yaml selects the memory backend."""
+        home = tmp_path / name
+        (home / ".semantica").mkdir(parents=True)
+        (home / ".semantica" / "config.yaml").write_text(
+            "graph_db:\n  backend: memory\nvector_store:\n  backend: faiss\n"
+        )
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: home))
+        return home
+
+    def test_store_override_constructs_the_real_backend(self, monkeypatch, tmp_path):
+        """--store must reach GraphStore, not die assembling its arguments.
+
+        `store_backend or graph_db.pop("backend", ...)` short-circuits, so an
+        override left the configured backend in the kwargs and GraphStore got
+        `backend` twice. Auto-loading ~/.semantica/config.yaml made plain
+        `init` + `--store` hit it, so this asserts on construction rather than
+        on _resolve_graph_backend().
+        """
+        self._init_home(monkeypatch, tmp_path, "home-override")
+        seen = {}
+
+        class FakeGraphStore:
+            def __init__(self, backend=None, **kwargs):
+                seen["backend"] = backend
+                seen["kwargs"] = kwargs
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.graph_store",
+            _fake_module(GraphStore=FakeGraphStore),
+        )
+        cfg = cli_module._build_runtime_config(None, None)
+        ctx = cli_module.CLIContext(
+            config_path=None, config=cfg, log_level="INFO", store_backend="neo4j",
+        )
+        store = cli_module._get_graph_store(ctx)
+        assert isinstance(store, FakeGraphStore)
+        assert seen["backend"] == "neo4j"
+        assert "backend" not in seen["kwargs"], seen["kwargs"]
+
+    @pytest.mark.parametrize("args", [
+        ["decision", "list", "--format", "json"],
+        ["export", "--format", "json"],
+    ])
+    def test_store_override_after_init_does_not_fail_on_arguments(
+        self, runner, monkeypatch, tmp_path, args
+    ):
+        """init then `--store neo4j <cmd>` must not raise a TypeError."""
+        self._init_home(monkeypatch, tmp_path, f"home-{args[0]}")
+        result = runner.invoke(cli_module.main, ["--store", "neo4j"] + args)
+        # Rich wraps the error inside a box, so collapse whitespace before
+        # matching: the literal phrase is split across lines in result.output.
+        flat = " ".join(result.output.split())
+        assert "multiple values for keyword argument" not in flat, flat[:300]
+        assert "TypeError" not in flat, flat[:300]
+        assert "Traceback" not in result.output
+
+    def test_get_graph_store_refuses_memory_with_a_clear_message(self, memory_cfg):
+        """Safety net: a future caller that forgets to route memory gets told."""
+        import click as _click
+        with pytest.raises(_click.ClickException) as exc:
+            cli_module._get_graph_store(self._ctx(memory_cfg))
+        assert "ContextGraph" in str(exc.value)
 
 
 # ─── temporal ─────────────────────────────────────────────────────────────────
@@ -905,14 +2481,16 @@ class TestTemporal:
                                       "--interval1", "int1", "--interval2", "int2"])
         assert result.exit_code != 0 or result.exit_code == 0  # depends on import
 
-    def test_history_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if n.startswith("semantica.kg") else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["temporal", "history", "entity_alice"])
+    def test_history_import_error_is_clean(self, runner, monkeypatch):
+        # Earlier tests may already have imported the submodule, and a cached
+        # submodule resolves without consulting its parent package.
+        monkeypatch.setitem(sys.modules, "semantica.kg", None)
+        monkeypatch.setitem(sys.modules, "semantica.kg.temporal_reasoning", None)
+        result = runner.invoke(cli_module.main, ["temporal", "history",
+                                      "entity_alice"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+        assert "semantica.kg" in result.output
 
 
 # ─── provenance ───────────────────────────────────────────────────────────────
@@ -932,7 +2510,7 @@ class TestProvenance:
     def test_lineage_import_error_is_clean(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "provenance" in n else __import__(n, *a, **k)
+            if "provenance" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["provenance", "lineage", "entity_alice"])
         assert result.exit_code != 0
@@ -957,7 +2535,7 @@ class TestProvenance:
     def test_check_exits_0_when_import_error(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "provenance" in n else __import__(n, *a, **k)
+            if "provenance" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["provenance", "check"])
         assert result.exit_code != 0
@@ -967,6 +2545,30 @@ class TestProvenance:
 # ─── validate ─────────────────────────────────────────────────────────────────
 
 
+_SHAPES_TURTLE = (
+    "@prefix sh: <http://www.w3.org/ns/shacl#> .\n"
+    "@prefix ex: <http://example.org/> .\n"
+    "ex:PersonShape a sh:NodeShape ;\n"
+    "    sh:targetClass ex:Person ;\n"
+    "    sh:property [ sh:path ex:name ; sh:minCount 1 ] .\n"
+)
+
+_DATA_WITH_NAME_TURTLE = (
+    "@prefix ex: <http://example.org/> .\n"
+    'ex:alice a ex:Person ; ex:name "Alice" .\n'
+)
+
+_DATA_WITHOUT_NAME_TURTLE = (
+    "@prefix ex: <http://example.org/> .\n"
+    "ex:alice a ex:Person .\n"
+)
+
+
+def _rdf_file(path, text):
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
 class TestValidate:
     def test_group_help(self, runner):
         result = runner.invoke(cli_module.main, ["validate", "--help"])
@@ -974,43 +2576,159 @@ class TestValidate:
         for sub in ["shacl", "conflicts", "integrity"]:
             assert sub in result.output
 
-    def test_shacl_help(self, runner):
+    def test_shacl_help_names_the_data_and_shapes_arguments(self, runner):
         result = runner.invoke(cli_module.main, ["validate", "shacl", "--help"])
         _ok(result)
-        assert "--strictness" in result.output
+        assert "DATA" in result.output
+        assert "--shapes" in result.output
 
-    def test_shacl_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "ontology" in n else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["validate", "shacl"])
-        assert result.exit_code != 0
-        assert "Traceback" not in result.output
-
-    def test_conflicts_json(self, runner, monkeypatch):
-        fake_conf = _fake_module(
-            detect_conflicts=lambda **kw: {"conflicts": [], "count": 0},
+    def test_shacl_conforms_on_matching_data(self, runner, tmp_path):
+        """#1814: the command had no way to check an RDF file against shapes."""
+        pytest.importorskip("pyshacl")
+        data = _rdf_file(tmp_path / "data.ttl", _DATA_WITH_NAME_TURTLE)
+        shapes = _rdf_file(tmp_path / "shapes.ttl", _SHAPES_TURTLE)
+        result = runner.invoke(
+            cli_module.main,
+            ["validate", "shacl", data, "--shapes", shapes, "--json"],
         )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.conflicts", fake_conf)
-        result = runner.invoke(cli_module.main, ["validate", "conflicts", "--json"])
         _ok(result)
-        data = _json_output(result)
-        assert isinstance(data, dict)
+        payload = _json_output(result)
+        assert payload["conforms"] is True
+        assert payload["violations"] == []
 
-    def test_integrity_exits_0_with_import_error(self, runner):
+    def test_shacl_reports_a_violation(self, runner, tmp_path):
+        pytest.importorskip("pyshacl")
+        data = _rdf_file(tmp_path / "data.ttl", _DATA_WITHOUT_NAME_TURTLE)
+        shapes = _rdf_file(tmp_path / "shapes.ttl", _SHAPES_TURTLE)
+        result = runner.invoke(
+            cli_module.main,
+            ["validate", "shacl", data, "--shapes", shapes, "--json"],
+        )
+        # Non-conforming data exits 1 so CI can gate on it.
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["conforms"] is False
+        assert payload["violation_count"] >= 1
+
+    def test_shacl_rejects_an_extension_it_cannot_read(self, runner, tmp_path):
+        data = _rdf_file(tmp_path / "data.rdf", _DATA_WITH_NAME_TURTLE)
+        shapes = _rdf_file(tmp_path / "shapes.ttl", _SHAPES_TURTLE)
+        result = runner.invoke(
+            cli_module.main,
+            ["validate", "shacl", data, "--shapes", shapes, "--json"],
+        )
+        assert result.exit_code == 2
+        assert "cannot tell the RDF format" in _flatten(result.output)
+
+    def test_shacl_import_error_is_clean(self, runner, tmp_path):
+        data = _rdf_file(tmp_path / "data.ttl", _DATA_WITH_NAME_TURTLE)
+        shapes = _rdf_file(tmp_path / "shapes.ttl", _SHAPES_TURTLE)
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if n.startswith("semantica.kg") else __import__(n, *a, **k)
+            if "ontology" in n else _real_import(n, *a, **k)
         )):
-            result = runner.invoke(cli_module.main, ["validate", "integrity"])
+            result = runner.invoke(
+                cli_module.main,
+                ["validate", "shacl", data, "--shapes", shapes],
+            )
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
-    def test_strictness_choices(self, runner):
-        result = runner.invoke(cli_module.main, ["validate", "shacl", "--help"])
-        for s in ["strict", "moderate", "lenient"]:
-            assert s in result.output
+    def test_conflicts_calls_the_detector_with_all_strategies(
+        self, runner, graph_cfg, monkeypatch
+    ):
+        """#1814: the CLI must call ConflictDetector, whose `all` method is the
+        command's default strategy. The module-level convenience function has no
+        `all` and no `property`, and it takes no config."""
+        import semantica.conflicts as conflicts_module
+
+        seen = {}
+
+        class _Detector:
+            def __init__(self, **kwargs):
+                seen["init"] = kwargs
+
+            def detect_conflicts(self, entities, **kwargs):
+                seen["entities"] = entities
+                seen["kwargs"] = kwargs
+                return []
+
+        monkeypatch.setattr(conflicts_module, "ConflictDetector", _Detector)
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "validate", "conflicts", "--json"]
+        )
+        _ok(result)
+        assert _json_output(result) == {"conflicts": [], "count": 0}
+        assert seen["kwargs"]["method"] == "all"
+        assert seen["kwargs"]["relationships"] == []
+
+    def test_conflicts_property_strategy_is_reachable(self, runner, graph_cfg):
+        """The advertised value/property strategies need a property name."""
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--config", graph_cfg, "validate", "conflicts",
+                "--strategy", "value", "--property", "name", "--json",
+            ],
+        )
+        _ok(result)
+        assert _json_output(result)["count"] == 0
+
+    def test_conflicts_value_strategy_without_property_is_a_usage_error(
+        self, runner, graph_cfg
+    ):
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", graph_cfg, "validate", "conflicts", "--strategy", "value"],
+        )
+        assert result.exit_code == 2
+        assert "--property" in _flatten(result.output)
+
+    def test_conflicts_all_strategy_rejects_a_property(self, runner, graph_cfg):
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--config", graph_cfg, "validate", "conflicts",
+                "--strategy", "all", "--property", "name",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--property" in _flatten(result.output)
+
+    def test_conflict_entities_lift_the_nested_attributes(self):
+        """ConflictDetector's value strategy tests ``property_name in entity``,
+        while both graph adapters keep an entity's attributes under
+        ``properties`` — so a stored attribute was never compared and no
+        conflict was reported."""
+        graph = {
+            "entities": [{"id": "e1", "type": "Person", "properties": {"age": 30}}],
+            "relationships": [],
+        }
+        entity = cli_module._conflict_entities(graph)[0]
+        assert entity["age"] == 30
+        # A structural field keeps its own meaning on a name clash.
+        assert entity["type"] == "Person"
+
+    def test_ontology_input_graph_lifts_the_nested_attributes(self):
+        """OntologyGenerator infers properties from top-level keys and lists
+        ``properties`` itself as a control field, so an unadapted graph produced
+        an ontology with no property shapes at all."""
+        graph = {
+            "entities": [
+                {"id": "e1", "type": "Person", "properties": {"age": 30}}
+            ],
+            "relationships": [],
+        }
+        entity = cli_module._ontology_input_graph(graph)["entities"][0]
+        assert entity["age"] == 30
+        assert entity["id"] == "e1"
+
+    def test_integrity_exits_0_with_import_error(self, runner, monkeypatch):
+        monkeypatch.setitem(sys.modules, "semantica.kg", None)
+        result = runner.invoke(cli_module.main, ["validate", "integrity"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "semantica.kg" in result.output
 
 
 # ─── ontology ─────────────────────────────────────────────────────────────────
@@ -1074,7 +2792,7 @@ class TestOntology:
                 f.write("")
             with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
                 (_ for _ in ()).throw(ImportError(n))
-                if "ontology" in n else __import__(n, *a, **k)
+                if "ontology" in n else _real_import(n, *a, **k)
             )):
                 result = runner.invoke(cli_module.main, ["ontology", "align",
                                               "--source", "s.ttl", "--target", "t.ttl"])
@@ -1084,22 +2802,249 @@ class TestOntology:
     def test_health_exits_0_with_import_error(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "ontology" in n else __import__(n, *a, **k)
+            if "ontology" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["ontology", "health"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
 
+    # ── #1814: the CLI drifted from the library's signatures ──────────────────
+
+    def test_import_ingests_a_turtle_file(self, runner, graph_cfg, tmp_path):
+        """#1814: the CLI forwarded its own config into rdflib's parser, so every
+        import died on `TurtleParser.parse() got an unexpected keyword 'config'`."""
+        schema = tmp_path / "schema.ttl"
+        schema.write_text(
+            "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+            "@prefix ex: <http://example.org/> .\n"
+            "ex:Person a owl:Class .\n"
+        )
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--config",
+                graph_cfg,
+                "ontology",
+                "import",
+                str(schema),
+                "--format",
+                "turtle",
+                "--json",
+            ],
+        )
+        _ok(result)
+        assert _json_output(result)["status"] == "ok"
+
+    def test_validate_returns_an_ontology_report(self, runner, graph_cfg):
+        """#1814: validate_ontology() takes an ontology, not `shapes_file`."""
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "ontology", "validate", "--json"]
+        )
+        _ok(result)
+        data = _json_output(result)
+        assert {"valid", "consistent", "satisfiable"} <= set(data)
+
+    def test_shacl_generates_shapes_from_the_ontology(self, runner, graph_cfg):
+        """#1814: SHACLGenerator.generate() requires the ontology argument."""
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "ontology", "shacl", "--json"]
+        )
+        _ok(result)
+        assert "shacl" in _json_output(result)
+
+    def test_version_reports_no_snapshots_yet(self, runner, graph_cfg):
+        """#1814: OntologyVersionManager has no `current`; list_versions() does."""
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "ontology", "version", "--json"]
+        )
+        _ok(result)
+        data = _json_output(result)
+        assert data["version"] is None
+        assert "No persistent version store selected" in data["message"]
+
+    def test_version_rejects_a_missing_store_file(self, runner, graph_cfg, tmp_path):
+        """A mistyped path used to create an empty store and report no versions;
+        the flag now fails fast instead."""
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--config", graph_cfg, "ontology", "version",
+                "--storage", str(tmp_path / "typo.db"), "--json",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "does not exist" in _flatten(result.output)
+
+    def test_version_rejects_a_missing_configured_store(self, runner, tmp_path):
+        """The config key must not create an empty store either."""
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "custom:\n  ontology:\n"
+            f"    version_storage_path: {tmp_path / 'typo.db'}\n"
+        )
+        result = runner.invoke(
+            cli_module.main, ["--config", str(cfg), "ontology", "version", "--json"]
+        )
+        assert result.exit_code == 1
+        assert "does not exist" in _flatten(result.output)
+        assert not (tmp_path / "typo.db").exists()
+
+    def test_version_hints_the_key_it_actually_reads(self, runner):
+        result = runner.invoke(cli_module.main, ["ontology", "version"])
+        assert "custom.ontology.version_storage_path" in _flatten(result.output)
+
+    def test_validate_shapes_points_at_validate_shacl(self, runner):
+        # --shapes moved to `validate shacl`; an existing script should get a
+        # pointer rather than Click's "No such option" (#1814 review).
+        result = runner.invoke(cli_module.main,
+                               ["ontology", "validate", "--shapes", "x.ttl"])
+        assert result.exit_code != 0
+        assert "validate shacl" in _flatten(result.output)
+
+    def test_health_returns_a_quality_report(self, runner, graph_cfg):
+        """#1814: OntologyValidator has no `health`; the quality gate does."""
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "ontology", "health", "--json"]
+        )
+        _ok(result)
+        assert "passed" in _json_output(result)
+
+    # ── #1814 review: paths, vocabularies and format names ────────────────────
+
+    def test_import_maps_the_advertised_format_names(
+        self, runner, graph_cfg, tmp_path, monkeypatch
+    ):
+        """The CLI advertises rdflib's public format names but hands an explicit
+        format to Dataset.parse, which wants its own parser names; passing them
+        through meant rdfxml/jsonld/ntriples never reached their parsers."""
+        import semantica.ontology as ontology_module
+
+        seen = {}
+
+        def _ingest(source, **kwargs):
+            seen.update(kwargs)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(ontology_module, "ingest_ontology", _ingest)
+        source = tmp_path / "schema.rdf"
+        source.write_text(
+            "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'/>"
+        )
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--config",
+                graph_cfg,
+                "ontology",
+                "import",
+                str(source),
+                "--format",
+                "rdfxml",
+                "--json",
+            ],
+        )
+        _ok(result)
+        assert seen["format"] == "xml"
+
+    def test_health_passes_the_graph_to_the_quality_gate(
+        self, runner, graph_cfg, monkeypatch
+    ):
+        """The generated ontology does not retain the instances, so without the
+        graph the report omitted every instance-level check."""
+        import semantica.ontology as ontology_module
+
+        seen = {}
+
+        class _Engine:
+            def quality_check(self, ontology, graph_data=None):
+                seen["graph_data"] = graph_data
+                return {"passed": True}
+
+        monkeypatch.setattr(ontology_module, "OntologyEngine", _Engine)
+        result = runner.invoke(
+            cli_module.main, ["--config", graph_cfg, "ontology", "health", "--json"]
+        )
+        _ok(result)
+        assert set(seen["graph_data"]) == {"entities", "relationships"}
+
 
 # ─── export ───────────────────────────────────────────────────────────────────
 
 
+# The record shape the Neo4j and FalkorDB backends return: endpoints named
+# start_node_id/end_node_id, and get_nodes() nesting its fields under
+# "properties". The local store uses source_id/target_id, so a fixture written
+# against it hid the fact that the command fed the exporters a shape they could
+# not read (#1712).
+STORE_NODES = [
+    {"id": "n1", "type": "Person", "name": "Alice", "properties": {"name": "Alice"}}
+]
+STORE_RELATIONSHIP = {
+    "id": "r1",
+    "start_node_id": "n1",
+    "end_node_id": "n1",
+    "type": "KNOWS",
+    "properties": {},
+}
+
+# The extension each multi-file format is written under, checked against the
+# list the command refuses a single destination for.
+MULTI_FILE_EXTENSIONS = {"arrow": ".arrow", "csv": ".csv", "parquet": ".parquet"}
+
+
+def _patch_graph_store(monkeypatch, relationships, nodes=None) -> dict:
+    """Point the export command at a fake store, and count how often it reads."""
+    node_records = STORE_NODES if nodes is None else nodes
+    reads = {"nodes": 0}
+
+    def get_nodes(**kwargs):
+        reads["nodes"] += 1
+        return [dict(n) for n in node_records]
+
+    def get_relationships(**kwargs):
+        return [dict(r) for r in relationships]
+
+    class FakeGraphStore:
+        def get_nodes(self, **kwargs):
+            return get_nodes(**kwargs)
+
+        def get_relationships(self, **kwargs):
+            return get_relationships(**kwargs)
+
+    monkeypatch.setattr(
+        "semantica.graph_store.methods._get_store", lambda: FakeGraphStore()
+    )
+    for target in (
+        "semantica.graph_store.get_nodes",
+        "semantica.graph_store.methods.get_nodes",
+    ):
+        monkeypatch.setattr(target, get_nodes)
+    for target in (
+        "semantica.graph_store.get_relationships",
+        "semantica.graph_store.methods.get_relationships",
+    ):
+        monkeypatch.setattr(target, get_relationships)
+    return reads
+
+
+def test_multi_file_extensions_cover_what_the_command_lists():
+    from semantica.export import MULTI_FILE_FORMATS
+
+    assert set(MULTI_FILE_EXTENSIONS) == set(
+        MULTI_FILE_FORMATS
+    ), "a multi-file format was added or removed without updating these tests"
+
+
 class TestExport:
-    def test_help_shows_14_formats(self, runner):
+    def test_help_shows_the_offered_formats(self, runner):
         result = runner.invoke(cli_module.main, ["export", "--help"])
         _ok(result)
-        for fmt in ["turtle", "parquet", "csv", "graphml", "owl", "arangodb"]:
+        for fmt in cli_module._EXPORT_FORMATS:
             assert fmt in result.output
+        # These three need an ontology or an Explorer session, not a graph
+        # dump, so they are no longer offered (#1712).
+        for fmt in ["owl", "shacl", "distance-enriched"]:
+            assert fmt not in result.output
         for flag in ["--with-provenance", "--filter", "--compress", "--dry-run"]:
             assert flag in result.output
 
@@ -1121,81 +3066,13 @@ class TestExport:
         assert data["dry_run"] is True
 
     def test_real_export_runtime_path(self, runner, tmp_path, monkeypatch):
-        class FakeGraphStore:
-            def get_nodes(self, labels=None, properties=None, limit=100, **options):
-                return [
-                    {
-                        "id": "n1",
-                        "type": "Person",
-                        "name": "Alice",
-                        "properties": {"name": "Alice"},
-                    }
-                ]
-
-            def get_relationships(self, node_id=None, rel_type=None, direction="both", limit=100, **options):
-                return [
-                    {
-                        "id": "r1",
-                        "source": "n1",
-                        "target": "n1",
-                        "type": "KNOWS",
-                        "properties": {},
-                    }
-                ]
-
-        monkeypatch.setattr(
-            "semantica.graph_store.methods._get_store",
-            lambda: FakeGraphStore(),
-        )
-        monkeypatch.setattr(
-            "semantica.graph_store.get_nodes",
-            lambda **kwargs: [
-                {
-                    "id": "n1",
-                    "type": "Person",
-                    "name": "Alice",
-                    "properties": {"name": "Alice"},
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            "semantica.graph_store.methods.get_nodes",
-            lambda **kwargs: [
-                {
-                    "id": "n1",
-                    "type": "Person",
-                    "name": "Alice",
-                    "properties": {"name": "Alice"},
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            "semantica.graph_store.get_relationships",
-            lambda **kwargs: [
-                {
-                    "id": "r1",
-                    "source": "n1",
-                    "target": "n1",
-                    "type": "KNOWS",
-                    "properties": {},
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            "semantica.graph_store.methods.get_relationships",
-            lambda **kwargs: [
-                {
-                    "id": "r1",
-                    "source": "n1",
-                    "target": "n1",
-                    "type": "KNOWS",
-                    "properties": {},
-                }
-            ],
-        )
+        _patch_graph_store(monkeypatch, [STORE_RELATIONSHIP])
 
         output_path = tmp_path / "export.json"
-        result = runner.invoke(cli_module.main, ["export", "--format", "json", "--output", str(output_path)])
+        result = runner.invoke(cli_module.main, [
+            "--store", "neo4j", "export", "--format", "json",
+            "--output", str(output_path),
+        ])
         _ok(result)
         exported = output_path.read_text(encoding="utf-8")
         assert "Alice" in exported
@@ -1205,15 +3082,93 @@ class TestExport:
         result = runner.invoke(cli_module.main, ["export", "--format", "magic"])
         assert result.exit_code != 0
 
-    def test_import_error_is_clean(self, runner):
-        original_import = __import__
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "semantica.export" in n else original_import(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["export", "--format", "json"])
+    def test_import_error_is_clean(self, runner, monkeypatch):
+        monkeypatch.setitem(sys.modules, "semantica.export", None)
+        result = runner.invoke(
+            cli_module.main, ["--store", "neo4j", "export", "--format", "json"]
+        )
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+        assert "semantica.export" in result.output
+
+
+class TestExportMultiFileFormats:
+    """Formats that write one file per collection, driven through the command.
+
+    ``arrow``, ``csv`` and ``parquet`` take ``--output`` as a base name and
+    write ``graph_entities.*``/``graph_relationships.*`` next to it, so the
+    path the command was given is never created. It used to report that path as
+    written anyway, hand stdout an empty file, and compress a base file that
+    did not exist.
+    """
+
+    @pytest.mark.parametrize("fmt,ext", sorted(MULTI_FILE_EXTENSIONS.items()))
+    def test_reports_the_files_it_wrote(self, runner, tmp_path, monkeypatch, fmt, ext):
+        _patch_graph_store(monkeypatch, [STORE_RELATIONSHIP])
+        target = tmp_path / f"graph{ext}"
+
+        result = runner.invoke(
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", fmt, "--output", str(target)]
+        )
+
+        _ok(result)
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == [f"graph_entities{ext}", f"graph_relationships{ext}"], names
+        for name in names:
+            assert name in result.output, f"{name} not reported: {result.output!r}"
+        assert not target.exists(), (
+            "the command was asked for a base name; it must not be reported as "
+            "the artifact"
+        )
+
+    @pytest.mark.parametrize("fmt,ext", sorted(MULTI_FILE_EXTENSIONS.items()))
+    @pytest.mark.parametrize(
+        "flags,mention",
+        [([], "--output"), (["--compress"], "--compress")],
+    )
+    def test_a_single_destination_is_refused(
+        self, runner, tmp_path, monkeypatch, fmt, ext, flags, mention
+    ):
+        reads = _patch_graph_store(monkeypatch, [STORE_RELATIONSHIP])
+
+        result = runner.invoke(cli_module.main, ["export", "--format", fmt] + flags)
+
+        assert result.exit_code != 0, f"{flags} exited 0: {result.output!r}"
+        assert mention in result.output, f"{result.output!r} does not mention {mention}"
+        assert reads["nodes"] == 0, "the store was read before the format was refused"
+
+    def test_arrow_without_relationships_still_exports(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """A graph whose nodes have no edges between them is not an error."""
+        _patch_graph_store(monkeypatch, [])
+        target = tmp_path / "graph.arrow"
+
+        result = runner.invoke(
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", "arrow", "--output", str(target)]
+        )
+
+        _ok(result)
+        assert (tmp_path / "graph_entities.arrow").exists()
+        assert not (tmp_path / "graph_relationships.arrow").exists()
+
+    @pytest.mark.parametrize("fmt,ext", sorted(MULTI_FILE_EXTENSIONS.items()))
+    def test_an_empty_store_writes_nothing_and_says_so(
+        self, runner, tmp_path, monkeypatch, fmt, ext
+    ):
+        _patch_graph_store(monkeypatch, [], nodes=[])
+        target = tmp_path / f"graph{ext}"
+
+        result = runner.invoke(
+            cli_module.main,
+            ["--store", "neo4j", "export", "--format", fmt, "--output", str(target)]
+        )
+
+        _ok(result)
+        assert "Nothing written" in result.output, result.output
+        assert not list(tmp_path.iterdir())
 
 
 # ─── visualize ────────────────────────────────────────────────────────────────
@@ -1237,7 +3192,7 @@ class TestVisualize:
     def test_import_error_is_clean(self, runner, sub):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "visualization" in n else __import__(n, *a, **k)
+            if "visualization" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["visualize", sub])
         assert result.exit_code != 0
@@ -1268,21 +3223,47 @@ class TestPipeline:
         result = runner.invoke(cli_module.main, ["pipeline", "init", "--dry-run"])
         _ok(result)
 
-    def test_init_creates_file(self, runner, monkeypatch):
-        fake_pl = _fake_module(
-            PipelineTemplateManager=lambda: MagicMock(scaffold=lambda t: "steps: []\n"),
-        )
-        monkeypatch.setitem(__import__("sys").modules, "semantica.pipeline", fake_pl)
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli_module.main, ["pipeline", "init",
-                                          "--template", "rag", "--output", "pl.yaml"])
-            _ok(result)
-            assert os.path.exists("pl.yaml")
+    def test_init_templates_match_the_manager(self, runner):
+        # The CLI hardcoded five template names the manager has never registered,
+        # so every `pipeline init` would have reached "Template not found" once the
+        # wrapper called the real API. Keep the two lists in step.
+        from semantica.pipeline import PipelineTemplateManager
 
-    def test_init_template_choices(self, runner):
+        manager = PipelineTemplateManager()
+        assert cli_module._PIPELINE_TEMPLATES == manager.list_templates()
+
+    def test_init_creates_a_loadable_pipeline(self, runner):
+        with runner.isolated_filesystem():
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "init", "--template", "rag_pipeline",
+                 "--output", "pl.yaml"],
+            )
+            _ok(result)
+            pipeline = cli_module._load_pipeline_file("pl.yaml")
+        assert [s.name for s in pipeline.steps] == [
+            "ingest", "chunk", "embed", "store_vectors",
+        ]
+
+    def test_init_writes_the_pipeline_not_a_placeholder(self, runner):
+        # The old ImportError path silently wrote "# Pipeline template: X\nsteps: []".
+        with runner.isolated_filesystem():
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "init", "--output", "pl.yaml"],
+            )
+            _ok(result)
+            text = open("pl.yaml").read()
+        assert "steps: []" not in text
+        assert "type: ingest" in text
+
+    def test_init_help_offers_only_real_templates(self, runner):
         result = runner.invoke(cli_module.main, ["pipeline", "init", "--help"])
-        for t in ["ingest-extract-kg", "rag", "ontology-build", "decision-track", "full"]:
-            assert t in result.output
+        _ok(result)
+        for gone in ["ingest-extract-kg", "decision-track", "ontology-build"]:
+            assert gone not in result.output
+        for real in ["document_processing", "rag_pipeline"]:
+            assert real in result.output
 
     def test_validate_requires_file(self, runner):
         result = runner.invoke(cli_module.main, ["pipeline", "validate"])
@@ -1291,6 +3272,178 @@ class TestPipeline:
     def test_validate_nonexistent_file_fails(self, runner):
         result = runner.invoke(cli_module.main, ["pipeline", "validate", "no_such.yaml"])
         assert result.exit_code != 0
+
+    def test_validate_reads_the_file_instead_of_the_path(self, runner):
+        # Regression: validate() was handed the *path string*. A str has no steps,
+        # so it type-checked nothing and reported valid for any input.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps:\n  - name: a\n    type: ingest\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml", "--json"],
+            )
+        _ok(result)
+        payload = json.loads([
+            line for line in result.output.splitlines() if line.startswith("{")
+        ][-1])
+        assert payload["valid"] is True
+        assert payload["pipeline"] == "pl.yaml"
+        # The loader leaves handlers off, and the validator says so.
+        assert any("no handler" in w for w in payload["warnings"])
+
+    def test_validate_reports_a_missing_dependency(self, runner):
+        # Before the fix this exact file was reported valid, because it was never
+        # loaded.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write(
+                    "steps:\n"
+                    "  - name: a\n"
+                    "    type: ingest\n"
+                    "    dependencies: [nope]\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml"],
+            )
+        assert result.exit_code != 0
+        assert "Missing dependency 'nope'" in _flatten(result.output)
+
+    def test_validate_rejects_a_file_that_is_not_a_pipeline(self, runner):
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("just a string\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml"],
+            )
+        assert result.exit_code != 0
+        assert "not a pipeline definition" in _flatten(result.output)
+
+    def test_validate_rejects_a_step_the_builder_would_drop(self, runner):
+        # build_pipeline() keeps a step only when both name and type are truthy,
+        # so a half-written step vanished before the validator ran and the file
+        # was reported valid (#2026).
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write(
+                    "steps:\n"
+                    "  - name: ingest\n"
+                    "    type: ingest\n"
+                    "  - name: broken\n"
+                    "    config: {}\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml"],
+            )
+        assert result.exit_code != 0
+        flat = _flatten(result.output)
+        assert "steps[1]" in flat
+        assert "broken" in flat
+        assert "non-empty 'type'" in flat
+
+    def test_validate_json_reports_a_dropped_step_in_its_own_shape(self, runner):
+        # The structured object has to survive the loader rejecting the file,
+        # otherwise --json callers only see the generic error envelope.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write(
+                    "steps:\n"
+                    "  - name: ingest\n"
+                    "    type: ingest\n"
+                    "  - name: broken\n"
+                    "    config: {}\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml", "--json"],
+            )
+        assert result.exit_code != 0
+        payload = json.loads([
+            line for line in result.output.splitlines() if line.startswith("{")
+        ][-1])
+        assert payload["valid"] is False
+        assert payload["pipeline"] == "pl.yaml"
+        assert payload["errors"] == ["steps[1] ('broken') is missing a non-empty 'type'"]
+        assert payload["warnings"] == []
+
+    def test_validate_rejects_a_step_that_is_not_a_mapping(self, runner):
+        # Used to reach dict() inside deserialize_pipeline and surface as
+        # "dictionary update sequence element #0 has length 1; 2 is required".
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps:\n  - just-a-string\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml"],
+            )
+        assert result.exit_code != 0
+        flat = _flatten(result.output)
+        assert "steps[0] is not a mapping (got str)" in flat
+        assert "dictionary update sequence" not in flat
+
+    def test_validate_json_reports_a_builder_rejection_in_its_own_shape(self, runner):
+        # deserialize_pipeline() runs builder validation, which raises on a
+        # missing dependency. --json used to fall through to the error envelope
+        # on stderr instead of printing {valid, errors, warnings, pipeline}.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write(
+                    "steps:\n"
+                    "  - name: orphan\n"
+                    "    type: export\n"
+                    "    dependencies: [does_not_exist]\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml", "--json"],
+            )
+        assert result.exit_code != 0
+        payload = json.loads([
+            line for line in result.output.splitlines() if line.startswith("{")
+        ][-1])
+        assert payload["valid"] is False
+        assert payload["errors"] == [
+            "Missing dependency 'does_not_exist' for step 'orphan'"
+        ]
+        assert payload["warnings"] == []
+        assert payload["pipeline"] == "pl.yaml"
+
+    def test_validate_json_keeps_the_object_for_a_non_pipeline_file(self, runner):
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("just a string\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "validate", "pl.yaml", "--json"],
+            )
+        assert result.exit_code != 0
+        payload = json.loads([
+            line for line in result.output.splitlines() if line.startswith("{")
+        ][-1])
+        assert payload["valid"] is False
+        assert "not a pipeline definition" in payload["errors"][0]
+
+    def test_run_rejects_a_step_the_builder_would_drop(self, runner):
+        # run loads through the same helper, so it must not silently execute a
+        # pipeline that is missing a step.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write(
+                    "steps:\n"
+                    "  - name: ingest\n"
+                    "    type: ingest\n"
+                    "  - name: broken\n"
+                    "    config: {}\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "run", "pl.yaml"],
+            )
+        assert result.exit_code != 0
+        assert "steps[1]" in _flatten(result.output)
 
     def test_run_dry_run(self, runner):
         with runner.isolated_filesystem():
@@ -1303,22 +3456,110 @@ class TestPipeline:
         result = runner.invoke(cli_module.main, ["pipeline", "run"])
         assert result.exit_code != 0
 
-    def test_status_exits_0(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "pipeline" in n else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["pipeline", "status"])
+    def test_run_refuses_steps_that_have_no_handler(self, runner):
+        # A pipeline loaded from a file can never carry handlers, and
+        # _execute_step() returns its input untouched when handler is None, so
+        # executing would report success having done nothing.
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps:\n  - name: ingest\n    type: ingest\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "run", "pl.yaml"],
+            )
         assert result.exit_code != 0
+        flat = _flatten(result.output)
+        assert "no handler" in flat
+        assert "ingest" in flat
+
+    def test_run_executes_a_pipeline_with_handlers(self, runner, monkeypatch):
+        # The wiring itself: execute_pipeline() has to receive the loaded Pipeline,
+        # and --parallel has to land on pipeline.config, the only place the engine
+        # reads parallelism from.
+        from semantica.pipeline import PipelineBuilder
+
+        builder = PipelineBuilder()
+        builder.register_step_handler("ingest", lambda data, **kw: data)
+        builder.add_step("ingest", "ingest")
+        handled = builder.build()
+
+        seen = {}
+
+        class _Engine:
+            def __init__(self, config=None):
+                seen["config"] = config
+
+            def execute_pipeline(self, pipeline, **options):
+                seen["pipeline"] = pipeline
+                return _fake_module(
+                    success=True,
+                    errors=[],
+                    metadata={"pipeline_id": pipeline.name, "execution_time": 0.5},
+                )
+
+        monkeypatch.setattr(cli_module, "_load_pipeline_file", lambda path: handled)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.pipeline",
+                            _fake_module(ExecutionEngine=_Engine))
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps: []\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "run", "pl.yaml", "--parallel", "7"],
+            )
+        _ok(result)
+        assert seen["pipeline"] is handled
+        assert seen["pipeline"].config["parallelism"] == 7
+        assert "Pipeline completed" in _flatten(result.output)
+
+    def test_run_reports_a_failed_pipeline(self, runner, monkeypatch):
+        from semantica.pipeline import PipelineBuilder
+
+        builder = PipelineBuilder()
+        builder.register_step_handler("ingest", lambda data, **kw: data)
+        builder.add_step("ingest", "ingest")
+        handled = builder.build()
+
+        class _Engine:
+            def __init__(self, config=None):
+                pass
+
+            def execute_pipeline(self, pipeline, **options):
+                return _fake_module(success=False, errors=["boom"], metadata={})
+
+        monkeypatch.setattr(cli_module, "_load_pipeline_file", lambda path: handled)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.pipeline",
+                            _fake_module(ExecutionEngine=_Engine))
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps: []\n")
+            result = runner.invoke(cli_module.main, ["pipeline", "run", "pl.yaml"])
+        assert result.exit_code != 0
+        assert "boom" in _flatten(result.output)
+
+    def test_run_rejects_watch(self, runner):
+        with runner.isolated_filesystem():
+            with open("pl.yaml", "w") as f:
+                f.write("steps:\n  - name: ingest\n    type: ingest\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["pipeline", "run", "pl.yaml", "--watch"],
+            )
+        assert result.exit_code != 0
+        assert "--watch" in _flatten(result.output)
+
+    def test_status_reports_it_cannot_observe_another_process(self, runner):
+        # The engine keeps pipeline status in memory, so a separate `pipeline run`
+        # process is not observable from here.
+        result = runner.invoke(cli_module.main, ["pipeline", "status"])
+        assert result.exit_code != 0
+        assert "no source of truth" in _flatten(result.output)
         assert "Traceback" not in result.output
 
-    def test_stop_exits_cleanly_on_import_error(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if "pipeline" in n else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["pipeline", "stop"])
+    def test_stop_reports_it_cannot_reach_another_process(self, runner):
+        result = runner.invoke(cli_module.main, ["pipeline", "stop"])
         assert result.exit_code != 0
+        assert "nothing to stop" in _flatten(result.output)
         assert "Traceback" not in result.output
 
 
@@ -1350,6 +3591,65 @@ class TestStore:
         result = runner.invoke(cli_module.main, ["store", "connect", "--backend", "neo4j"])
         _ok(result)
 
+    def test_connect_dispatches_through_graph_store(self, runner, monkeypatch):
+        # store connect used to call get_graph_store_method(backend) — the
+        # method registry, which needs (task, method_name) — so it raised a
+        # TypeError before any connection attempt (#1354).
+        calls = {}
+
+        class _FakeGraphStore:
+            def __init__(self, backend=None, **cfg):
+                calls["backend"] = backend
+                calls["cfg"] = cfg
+
+            def connect(self):
+                calls["connected"] = True
+                return True
+
+        import semantica.graph_store as gs_mod
+        monkeypatch.setattr(gs_mod, "GraphStore", _FakeGraphStore)
+        result = runner.invoke(cli_module.main, [
+            "store", "connect", "--backend", "neo4j",
+            "--uri", "bolt://example:7687", "--json"])
+        _ok(result)
+        data = _json_output(result)
+        assert data == {"backend": "neo4j", "connected": True}
+        assert calls["backend"] == "neo4j"
+        assert calls["cfg"].get("uri") == "bolt://example:7687"
+        assert calls.get("connected") is True
+
+    def test_connect_invalid_backend_reports_error_not_dispatch_error(self, runner):
+        """An unknown backend name must produce a meaningful backend error, not a
+        Python TypeError from the old get_graph_store_method() dispatch (#1354)."""
+        result = runner.invoke(cli_module.main,
+                               ["store", "connect", "--backend", "does-not-exist"])
+        # Exit 0 because store_connect always catches and reports errors gracefully.
+        _ok(result)
+        # The output must mention the backend, not a Python internal error.
+        assert "does-not-exist" in result.output
+        assert "TypeError" not in result.output
+        assert "Traceback" not in result.output
+
+    def test_connect_backend_error_surfaces_in_json(self, runner, monkeypatch):
+        """A connect() failure must appear in JSON output as connected=False with an error field."""
+
+        class _FailingStore:
+            def __init__(self, backend=None, **cfg):
+                pass
+
+            def connect(self):
+                raise RuntimeError("auth failed")
+
+        import semantica.graph_store as gs_mod
+        monkeypatch.setattr(gs_mod, "GraphStore", _FailingStore)
+        result = runner.invoke(cli_module.main, [
+            "store", "connect", "--backend", "neo4j", "--json"])
+        _ok(result)
+        data = _json_output(result)
+        assert data["connected"] is False
+        assert "auth failed" in data.get("error", "")
+        assert data["backend"] == "neo4j"
+
     def test_migrate_dry_run(self, runner):
         result = runner.invoke(cli_module.main, ["store", "migrate",
                                       "--from", "faiss", "--to", "qdrant", "--dry-run"])
@@ -1359,20 +3659,606 @@ class TestStore:
         result = runner.invoke(cli_module.main, ["store", "migrate", "--from", "faiss"])
         assert result.exit_code != 0
 
+    def test_migrate_refuses_unsupported_backend_pair(self, runner):
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "faiss", "--to", "qdrant"])
+        assert result.exit_code != 0
+        # Rich may wrap the error message across lines; check for each backend
+        # name individually rather than the exact comma-joined string.
+        output = result.output
+        assert "faiss" in output
+        assert "pgvector" in output
+        assert "sqlite" in output
+
+    def _fake_migrate_store_module(self, source_items, stored, dest_configs=None):
+        class _FakeBackendStore:
+            def __init__(self, dimension=None):
+                self.dimension = dimension
+
+        class _FakeStore:
+            def __init__(self, backend, config=None, **kw):
+                self.backend = backend
+                self._config = config or {}
+                dim = self._config.get("dimension")
+                self._backend_store = _FakeBackendStore(dimension=dim)
+                if dest_configs is not None:
+                    dest_configs[backend] = dict(self._config)
+
+            def iter_vectors(self, batch_size=500):
+                if self.backend == "sqlite":
+                    yield from source_items
+                    return
+                return
+                yield  # pragma: no cover - makes this a generator for other backends
+
+            def store_vectors(self, vectors, metadata, ids=None):
+                for vec_id, meta in zip(ids, metadata):
+                    stored[vec_id] = meta
+
+        return _fake_module(VectorStore=_FakeStore)
+
+    def test_migrate_runs_between_supported_backends(self, runner, monkeypatch):
+        source_items = [
+            {"id": "a", "vector": [0.1, 0.2], "metadata": {"tag": "x"}},
+            {"id": "b", "vector": [0.3, 0.4], "metadata": {}},
+        ]
+        stored = {}
+        fake_vs = self._fake_migrate_store_module(source_items, stored)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
+
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "sqlite", "--to", "pgvector",
+                                      "--namespace", "prod", "--json"])
+        _ok(result)
+        data = _json_output(result)
+        assert data == {"from": "sqlite", "to": "pgvector", "migrated": 2}
+        assert stored == {"a": {"tag": "x", "namespace": "prod"}, "b": {"namespace": "prod"}}
+
+    def test_migrate_reports_zero_for_empty_source(self, runner, monkeypatch):
+        stored = {}
+        fake_vs = self._fake_migrate_store_module([], stored)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
+
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "sqlite", "--to", "pgvector", "--json"])
+        _ok(result)
+        assert _json_output(result)["migrated"] == 0
+        assert stored == {}
+
+    def test_migrate_inherits_source_dimension_into_dest(self, runner, monkeypatch):
+        source_items = [{"id": "a", "vector": [0.1, 0.2, 0.3], "metadata": {}}]
+        stored = {}
+        dest_configs: dict = {}
+        fake_vs = self._fake_migrate_store_module(source_items, stored, dest_configs)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
+        monkeypatch.setattr(
+            cli_module.Config, "to_dict",
+            lambda self: {"vector_store": {"sqlite": {"dimension": 3}, "pgvector": {}}},
+        )
+
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "sqlite", "--to", "pgvector", "--json"])
+        _ok(result)
+        assert dest_configs["pgvector"].get("dimension") == 3
+
+    def test_migrate_retry_reloads_persisted_faiss_state(
+        self, runner, monkeypatch, tmp_path
+    ):
+        pytest.importorskip("faiss")
+        import numpy as np
+
+        from semantica.vector_store.faiss_store import FAISSStore
+
+        index_path = tmp_path / "migrated.faiss"
+        source_items = [
+            {"id": "a", "vector": [0.1, 0.2, 0.3], "metadata": {"tag": "x"}},
+            {"id": "b", "vector": [0.4, 0.5, 0.6], "metadata": {"tag": "y"}},
+        ]
+
+        class _SourceBackend:
+            dimension = 3
+
+        class _MigrationStore:
+            def __init__(self, backend, config=None, **kw):
+                self.backend = backend
+                if backend == "sqlite":
+                    self._backend_store = _SourceBackend()
+                else:
+                    self._backend_store = FAISSStore(dimension=3)
+                    self._backend_store.create_index(index_type="flat")
+
+            def iter_vectors(self, batch_size=500):
+                if self.backend == "sqlite":
+                    yield from source_items
+
+            def store_vectors(self, vectors, metadata, ids=None):
+                self._backend_store.add_vectors(
+                    np.asarray(vectors, dtype=np.float32),
+                    ids=ids,
+                    metadata=metadata,
+                )
+
+        fake_vs = _fake_module(VectorStore=_MigrationStore)
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.vector_store", fake_vs
+        )
+        monkeypatch.setattr(
+            cli_module.Config,
+            "to_dict",
+            lambda self: {
+                "vector_store": {
+                    "sqlite": {"dimension": 3},
+                    "faiss": {"dimension": 3, "index_path": str(index_path)},
+                }
+            },
+        )
+
+        command = [
+            "store",
+            "migrate",
+            "--from",
+            "sqlite",
+            "--to",
+            "faiss",
+            "--json",
+        ]
+        first_result = runner.invoke(cli_module.main, command)
+        _ok(first_result)
+
+        first_load = FAISSStore(dimension=3)
+        first_load.load_index(index_path, index_type="flat")
+        assert first_load.index.vector_ids == ["a", "b"]
+        assert first_load.index.index.ntotal == 2
+
+        retry_result = runner.invoke(cli_module.main, command)
+        _ok(retry_result)
+
+        retry_load = FAISSStore(dimension=3)
+        retry_load.load_index(index_path, index_type="flat")
+        assert retry_load.index.vector_ids == ["a", "b"]
+        assert retry_load.index.index.ntotal == 2
+
+    def test_migrate_faiss_source_requires_index_path(self, runner, monkeypatch):
+        fake_vs = _fake_module(VectorStore=lambda **kw: MagicMock())
+        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
+
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "faiss", "--to", "sqlite"])
+        assert result.exit_code != 0
+        assert "index_path" in result.output
+
+    def test_migrate_faiss_dest_requires_index_path(self, runner, monkeypatch):
+        fake_vs = _fake_module(VectorStore=lambda **kw: MagicMock())
+        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
+
+        result = runner.invoke(cli_module.main, ["store", "migrate",
+                                      "--from", "sqlite", "--to", "faiss"])
+        assert result.exit_code != 0
+        assert "index_path" in result.output
+
     def test_flush_requires_confirm(self, runner):
         result = runner.invoke(cli_module.main, ["store", "flush"])
         assert result.exit_code != 0
         assert "confirm" in result.output.lower() or result.exit_code == 2
 
-    def test_flush_with_confirm(self, runner, monkeypatch):
-        fake_vs = _fake_module(delete_vectors=lambda **kw: None)
-        monkeypatch.setitem(__import__("sys").modules, "semantica.vector_store", fake_vs)
-        result = runner.invoke(cli_module.main, ["store", "flush", "--confirm"])
+    def test_flush_removes_only_the_named_namespace(self, runner, monkeypatch):
+        # The old implementation read a namespace registry that ordinary
+        # storage never populates, so it reported zero removals against real
+        # data (#1943). This drives the real VectorStore API.
+        built: list = []
+        store = _wire_inmemory_vector_store(
+            monkeypatch, ["default", "production"], built)
+        result = runner.invoke(
+            cli_module.main, ["--vector-store", "sqlite", "store", "flush", "--confirm"])
         _ok(result)
+        assert "1 vectors removed" in result.output
+        remaining = [item["metadata"]["namespace"] for item in store.iter_vectors()]
+        assert remaining == ["production"]
+        assert built[0]["backend"] == "sqlite"
+
+    def test_flush_reports_zero_for_an_empty_namespace(self, runner, monkeypatch):
+        store = _wire_inmemory_vector_store(monkeypatch, ["default"])
+        result = runner.invoke(
+            cli_module.main,
+            ["--vector-store", "sqlite", "store", "flush", "--namespace", "nope", "--confirm"])
+        _ok(result)
+        assert "nope" in result.output and "0 vectors" in result.output
+        assert len(list(store.iter_vectors())) == 1
+
+    def test_flush_uses_pinecone_native_namespace(self, runner, monkeypatch):
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                assert backend == "pinecone"
+                self.items = {
+                    "default-id": ("", {"tag": "default"}),
+                    "production-id": ("production", {"tag": "production"}),
+                    "other-id": ("other", {"tag": "other"}),
+                }
+                self.iter_calls = []
+                self.delete_calls = []
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                self.iter_calls.append(namespace)
+                for vector_id, (item_namespace, metadata) in self.items.items():
+                    if item_namespace == namespace:
+                        yield {"id": vector_id, "metadata": metadata, "vector": [1.0]}
+
+            def delete_vectors(self, vector_ids, namespace=None):
+                self.delete_calls.append((vector_ids, namespace))
+                for vector_id in vector_ids:
+                    if self.items[vector_id][0] != namespace:
+                        raise AssertionError("deletion escaped the requested namespace")
+                    del self.items[vector_id]
+                return True
+
+        stores = []
+
+        def _store_factory(*args, **kwargs):
+            store = _PineconeFlushStore(*args, **kwargs)
+            stores.append(store)
+            return store
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_store_factory),
+        )
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--vector-store",
+                "pinecone",
+                "store",
+                "flush",
+                "--namespace",
+                "production",
+                "--confirm",
+            ],
+        )
+        _ok(result)
+        assert "1 vectors removed" in result.output
+        assert stores[0].iter_calls == ["production", "production"]
+        assert stores[0].delete_calls == [(["production-id"], "production")]
+        assert set(stores[0].items) == {"default-id", "other-id"}
+
+    def test_flush_preserves_case_varied_pinecone_config(self, runner, monkeypatch):
+        built = []
+
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                built.append((backend, config))
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                yield {"id": "production-id", "metadata": {}, "vector": [1.0]}
+
+            def delete_vectors(self, vector_ids, namespace=None):
+                return True
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_PineconeFlushStore),
+        )
+        monkeypatch.setattr(
+            cli_module.Config,
+            "to_dict",
+            lambda self: {
+                "vector_store": {
+                    "backend": "Pinecone",
+                    "api_key": "secret",
+                    "index_name": "vectors",
+                }
+            },
+        )
+
+        result = runner.invoke(
+            cli_module.main,
+            ["store", "flush", "--namespace", "production", "--confirm"],
+        )
+
+        _ok(result)
+        assert built == [
+            (
+                "Pinecone",
+                {"api_key": "secret", "index_name": "vectors"},
+            )
+        ]
+
+    def test_flush_batches_pinecone_deletes(self, runner, monkeypatch):
+        delete_calls = []
+        vector_ids = [f"vector-{index}" for index in range(1001)]
+
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                pass
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                for vector_id in vector_ids:
+                    yield {"id": vector_id, "metadata": {}, "vector": [1.0]}
+
+            def delete_vectors(self, ids, namespace=None):
+                delete_calls.append((ids, namespace))
+                return True
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_PineconeFlushStore),
+        )
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--vector-store",
+                "pinecone",
+                "store",
+                "flush",
+                "--namespace",
+                "production",
+                "--confirm",
+            ],
+        )
+
+        _ok(result)
+        assert [len(ids) for ids, namespace in delete_calls] == [1000, 1]
+        assert all(namespace == "production" for ids, namespace in delete_calls)
+
+    def test_flush_retries_pinecone_verification(self, runner, monkeypatch):
+        scans = iter(
+            [
+                [{"id": "production-id", "metadata": {}, "vector": [1.0]}],
+                [{"id": "production-id", "metadata": {}, "vector": [1.0]}],
+                [],
+            ]
+        )
+        sleeps = []
+
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                pass
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                yield from next(scans)
+
+            def delete_vectors(self, ids, namespace=None):
+                return True
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_PineconeFlushStore),
+        )
+        monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--vector-store",
+                "pinecone",
+                "store",
+                "flush",
+                "--namespace",
+                "production",
+                "--confirm",
+            ],
+        )
+
+        _ok(result)
+        assert "1 vectors removed" in result.output
+        assert sleeps == [cli_module._PINECONE_VERIFY_SLEEP_SECONDS]
+
+    def test_flush_reports_unconfirmed_pinecone_deletes(
+        self, runner, monkeypatch
+    ):
+        sleeps = []
+
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                pass
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                yield {"id": "production-id", "metadata": {}, "vector": [1.0]}
+
+            def delete_vectors(self, ids, namespace=None):
+                return True
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_PineconeFlushStore),
+        )
+        monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+
+        result = runner.invoke(
+            cli_module.main,
+            [
+                "--vector-store",
+                "pinecone",
+                "store",
+                "flush",
+                "--namespace",
+                "production",
+                "--confirm",
+            ],
+        )
+
+        _ok(result)
+        assert "0 vectors removed" in result.output
+        assert "1 vectors unconfirmed" in result.output
+        assert sleeps == [
+            cli_module._PINECONE_VERIFY_SLEEP_SECONDS,
+            cli_module._PINECONE_VERIFY_SLEEP_SECONDS,
+        ]
+
+    def test_flush_pinecone_defaults_to_native_default_namespace(
+        self, runner, monkeypatch
+    ):
+        class _PineconeFlushStore:
+            def __init__(self, backend, config=None):
+                self.items = {"default-id": ""}
+                self.iter_calls = []
+
+            def iter_vectors(self, batch_size=500, namespace=None):
+                self.iter_calls.append(namespace)
+                for vector_id, item_namespace in self.items.items():
+                    if item_namespace == namespace:
+                        yield {"id": vector_id, "metadata": {}, "vector": [1.0]}
+
+            def delete_vectors(self, vector_ids, namespace=None):
+                for vector_id in vector_ids:
+                    del self.items[vector_id]
+                return True
+
+        stores = []
+
+        def _store_factory(*args, **kwargs):
+            store = _PineconeFlushStore(*args, **kwargs)
+            stores.append(store)
+            return store
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_store_factory),
+        )
+        result = runner.invoke(
+            cli_module.main,
+            ["--vector-store", "pinecone", "store", "flush", "--confirm"],
+        )
+        _ok(result)
+        assert "1 vectors removed" in result.output
+        assert stores[0].iter_calls == ["", ""]
+
+    def test_flush_uses_the_configured_vector_backend(
+        self, runner, monkeypatch, tmp_path
+    ):
+        # vector_store.backend is what every other vector command builds; the
+        # flush must not silently fall back to an empty faiss store instead.
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("vector_store:\n  backend: pgvector\n  table: vecs\n")
+        built: list = []
+        _wire_inmemory_vector_store(monkeypatch, ["default"], built)
+        result = runner.invoke(
+            cli_module.main, ["--config", str(cfg), "store", "flush", "--confirm"])
+        _ok(result)
+        assert "1 vectors removed" in result.output
+        assert built[0]["backend"] == "pgvector"
+        assert built[0]["config"] == {"table": "vecs"}
+
+    def test_flush_faiss_requires_index_path(self, runner, monkeypatch):
+        # A fresh FAISSStore starts empty, so without an index on disk the
+        # flush would report success while deleting nothing.
+        _wire_inmemory_vector_store(monkeypatch, ["default"])
+        result = runner.invoke(
+            cli_module.main, ["--vector-store", "faiss", "store", "flush", "--confirm"])
+        assert result.exit_code != 0
+        assert "index_path" in _flatten(result.output)
+
+    def test_flush_faiss_loads_the_index_on_disk(self, runner, monkeypatch, tmp_path):
+        # FAISS itself is an optional extra, so stand in for the store and
+        # check the index on disk is loaded before anything is enumerated.
+        events = []
+
+        class _FaissLike:
+            def __init__(self, **kwargs: Any) -> None:
+                self.ids = ["v1"]
+                self._backend_store = types.SimpleNamespace(
+                    load_index=lambda path: events.append(("load", path)))
+
+            def iter_vectors(self, batch_size: int = 500):
+                events.append(("iter",))
+                return iter([{"id": i, "metadata": {}} for i in self.ids])
+
+            def delete_vectors(self, ids: Any) -> bool:
+                self.ids = [i for i in self.ids if i not in ids]
+                return True
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_FaissLike),
+        )
+        cfg = tmp_path / "cfg.yaml"
+        index = tmp_path / "vecs.faiss"
+        cfg.write_text(f"vector_store:\n  backend: faiss\n  index_path: {index}\n")
+        result = runner.invoke(
+            cli_module.main, ["--config", str(cfg), "store", "flush", "--confirm"])
+        _ok(result)
+        assert events[0] == ("load", str(index))
+        assert "1 vectors removed" in result.output
+
+    def test_flush_rejects_the_inmemory_backend(self, runner, monkeypatch):
+        _wire_inmemory_vector_store(monkeypatch, ["default"])
+        result = runner.invoke(
+            cli_module.main, ["--vector-store", "inmemory", "store", "flush", "--confirm"])
+        assert result.exit_code != 0
+        assert "does not persist" in _flatten(result.output)
+
+    def test_flush_fails_loudly_when_backend_cannot_enumerate(
+        self, runner, monkeypatch
+    ):
+        # An unsupported capability is not the same as an empty namespace, so
+        # the command must not report a successful zero-vector flush.
+        class _NoEnumeration:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            def iter_vectors(self, batch_size: int = 500):
+                raise NotImplementedError("no scan_vectors() on this backend")
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.vector_store",
+            _fake_module(VectorStore=_NoEnumeration),
+        )
+        result = runner.invoke(
+            cli_module.main, ["--vector-store", "sqlite", "store", "flush", "--confirm"])
+        assert result.exit_code != 0
+        assert "cannot enumerate" in _flatten(result.output)
 
     def test_stats_requires_backend(self, runner):
         result = runner.invoke(cli_module.main, ["store", "stats"])
         assert result.exit_code != 0
+
+    def test_stats_memory_backend_reads_the_context_graph(
+        self, runner, graph_cfg, tmp_path
+    ):
+        # memory is the default graph backend and the one #1943 reported;
+        # it is served by the persisted ContextGraph, not GraphStore.
+        from semantica.context import ContextGraph
+
+        graph = ContextGraph()
+        graph.add_node("n1", "Entity")
+        graph.add_node("n2", "Entity")
+        graph.save_to_file(tmp_path / "graph.json")
+        result = runner.invoke(
+            cli_module.main,
+            ["--config", graph_cfg, "store", "stats", "--backend", "memory", "--json"])
+        _ok(result)
+        assert _json_output(result)["node_count"] == 2
+
+    def test_stats_dispatches_through_graph_store(self, runner, monkeypatch):
+        # store stats used to call run_analytics(backend=..., config=...),
+        # the graph analytics entry point, whose first parameter is an
+        # algorithm name — a TypeError on every invocation (#1943).
+        calls = {}
+
+        class _FakeGraphStore:
+            def __init__(self, backend: Any = None, **cfg: Any) -> None:
+                calls["backend"] = backend
+                calls["cfg"] = cfg
+
+            def get_stats(self) -> Any:
+                calls["stats"] = True
+                return {"node_count": 3, "edge_count": 2}
+
+        import semantica.graph_store as gs_mod
+        monkeypatch.setattr(gs_mod, "GraphStore", _FakeGraphStore)
+        result = runner.invoke(
+            cli_module.main, ["store", "stats", "--backend", "neo4j", "--json"])
+        _ok(result)
+        assert _json_output(result) == {"node_count": 3, "edge_count": 2}
+        assert calls["backend"] == "neo4j"
+        assert calls.get("stats") is True
 
 
 # ─── backup ───────────────────────────────────────────────────────────────────
@@ -1428,8 +4314,17 @@ class TestBackup:
 
     def test_create_dry_run(self, runner):
         with runner.isolated_filesystem():
-            result = runner.invoke(cli_module.main, ["backup", "create", "backup.tar.gz", "--dry-run"])
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write("graph_db:\n  backend: sqlite\n  path: kg\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "backup.tar.gz", "--dry-run"],
+            )
             _ok(result)
+            assert "Dry run: would backup create" in _flatten(result.output)
 
     def test_create_unencrypted_with_config_requires_confirm(self, runner):
         with runner.isolated_filesystem():
@@ -1453,10 +4348,729 @@ class TestBackup:
             )
         assert "Traceback" not in result.output
 
+    @pytest.mark.parametrize("extra", [["--strip-config"], [], ["--encrypt"]])
+    def test_create_without_stores_fails(self, runner, monkeypatch, tmp_path, extra):
+        # Regression for #1820: no store paths used to write an archive
+        # with "files": [] and exit 0. It must also fail before asking for
+        # a passphrase or confirmation.
+        monkeypatch.setattr(cli_module.Path, "home", staticmethod(lambda: tmp_path))
+        with runner.isolated_filesystem():
+            result = runner.invoke(
+                cli_module.main,
+                ["backup", "create", "out.tar.gz", "--quiet", *extra],
+            )
+            assert result.exit_code != 0
+            assert "No store data to back up" in result.output
+            assert "passphrase" not in result.output
+            assert "Continue without encryption" not in result.output
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_with_local_store_writes_its_files(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write("graph_db:\n  backend: sqlite\n  path: kg\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--quiet"],
+            )
+            _ok(result)
+            with tarfile.open("out.tar.gz") as tar:
+                names = tar.getnames()
+        assert "semantica-backup/graph/graph.db" in names
+
+    def test_create_reports_a_store_whose_path_is_missing(self, runner):
+        # Regression for #2009: a configured store whose path does not exist was
+        # dropped without a word, so the archive was partial and still reported
+        # success. The skip must be named, and recorded in the manifest.
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "missing_graph.json" in flat
+            with tarfile.open("out.tar.gz") as tar:
+                names = tar.getnames()
+                manifest = json.loads(
+                    tar.extractfile("semantica-backup/backup_manifest.json").read()
+                )
+        assert "semantica-backup/vector/index.json" in names
+        assert not any(n.startswith("semantica-backup/graph/") for n in names)
+        assert manifest["skipped"] == [
+            {"store": "graph", "backend": "local", "path": "missing_graph.json"}
+        ]
+
+    def test_create_fail_on_skip_exits_nonzero_without_writing(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_records_no_skipped_entries_when_paths_exist(self, runner):
+        # A store the caller simply has not configured is not a skip, and a
+        # backend with no local path key (cloud) must not be reported either.
+        with runner.isolated_filesystem():
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: kg\n"
+                    "vector_store:\n"
+                    "  backend: pinecone\n"
+                    "  index: demo\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            assert "Skipping" not in _flatten(result.output)
+            with tarfile.open("out.tar.gz") as tar:
+                manifest = json.loads(
+                    tar.extractfile("semantica-backup/backup_manifest.json").read()
+                )
+        assert manifest["skipped"] == []
+
+    def test_collect_backup_sources_separates_missing_paths(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "graph_db": {"backend": "local", "path": "gone.json"},
+                "vector_store": {"backend": "local", "path": "vecs"},
+                "triplet_store": {"backend": "pinecone", "index": "demo"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert skipped == [
+            {"store": "graph", "backend": "local", "path": "gone.json"}
+        ]
+
+    def test_create_reports_a_store_whose_directory_is_empty(self, runner):
+        # Regression for #2014: a configured store whose path exists but holds
+        # no files took the is_dir() branch, contributed nothing, and never
+        # reached `skipped`, so the manifest reported "skipped": [] and the
+        # command exited 0.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            with tarfile.open("out.tar.gz") as tar:
+                manifest = json.loads(
+                    tar.extractfile("semantica-backup/backup_manifest.json").read()
+                )
+        assert manifest["skipped"] == [
+            {"store": "graph", "backend": "local", "path": "empty_graph"}
+        ]
+
+    def test_create_empty_dir_fail_on_skip_exits_nonzero(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_dry_run_fail_on_skip_exits_nonzero(self, runner):
+        # #2109: a dry run has to match the real command.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--dry-run", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert "Configured store path does not exist" in flat
+            assert not os.path.exists("out.tar.gz")
+
+    @pytest.mark.parametrize("extra_args", [[], ["--fail-on-skip"]])
+    def test_create_dry_run_fails_when_no_store_has_data(self, runner, extra_args):
+        # #2122: --dry-run previewed a backup the real command refuses to
+        # write, so it exited 0 on a config where nothing would be archived.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: missing_vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--dry-run", *extra_args],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert "Skipping vector store" in flat
+            assert "missing_vecs" in flat
+            assert "No store data to back up" in flat
+            assert "Dry run: would backup create" not in flat
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_dry_run_without_store_config_fails(self, runner):
+        # Same #2122 case as above with no store configured at all: the real
+        # command refuses it (#1820), so the preview must too.
+        with runner.isolated_filesystem():
+            with open("cfg.yaml", "w") as f:
+                f.write("processing:\n  batch_size: 8\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--dry-run"],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "No store data to back up" in flat
+            assert "Skipping" not in flat
+
+    def test_create_dry_run_json_fails_when_no_store_has_data(self, runner):
+        # --json must not print a payload for a preview that cannot happen.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            with open("cfg.yaml", "w") as f:
+                f.write("graph_db:\n  backend: local\n  path: empty_graph\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "--json", "backup", "create",
+                 "out.tar.gz", "--strip-config", "--dry-run"],
+            )
+            assert result.exit_code != 0
+            assert result.stdout.strip() == ""
+            assert "No store data to back up" in _flatten(result.stderr)
+
+    def test_create_dry_run_reports_a_skipped_store(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--dry-run"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_dry_run_json_stays_parseable_when_a_store_is_skipped(self, runner):
+        # #2110 review: the skip warning used to land on stdout ahead of the
+        # payload, so --json could not be parsed in exactly the case this PR
+        # fixes.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "--json", "backup", "create",
+                 "out.tar.gz", "--strip-config", "--dry-run"],
+            )
+            _ok(result)
+            payload = json.loads(result.stdout)
+            assert payload["skipped"] == [
+                {"store": "graph", "backend": "local", "path": "empty_graph"}
+            ]
+            assert "Skipping graph store" in result.stderr
+            assert not os.path.exists("out.tar.gz")
+
+    def test_sync_dry_run_json_stays_parseable_when_a_store_is_skipped(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "--json", "backup", "sync",
+                 "sync_dest", "--dry-run"],
+            )
+            _ok(result)
+            payload = json.loads(result.stdout)
+            assert payload["skipped"] == [
+                {"store": "graph", "backend": "local", "path": "empty_graph"}
+            ]
+            assert "Skipping graph store" in result.stderr
+            assert not os.path.exists("sync_dest")
+
+    def test_no_color_strips_colour_from_the_json_warning_on_stderr(
+        self, runner, monkeypatch
+    ):
+        # Under --json the warning goes to err_console, not console. Give that
+        # console a forced terminal first, so a rebind that misses it would
+        # leave escape codes in the captured stderr.
+        monkeypatch.setenv("TERM", "xterm-256color")
+        original = cli_module.err_console
+        cli_module.err_console = cli_module.Console(stderr=True, force_terminal=True)
+        try:
+            with runner.isolated_filesystem():
+                os.makedirs("empty_graph")
+                os.makedirs("vecs")
+                with open("vecs/index.json", "w") as f:
+                    f.write("{}")
+                with open("cfg.yaml", "w") as f:
+                    f.write(
+                        "graph_db:\n"
+                        "  backend: local\n"
+                        "  path: empty_graph\n"
+                        "vector_store:\n"
+                        "  backend: local\n"
+                        "  path: vecs\n"
+                    )
+                result = runner.invoke(
+                    cli_module.main,
+                    [
+                        "--config",
+                        "cfg.yaml",
+                        "--json",
+                        "--no-color",
+                        "backup",
+                        "sync",
+                        "sync_dest",
+                        "--dry-run",
+                    ],
+                )
+                _ok(result)
+                assert "Skipping graph store" in result.stderr
+                assert "\x1b[" not in result.stderr
+        finally:
+            cli_module.err_console = original
+
+    def test_dry_run_json_reports_no_skips_when_every_store_is_present(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "--json", "backup", "create",
+                 "out.tar.gz", "--strip-config", "--dry-run"],
+            )
+            _ok(result)
+            assert json.loads(result.stdout)["skipped"] == []
+
+    def test_collect_backup_sources_marks_empty_directories_as_skipped(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "graph_db": {"backend": "local", "path": "empty_graph"},
+                "vector_store": {"backend": "local", "path": "vecs"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert skipped == [
+            {"store": "graph", "backend": "local", "path": "empty_graph"}
+        ]
+
+    def test_collect_backup_sources_reports_empty_ontology_directory(self, runner):
+        # #2014 also flagged the ontology branch: an existing-but-empty (or
+        # absent) ontology path produced no sources and no skip entry.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_onto")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "ontology_path": "empty_onto",
+                "vector_store": {"backend": "local", "path": "vecs"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert skipped == [
+            {"store": "ontology", "backend": "file", "path": "empty_onto"}
+        ]
+
+    def test_sync_names_a_skipped_store(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "sync", "sync_dest"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert os.path.isfile(os.path.join("sync_dest", "vector", "index.json"))
+
+    def test_sync_fail_on_skip_exits_nonzero(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "sync", "sync_dest",
+                 "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert not os.path.exists("sync_dest")
+
+    def test_sync_dry_run_fail_on_skip_exits_nonzero(self, runner):
+        # #2109: the dry-run branch used to return before the skip handling.
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "sync", "sync_dest",
+                 "--dry-run", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert "Configured store path does not exist" in flat
+            assert not os.path.exists("sync_dest")
+
+    def test_sync_dry_run_reports_a_skipped_store(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("empty_graph")
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: empty_graph\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "sync", "sync_dest",
+                 "--dry-run"],
+            )
+            _ok(result)
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "empty_graph" in flat
+            assert not os.path.exists("sync_dest")
+
+    def test_sync_without_skips_does_not_warn(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write("graph_db:\n  backend: sqlite\n  path: kg\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "sync", "sync_dest"],
+            )
+            _ok(result)
+            assert "Skipping" not in _flatten(result.output)
+
+    @pytest.mark.parametrize("extra_args", [[], ["--fail-on-skip"]])
+    def test_create_names_every_missing_store_when_none_exist(self, runner, extra_args):
+        # When every configured store path is missing, the empty-archive error
+        # (#1820) still fires, but each missing path must be named first.
+        with runner.isolated_filesystem():
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: local\n"
+                    "  path: missing_graph.json\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: missing_vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", *extra_args],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "Skipping graph store" in flat
+            assert "missing_graph.json" in flat
+            assert "Skipping vector store" in flat
+            assert "missing_vecs" in flat
+            assert "No store data to back up" in flat
+            assert not os.path.exists("out.tar.gz")
+
+    def test_create_without_store_config_reports_no_skip(self, runner):
+        # No store configured at all is the #1820 case, not a skip.
+        with runner.isolated_filesystem():
+            with open("cfg.yaml", "w") as f:
+                f.write("processing:\n  batch_size: 8\n")
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            assert result.exit_code != 0
+            flat = _flatten(result.output)
+            assert "No store data to back up" in flat
+            assert "Skipping" not in flat
+
+    def test_create_redacts_credentials_in_skipped_path(self, runner):
+        # A credential-bearing path must not reach the warning or the
+        # manifest, even with --strip-config.
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: 'postgresql://user:s3cretpw@db.example/kg'\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config"],
+            )
+            _ok(result)
+            assert "s3cretpw" not in result.output
+            assert "Skipping graph store" in _flatten(result.output)
+            with tarfile.open("out.tar.gz") as tar:
+                raw = tar.extractfile(
+                    "semantica-backup/backup_manifest.json"
+                ).read().decode("utf-8")
+        assert "s3cretpw" not in raw
+        manifest = json.loads(raw)
+        assert len(manifest["skipped"]) == 1
+        assert manifest["skipped"][0]["path"].startswith("postgresql://user:")
+        assert manifest["skipped"][0]["path"].endswith("@db.example/kg")
+
+    def test_create_fail_on_skip_redacts_credentials(self, runner):
+        with runner.isolated_filesystem():
+            os.makedirs("vecs")
+            with open("vecs/index.json", "w") as f:
+                f.write("{}")
+            with open("cfg.yaml", "w") as f:
+                f.write(
+                    "graph_db:\n"
+                    "  backend: sqlite\n"
+                    "  path: 'postgresql://user:s3cretpw@db.example/kg'\n"
+                    "vector_store:\n"
+                    "  backend: local\n"
+                    "  path: vecs\n"
+                )
+            result = runner.invoke(
+                cli_module.main,
+                ["--config", "cfg.yaml", "backup", "create", "out.tar.gz",
+                 "--strip-config", "--fail-on-skip"],
+            )
+            assert result.exit_code != 0
+            assert "Configured store path does not exist" in _flatten(result.output)
+            assert "s3cretpw" not in result.output
+            assert not os.path.exists("out.tar.gz")
+
+    def test_collect_backup_sources_redacts_but_checks_the_real_path(self, runner):
+        # The redacted form is only for reporting; an existing path containing
+        # ":...@" must still be found and archived under its real name.
+        with runner.isolated_filesystem():
+            os.makedirs("a:b@c")
+            with open("a:b@c/index.json", "w") as f:
+                f.write("{}")
+            cfg = {
+                "graph_db": {"backend": "sqlite",
+                             "path": "postgresql://user:s3cretpw@db.example/kg"},
+                "vector_store": {"backend": "local", "path": "a:b@c"},
+            }
+            sources, skipped = cli_module._collect_backup_sources(
+                cfg, None, "all", strip_config=True,
+            )
+        assert [arcname for arcname, _ in sources] == ["vector/index.json"]
+        assert [str(p) for _, p in sources] == [os.path.join("a:b@c", "index.json")]
+        assert len(skipped) == 1
+        assert "s3cretpw" not in skipped[0]["path"]
+
     def test_create_dry_run_json(self, runner):
         # backup create has no per-command --json; use global --json
-        result = runner.invoke(cli_module.main, ["--json", "backup", "create", "backup.tar.gz",
-                                      "--dry-run"])
+        with runner.isolated_filesystem():
+            os.makedirs("kg")
+            with open("kg/graph.db", "w") as f:
+                f.write("data")
+            with open("cfg.yaml", "w") as f:
+                f.write("graph_db:\n  backend: sqlite\n  path: kg\n")
+            result = runner.invoke(cli_module.main, ["--config", "cfg.yaml", "--json",
+                                      "backup", "create", "backup.tar.gz", "--dry-run"])
         _ok(result)
         data = _json_output(result)
         assert data["dry_run"] is True
@@ -1672,15 +5286,14 @@ class TestMCP:
             result = runner.invoke(cli_module.main, ["mcp", "start"])
         _ok(result)
 
-    def test_start_http_includes_port(self, runner):
+    def test_start_http_is_rejected(self, runner):
         mock_proc = MagicMock()
         mock_proc.pid = 33334
         with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
             result = runner.invoke(cli_module.main, ["mcp", "start", "--transport", "http",
                                           "--port", "4000"])
-        _ok(result)
-        call_args = mock_popen.call_args[0][0]
-        assert "4000" in call_args
+        assert result.exit_code != 0
+        assert not mock_popen.called
 
     def test_stop_when_not_running(self, runner, monkeypatch):
         monkeypatch.setattr(cli_module, "_read_pid", lambda n: None)
@@ -1700,12 +5313,16 @@ class TestMCP:
         # Table renders correctly — at minimum the column header is present
         assert "Tool" in result.output or "tool" in result.output.lower()
 
-    def test_list_tools_with_mock_shows_known_tools(self, runner, monkeypatch):
-        fake_tools = _fake_module(__all__=["extract_entities", "query_graph"])
-        monkeypatch.setitem(__import__("sys").modules, "mcp.tools", fake_tools)
+    def test_list_tools_reads_server_catalog(self, runner, monkeypatch):
+        """list-tools must read TOOL_DEFINITIONS (what the server serves via
+        tools/list), not the module's ``__all__`` (issue #1355)."""
+        import semantica_mcp.mcp.tools as tools_mod
+        fake = [{"name": "fake_tool_from_catalog", "description": "", "inputSchema": {},
+                 "_handler": lambda a: {}}]
+        monkeypatch.setattr(tools_mod, "TOOL_DEFINITIONS", fake)
         result = runner.invoke(cli_module.main, ["mcp", "list-tools"])
         _ok(result)
-        assert "extract_entities" in result.output
+        assert "fake_tool_from_catalog" in result.output
 
     def test_list_tools_json(self, runner):
         result = runner.invoke(cli_module.main, ["mcp", "list-tools", "--json"])
@@ -1724,14 +5341,63 @@ class TestMCP:
         assert "Traceback" not in result.output
         assert "Invalid JSON" in result.output
 
-    def test_call_import_error_is_clean(self, runner):
-        with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
-            (_ for _ in ()).throw(ImportError(n))
-            if n.startswith("mcp") else __import__(n, *a, **k)
-        )):
-            result = runner.invoke(cli_module.main, ["mcp", "call", "extract_entities"])
+    def test_call_failure_global_json_mode_keeps_stdout_clean(self, runner):
+        """Under global --json, stdout must stay machine-readable: failures are
+        emitted as structured JSON on stderr, never as a Rich panel on stdout."""
+        result = runner.invoke(
+            cli_module.main,
+            ["--json", "mcp", "call", "some_tool", "--args", "{bad json}"],
+        )
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        err = json.loads(result.stderr)
+        assert err["error"].startswith("Invalid JSON in --args")
+        assert err["type"] == "ClickException"
+
+    def test_call_failure_local_json_mode_keeps_stdout_clean(self, runner):
+        """The subcommand's own --json flag promises the same stream contract."""
+        result = runner.invoke(
+            cli_module.main,
+            ["mcp", "call", "some_tool", "--args", "{bad json}", "--json"],
+        )
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        err = json.loads(result.stderr)
+        assert err["error"].startswith("Invalid JSON in --args")
+
+    def test_call_dispatches_through_packaged_server(self, runner):
+        """Regression for issue #1355: ``mcp call`` dispatches in-process through
+        ``semantica_mcp.mcp.server`` (the server ``mcp start`` spawns) instead
+        of importing the nonexistent ``MCPSession``."""
+        result = runner.invoke(
+            cli_module.main, ["--json", "mcp", "call", "extract_entities"]
+        )
+        _ok(result)
+        # Empty args short-circuit before heavy imports; reaching the
+        # handler's own validation proves the dispatch path works.
+        assert "text is required" in result.output
+
+    def test_call_unknown_tool_fails_cleanly(self, runner):
+        result = runner.invoke(cli_module.main, ["mcp", "call", "no_such_tool"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+        assert "Unknown tool" in result.output
+
+    def test_call_non_object_args_rejected(self, runner):
+        result = runner.invoke(
+            cli_module.main, ["mcp", "call", "extract_entities", "--args", "[1, 2]"]
+        )
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "--args must be a JSON object" in result.output
+
+    def test_list_tools_json_matches_server_catalog(self, runner):
+        """The CLI catalog and the MCP server catalog must be the same list."""
+        from semantica_mcp.mcp.tools import TOOL_DEFINITIONS
+        result = runner.invoke(cli_module.main, ["mcp", "list-tools", "--json"])
+        _ok(result)
+        data = _json_output(result)
+        assert data["tools"] == [t["name"] for t in TOOL_DEFINITIONS]
 
 
 # ─── services group (backward-compat wrapper) ─────────────────────────────────
@@ -1835,7 +5501,7 @@ class TestExitCodes:
     def test_import_error_is_nonzero(self, runner):
         with patch("builtins.__import__", side_effect=lambda n, *a, **k: (
             (_ for _ in ()).throw(ImportError(n))
-            if "deduplication" in n else __import__(n, *a, **k)
+            if "deduplication" in n else _real_import(n, *a, **k)
         )):
             result = runner.invoke(cli_module.main, ["deduplicate"])
         assert result.exit_code != 0
@@ -1851,3 +5517,1164 @@ class TestExitCodes:
             assert "Traceback" not in result.output, (
                 f"Traceback found for {argv}: {result.output}"
             )
+
+
+class TestDoctorEmbeddings:
+    """#994: doctor must surface non-functional embedding backends instead of
+    reporting all green. Default = import-level check; --deep-embeddings (or
+    SEMANTICA_DOCTOR_DEEP_EMBEDDINGS=1) instantiates via TextEmbedder."""
+
+    def _doctor_checks(self, runner, *extra):
+        result = runner.invoke(cli_module.main, ["doctor", "--json", *extra])
+        _ok(result)
+        import json as _json
+        return {c["check"]: c for c in _json.loads(result.output)}
+
+    def _with_fake_st(self, monkeypatch, **embedder_attrs):
+        fake_st = _fake_module(
+            __version__="9.9.9",
+            SentenceTransformer=object,
+        )
+        monkeypatch.setitem(__import__("sys").modules, "sentence_transformers", fake_st)
+
+    def test_doctor_reports_embedding_checks(self, runner):
+        checks = self._doctor_checks(runner)
+        assert "Embeddings (sentence-transformers)" in checks
+        assert "Embeddings (fastembed)" in checks
+
+    def test_import_failure_is_fail_status_with_hint(self, runner, monkeypatch):
+        # Force the 'import sentence_transformers' inside _embedding_backend to
+        # raise ImportError regardless of whether the package is installed on
+        # this machine.  Setting a module entry to None is the standard Python
+        # mechanism: any subsequent 'import <name>' raises
+        # "import of <name> halted; None in sys.modules".
+        monkeypatch.setitem(
+            __import__("sys").modules, "sentence_transformers", None
+        )
+        checks = self._doctor_checks(runner)
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "fail"
+        assert st["hint"] == "pip install 'semantica[embeddings-local]'"
+
+    def test_deep_probe_detects_fallback_active(self, runner, monkeypatch):
+        self._with_fake_st(monkeypatch)
+        fake_embedder = types.SimpleNamespace(model=None, fastembed_model=None)
+
+        fake_emb_mod = _fake_module(TextEmbedder=lambda **k: fake_embedder)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb_mod)
+
+        checks = self._doctor_checks(runner, "--deep-embeddings")
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "fail"
+        assert "hash fallback" in st["note"]
+
+    def test_deep_probe_ok_when_model_loads(self, runner, monkeypatch):
+        self._with_fake_st(monkeypatch)
+        import numpy as np
+        fake_embedder = types.SimpleNamespace(
+            model=object(),
+            fastembed_model=None,
+            embed_text=lambda text: np.zeros(384, dtype=np.float32),
+        )
+        fake_emb_mod = _fake_module(TextEmbedder=lambda **k: fake_embedder)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb_mod)
+
+        checks = self._doctor_checks(runner, "--deep-embeddings")
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "ok"
+        assert "384-dim" in st["note"]
+
+    def test_env_var_enables_deep_mode(self, runner, monkeypatch):
+        monkeypatch.setenv("SEMANTICA_DOCTOR_DEEP_EMBEDDINGS", "1")
+        self._with_fake_st(monkeypatch)
+        fake_embedder = types.SimpleNamespace(model=None, fastembed_model=None)
+        fake_emb_mod = _fake_module(TextEmbedder=lambda **k: fake_embedder)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb_mod)
+
+        checks = self._doctor_checks(runner)
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "fail"
+        assert "hash fallback" in st["note"]
+
+
+class TestDoctorEmbeddingHintsAndEnv:
+    """Review follow-ups: deep failures must not carry the pip-install hint,
+    and the env toggle tolerates case/whitespace variants."""
+
+    def _doctor_checks(self, runner, *extra):
+        result = runner.invoke(cli_module.main, ["doctor", "--json", *extra])
+        _ok(result)
+        import json as _json
+        return {c["check"]: c for c in _json.loads(result.output)}
+
+    def _with_fake_st(self, monkeypatch):
+        fake_st = _fake_module(
+            __version__="9.9.9",
+            SentenceTransformer=object,
+        )
+        monkeypatch.setitem(__import__("sys").modules, "sentence_transformers", fake_st)
+
+    def test_deep_failure_hint_is_not_pip_install(self, runner, monkeypatch):
+        self._with_fake_st(monkeypatch)
+        fake_embedder = types.SimpleNamespace(model=None, fastembed_model=None)
+        fake_emb_mod = _fake_module(TextEmbedder=lambda **k: fake_embedder)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb_mod)
+
+        checks = self._doctor_checks(runner, "--deep-embeddings")
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "fail"
+        assert "pip install" not in (st["hint"] or ""), (
+            "a deep probe failure means the package imported fine — pointing "
+            "users at pip sends them to reinstall for a runtime/model problem"
+        )
+        assert "runtime/model-load" in st["hint"]
+
+    def test_env_var_tolerates_case_and_whitespace(self, runner, monkeypatch):
+        monkeypatch.setenv("SEMANTICA_DOCTOR_DEEP_EMBEDDINGS", "  TRUE ")
+        self._with_fake_st(monkeypatch)
+        fake_embedder = types.SimpleNamespace(model=None, fastembed_model=None)
+        fake_emb_mod = _fake_module(TextEmbedder=lambda **k: fake_embedder)
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb_mod)
+
+        checks = self._doctor_checks(runner)
+        st = checks["Embeddings (sentence-transformers)"]
+        assert st["status"] == "fail"
+        assert "hash fallback" in st["note"], "padded/caps env value must enable deep mode"
+
+
+class TestDoctorBackendEnvResolution:
+    """#1818: doctor must report the MCP server's stores, which are configured
+    only through ``SEMANTICA_VECTOR_*`` / ``SEMANTICA_KG_PATH``.
+
+    Those variables never change what CLI commands build, so they get their own
+    rows resolved by the server's session helpers instead of being folded into
+    the CLI's vector and graph checks.
+    """
+
+    _MCP_ENV = (
+        "SEMANTICA_VECTOR_BACKEND",
+        "SEMANTICA_VECTOR_DB_PATH",
+        "SEMANTICA_VECTOR_PATH",
+        "SEMANTICA_KG_PATH",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in self._MCP_ENV:
+            monkeypatch.delenv(var, raising=False)
+
+    @pytest.fixture
+    def cfg(self, tmp_path):
+        # graph_db.path keeps the CLI graph row off the real ~/.semantica.
+        def _write(extra=""):
+            path = tmp_path / "cfg.yaml"
+            path.write_text(
+                "graph_db:\n  backend: memory\n"
+                f"  path: {tmp_path / 'cli_graph.json'}\n" + extra
+            )
+            return str(path)
+
+        return _write
+
+    def _checks(self, runner, config):
+        args = ["--config", config, "doctor", "--json"]
+        result = runner.invoke(cli_module.main, args)
+        _ok(result)
+        return {c["check"]: c for c in json.loads(result.output)}
+
+    @staticmethod
+    def _without_faiss(monkeypatch):
+        monkeypatch.setitem(sys.modules, "faiss", None)
+
+    @staticmethod
+    def _with_faiss(monkeypatch):
+        monkeypatch.setitem(sys.modules, "faiss", types.ModuleType("faiss"))
+
+    @staticmethod
+    def _sqlite_vec_loads(monkeypatch):
+        monkeypatch.setattr(cli_module, "_probe_sqlite_vec", lambda: None)
+
+    @staticmethod
+    def _save_graph_with_one_decision(path):
+        from semantica.context import ContextGraph
+
+        graph = ContextGraph()
+        graph.record_decision(
+            category="vendor_selection",
+            scenario="Pick a vector backend",
+            reasoning="sqlite-vec needs no server",
+            outcome="selected_sqlite",
+            confidence=0.9,
+        )
+        graph.save_to_file(path)
+
+    def test_no_mcp_rows_without_mcp_env(self, runner, cfg):
+        checks = self._checks(runner, cfg())
+        assert "MCP vector store" not in checks
+        assert "MCP graph" not in checks
+
+    def test_reports_the_mcp_sqlite_store(self, runner, cfg, tmp_path, monkeypatch):
+        self._sqlite_vec_loads(monkeypatch)
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", " SQLite ")
+        monkeypatch.setenv("SEMANTICA_VECTOR_DB_PATH", str(tmp_path / "v.db"))
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "ok"
+        assert row["note"] == "sqlite-vec loaded"
+
+    def test_mcp_env_is_read_even_when_init_wrote_a_cli_backend(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        # `semantica init` writes vector_store.backend: faiss by default; that
+        # must neither hide the MCP store nor be replaced by it.
+        self._with_faiss(monkeypatch)
+        self._sqlite_vec_loads(monkeypatch)
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "sqlite")
+        monkeypatch.setenv("SEMANTICA_VECTOR_DB_PATH", str(tmp_path / "v.db"))
+        checks = self._checks(runner, cfg("vector_store:\n  backend: faiss\n"))
+        assert checks["MCP vector store"]["note"] == "sqlite-vec loaded"
+        assert checks["Vector store"]["note"] == "faiss importable"
+
+    def test_mcp_vector_defaults_to_inmemory(self, runner, cfg, tmp_path, monkeypatch):
+        monkeypatch.setenv("SEMANTICA_KG_PATH", str(tmp_path / "kg.json"))
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "ok"
+        assert row["note"] == "inmemory"
+
+    def test_flags_sqlite_without_a_db_path(self, runner, cfg, monkeypatch):
+        # The server refuses to start this way, so doctor must not pass it.
+        self._sqlite_vec_loads(monkeypatch)
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "sqlite")
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "fail"
+        assert "SEMANTICA_VECTOR_DB_PATH" in row["note"]
+
+    def test_flags_an_unsupported_mcp_backend(self, runner, cfg, monkeypatch):
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "faiss")
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "fail"
+        assert "supported backends: inmemory, sqlite" in row["note"]
+
+    def test_flags_a_missing_sqlite_vec(self, runner, cfg, tmp_path, monkeypatch):
+        import semantica.vector_store.sqlite_vec_store as sqlite_store
+
+        monkeypatch.setattr(sqlite_store, "SQLITE_VEC_AVAILABLE", False)
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "sqlite")
+        monkeypatch.setenv("SEMANTICA_VECTOR_DB_PATH", str(tmp_path / "v.db"))
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "fail"
+        assert "not installed" in row["note"]
+        assert "vectorstore-sqlite" in row["hint"]
+
+    def test_flags_a_sqlite_vec_that_fails_to_load(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        # Discoverable but unloadable must fail: the probe runs the store's
+        # real load path rather than trusting find_spec.
+        import semantica.vector_store.sqlite_vec_store as sqlite_store
+        from semantica.utils.exceptions import ProcessingError
+
+        def _boom(**_):
+            raise ProcessingError("Failed to load sqlite-vec extension: boom")
+
+        monkeypatch.setattr(sqlite_store, "SQLITE_VEC_AVAILABLE", True)
+        monkeypatch.setattr(sqlite_store, "SQLiteVecStore", _boom)
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "sqlite")
+        monkeypatch.setenv("SEMANTICA_VECTOR_DB_PATH", str(tmp_path / "v.db"))
+        row = self._checks(runner, cfg())["MCP vector store"]
+        assert row["status"] == "fail"
+        assert "Failed to load sqlite-vec extension" in row["note"]
+
+    def test_unconfigured_faiss_is_a_warning_for_an_mcp_deployment(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        self._without_faiss(monkeypatch)
+        monkeypatch.setenv("SEMANTICA_KG_PATH", str(tmp_path / "kg.json"))
+        row = self._checks(runner, cfg())["Vector store"]
+        assert row["status"] == "warn"
+        assert "CLI default" in row["note"]
+
+    def test_unconfigured_faiss_still_fails_without_mcp_env(
+        self, runner, cfg, monkeypatch
+    ):
+        self._without_faiss(monkeypatch)
+        assert self._checks(runner, cfg())["Vector store"]["status"] == "fail"
+
+    def test_configured_faiss_still_fails_for_an_mcp_deployment(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        self._without_faiss(monkeypatch)
+        monkeypatch.setenv("SEMANTICA_KG_PATH", str(tmp_path / "kg.json"))
+        config = cfg("vector_store:\n  backend: faiss\n")
+        assert self._checks(runner, config)["Vector store"]["status"] == "fail"
+
+    def test_mcp_graph_counts_decisions_from_kg_path(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        kg = tmp_path / "mcp_graph.json"
+        self._save_graph_with_one_decision(kg)
+        monkeypatch.setenv("SEMANTICA_KG_PATH", str(kg))
+        checks = self._checks(runner, cfg())
+        assert checks["MCP graph"]["status"] == "ok"
+        assert checks["MCP graph"]["note"] == "1 decision(s)"
+        # The CLI graph is a different file; it must not report the MCP one.
+        assert checks["Graph store"]["note"] == "memory, 0 decision(s)"
+
+    def test_mcp_graph_accepts_an_empty_or_missing_file(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        # The server starts empty from both, so neither is a failure.
+        empty = tmp_path / "empty.json"
+        empty.write_text("")
+        for path in (empty, tmp_path / "missing.json"):
+            monkeypatch.setenv("SEMANTICA_KG_PATH", str(path))
+            row = self._checks(runner, cfg())["MCP graph"]
+            assert row["status"] == "ok"
+            assert row["note"] == "new graph, created on first save"
+
+    def test_mcp_graph_flags_an_unreadable_file(
+        self, runner, cfg, tmp_path, monkeypatch
+    ):
+        kg = tmp_path / "corrupt.json"
+        kg.write_text("{not json")
+        monkeypatch.setenv("SEMANTICA_KG_PATH", str(kg))
+        row = self._checks(runner, cfg())["MCP graph"]
+        assert row["status"] == "fail"
+        assert "persistence would be disabled" in row["note"]
+
+    def test_mcp_graph_without_kg_path_is_in_memory(self, runner, cfg, monkeypatch):
+        monkeypatch.setenv("SEMANTICA_VECTOR_BACKEND", "inmemory")
+        row = self._checks(runner, cfg())["MCP graph"]
+        assert row["status"] == "ok"
+        assert "not persisted" in row["note"]
+
+
+class TestDoctorTableLayout:
+    """#1428 + Qodo review: doctor table must keep Check labels and Hint text
+    readable at a normal 80-column terminal.
+
+    These tests render the *human-readable* (non-JSON) doctor table into a
+    captured 80-column Rich console so they cover the actual column-width
+    arithmetic, not just the JSON data.
+
+    Two regressions are protected:
+
+    A. #1428 — Hint (and Note) columns must not collapse into unreadable
+       single-character fragments or be silently truncated with a layout '…'.
+       overflow="fold" on both columns ensures content wraps across lines while
+       remaining fully present.
+
+    B. Qodo — Long Check labels such as "Embeddings (sentence-transformers)"
+       must not be truncated/ellipsized.  Assigning ratio=1 to the Check column
+       (as the original PR did) caused Rich to squeeze it below its min_width
+       at narrow terminals, so the fix removes ratio from the fixed-size columns.
+    """
+
+    def _render_doctor_at_80(self, runner, monkeypatch):
+        """Return the plain-text (ANSI-stripped) doctor table rendered at 80 cols."""
+        import io
+        import re
+        from rich.console import Console
+
+        # Unset LLM-provider env vars so the warn rows (with hints) are always present.
+        for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+        buf = io.StringIO()
+        narrow_console = Console(
+            file=buf, width=80, highlight=False, force_terminal=True, no_color=True
+        )
+        monkeypatch.setattr(cli_module, "console", narrow_console)
+
+        result = runner.invoke(cli_module.main, ["doctor"])
+        assert result.exit_code == 0, f"doctor exited non-zero: {result.output!r}"
+
+        return re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
+
+    def _hint_column_parts(self, output: str) -> "list[str]":
+        """Extract non-blank Hint-column segments from each rendered line.
+
+        Locates the Hint column start from the header row and slices that
+        suffix from every subsequent line, so the test is insensitive to the
+        exact widths of the other columns.
+        """
+        lines = output.splitlines()
+        # Line 0 is blank (console.print() blank line before table).
+        hdr = next((l for l in lines if "Hint" in l and "Check" in l), None)
+        assert hdr is not None, "Could not find table header in doctor output"
+        hint_start = hdr.index("Hint")
+
+        parts = []
+        for line in lines:
+            if len(line) > hint_start:
+                seg = line[hint_start:].rstrip()
+                if seg and seg != "Hint" and not set(seg).issubset({"─", " "}):
+                    parts.append(seg)
+        return parts
+
+    # ── B: Qodo regression ────────────────────────────────────────────────────
+
+    def test_long_check_label_not_truncated_at_80_cols(self, runner, monkeypatch):
+        """'Embeddings (sentence-transformers)' must appear verbatim at 80 cols.
+
+        Before the fix, ratio=1 on the Check column let Rich squeeze it below
+        its min_width, turning the label into 'Embedd…' or similar.
+        """
+        output = self._render_doctor_at_80(runner, monkeypatch)
+        assert "Embeddings (sentence-transformers)" in output, (
+            "Check label 'Embeddings (sentence-transformers)' was truncated in "
+            "the 80-column doctor table — the ratio= constraint on the Check "
+            "column must be removed so min_width=34 is always honoured."
+        )
+
+    def test_all_check_labels_not_truncated_at_80_cols(self, runner, monkeypatch):
+        """Every standard Check label must appear verbatim at 80 cols."""
+        output = self._render_doctor_at_80(runner, monkeypatch)
+        for label in (
+            "Python",
+            "semantica",
+            "rich",
+            "Graph store",
+            "Vector store",
+            "Embeddings (sentence-transformers)",
+            "Embeddings (fastembed)",
+            "OpenAI",
+            "Anthropic",
+            "Groq",
+            "Config file",
+            "Log directory",
+        ):
+            assert label in output, (
+                f"Check label {label!r} was truncated or missing in the "
+                "80-column doctor table."
+            )
+
+    # ── A: #1428 regression ───────────────────────────────────────────────────
+
+    def test_hint_content_fully_present_at_80_cols(self, runner, monkeypatch):
+        """The LLM-provider hints must be fully present (folded, not ellipsized).
+
+        With overflow='fold' the full hint text wraps across lines; no
+        characters are discarded.  Joining the Hint-column segments (stripping
+        whitespace) must reconstruct each complete hint string.
+        """
+        import re
+
+        output = self._render_doctor_at_80(runner, monkeypatch)
+        parts = self._hint_column_parts(output)
+        hint_joined = re.sub(r"\s+", "", "".join(parts))
+
+        # Each LLM-provider hint must be fully recoverable from the folded lines.
+        for expected in (
+            "exportOPENAI_API_KEY=\u2026",       # export OPENAI_API_KEY=…
+            "exportANTHROPIC_API_KEY=\u2026",    # export ANTHROPIC_API_KEY=…
+            "exportGROQ_API_KEY=\u2026",         # export GROQ_API_KEY=…
+        ):
+            assert expected in hint_joined, (
+                f"Hint content {expected!r} is missing from the 80-column "
+                "doctor table — overflow='fold' must be set on the Hint column "
+                "so no content is silently discarded."
+            )
+
+    def test_hint_column_has_no_single_char_fragments_at_80_cols(
+        self, runner, monkeypatch
+    ):
+        """No Hint-column line must be a single alphabetic character.
+
+        The original #1428 bug produced outputs like:
+            export
+            O
+            P
+            E
+            N
+            A
+            I
+            ...
+        because Rich allocated the Hint column only 1–2 characters of content
+        width.  overflow='fold' on a properly-wide column eliminates this.
+        """
+        output = self._render_doctor_at_80(runner, monkeypatch)
+        parts = self._hint_column_parts(output)
+        single_char_alpha = [p for p in parts if len(p.strip()) == 1 and p.strip().isalpha()]
+        assert not single_char_alpha, (
+            f"Hint column contains single-character lines {single_char_alpha!r} "
+            "at 80 columns — the Hint column is too narrow; check min_width and "
+            "ratio settings."
+        )
+
+
+class TestEmbedGenerateOutput:
+    """#994: `embed generate --output` must write files `embed index` can read."""
+
+    def _patch_generate(self, monkeypatch, retval):
+        import numpy as np
+        fake_emb = _fake_module(generate_embeddings=lambda *a, **k: np.asarray(retval))
+        monkeypatch.setitem(__import__("sys").modules, "semantica.embeddings", fake_emb)
+
+    def test_writes_valid_parquet(self, runner, monkeypatch, tmp_path):
+        pytest.importorskip("pyarrow", reason="parquet writer regression needs pyarrow")
+        import numpy as np
+        import pandas as pd
+        self._patch_generate(monkeypatch, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+        out = tmp_path / "embeddings.parquet"
+        result = runner.invoke(cli_module.main, ["embed", "generate", "in.json", "--output", str(out)])
+        _ok(result)
+        df = pd.read_parquet(out)
+        assert "embedding" in df.columns
+        assert len(df) == 2
+        # Use allclose: the writer may store float32 or float64 depending on
+        # the model backend; exact == fails for float32-precision values.
+        assert np.allclose(df["embedding"].iloc[0], [0.1, 0.2, 0.3], atol=1e-6)
+
+    def test_writes_1d_result_as_single_row_parquet(self, runner, monkeypatch, tmp_path):
+        pytest.importorskip("pyarrow", reason="parquet writer regression needs pyarrow")
+        import numpy as np
+        import pandas as pd
+        self._patch_generate(monkeypatch, [0.1, 0.2, 0.3])
+        out = tmp_path / "embeddings.parquet"
+        result = runner.invoke(cli_module.main, ["embed", "generate", "in.json", "--output", str(out)])
+        _ok(result)
+        df = pd.read_parquet(out)
+        assert len(df) == 1
+        assert np.allclose(df["embedding"].iloc[0], [0.1, 0.2, 0.3], atol=1e-6)
+
+    def test_writes_json_records_not_repr_strings(self, runner, monkeypatch, tmp_path):
+        import json as _json
+        import numpy as np
+        import pandas as pd
+        self._patch_generate(monkeypatch, [[0.1, 0.2], [0.3, 0.4]])
+        out = tmp_path / "embeddings.json"
+        result = runner.invoke(cli_module.main, ["embed", "generate", "in.json", "--output", str(out)])
+        _ok(result)
+        records = _json.loads(out.read_text(encoding="utf-8"))
+        assert records == [{"embedding": [0.1, 0.2]}, {"embedding": [0.3, 0.4]}]
+        # Verify embed index can read the file back (round-trip contract).
+        df = pd.read_json(out, orient="records")
+        vector_col = next(
+            (c for c in df.columns if isinstance(df[c].iloc[0], (list, np.ndarray))),
+            None,
+        )
+        assert vector_col == "embedding", (
+            f"embed index would not find a vector column; got columns {list(df.columns)}"
+        )
+
+    def test_rejects_unsupported_output_format(self, runner, monkeypatch, tmp_path):
+        self._patch_generate(monkeypatch, [[0.1, 0.2]])
+        out = tmp_path / "embeddings.txt"
+        result = runner.invoke(cli_module.main, ["embed", "generate", "in.json", "--output", str(out)])
+        assert result.exit_code != 0
+        assert "Unsupported output format" in result.output
+        assert not out.exists()
+
+
+class TestWriteResultOutput:
+    """Unit-level regression tests for _write_result_output().
+
+    Covers every branch: JSON, JSONL, CSV, unsupported extension, no-extension,
+    dict+JSONL, empty list, NumPy scalar/array values, and round-trip readback.
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _write(self, tmp_path, filename, result):
+        """Call _write_result_output and return the output Path."""
+        from semantica.cli import _write_result_output
+        out = tmp_path / filename
+        _write_result_output(out, result)
+        return out
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+
+    def test_json_dict_produces_valid_json(self, tmp_path):
+        import json
+        out = self._write(tmp_path, "r.json", {"pairs": 3, "score": 0.9})
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data == {"pairs": 3, "score": 0.9}
+
+    def test_json_list_produces_valid_json(self, tmp_path):
+        import json
+        out = self._write(tmp_path, "r.json", [{"a": 1}, {"a": 2}])
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data == [{"a": 1}, {"a": 2}]
+
+    def test_json_numpy_scalar_serialises_as_number_not_repr(self, tmp_path):
+        """np.float32 values must round-trip as JSON numbers, not repr strings."""
+        import json
+        import numpy as np
+        out = self._write(tmp_path, "r.json", {"score": np.float32(0.95)})
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert isinstance(data["score"], float), (
+            f"expected float, got {type(data['score'])}: {data['score']!r}"
+        )
+        assert abs(data["score"] - 0.95) < 1e-4
+
+    def test_json_numpy_array_serialises_as_list_not_repr(self, tmp_path):
+        """np.ndarray values must round-trip as JSON arrays, not '[0.1 0.2]' repr."""
+        import json
+        import numpy as np
+        out = self._write(tmp_path, "r.json", {"vec": np.array([0.1, 0.2, 0.3])})
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert isinstance(data["vec"], list), (
+            f"expected list, got {type(data['vec'])}: {data['vec']!r}"
+        )
+        assert len(data["vec"]) == 3
+
+    # ── JSONL ────────────────────────────────────────────────────────────────
+
+    def test_jsonl_list_writes_one_object_per_line(self, tmp_path):
+        """Each item in a list result must occupy exactly one JSONL line."""
+        import json
+        records = [{"id": "a", "score": 0.9}, {"id": "b", "score": 0.7}]
+        out = self._write(tmp_path, "r.jsonl", records)
+        lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(lines) == 2
+        assert json.loads(lines[0]) == {"id": "a", "score": 0.9}
+        assert json.loads(lines[1]) == {"id": "b", "score": 0.7}
+
+    def test_jsonl_dict_writes_exactly_one_line(self, tmp_path):
+        """A dict result (e.g. ontology_align) must write one JSON object on one line,
+        not a pretty-printed multi-line block that pd.read_json(lines=True) cannot parse."""
+        import json
+        import pandas as pd
+        result = {"total_entities": 10, "duplicate_pairs": 3}
+        out = self._write(tmp_path, "r.jsonl", result)
+        raw = out.read_text(encoding="utf-8")
+        lines = [l for l in raw.splitlines() if l.strip()]
+        # Exactly one line
+        assert len(lines) == 1, (
+            f"Expected 1 JSONL line for dict result, got {len(lines)}:\n{raw!r}"
+        )
+        # That line parses as valid JSON
+        parsed = json.loads(lines[0])
+        assert parsed == result
+        # pd.read_json(lines=True) can read it back
+        df = pd.read_json(out, lines=True)
+        assert list(df.columns) == ["total_entities", "duplicate_pairs"]
+
+    def test_jsonl_numpy_values_are_not_repr_strings(self, tmp_path):
+        """NumPy values inside JSONL lines must be proper JSON, not repr()."""
+        import json
+        import numpy as np
+        records = [{"score": np.float32(0.8), "tag": "x"}]
+        out = self._write(tmp_path, "r.jsonl", records)
+        line = out.read_text(encoding="utf-8").strip()
+        parsed = json.loads(line)
+        assert isinstance(parsed["score"], float)
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+
+    def test_csv_list_of_dicts_produces_readable_csv(self, tmp_path):
+        import pandas as pd
+        rows = [{"entity_1": "Alice", "entity_2": "Bob", "similarity": 0.87},
+                {"entity_1": "Carol", "entity_2": "Dave", "similarity": 0.72}]
+        out = self._write(tmp_path, "r.csv", rows)
+        df = pd.read_csv(out)
+        assert list(df.columns) == ["entity_1", "entity_2", "similarity"]
+        assert len(df) == 2
+        assert abs(df["similarity"].iloc[0] - 0.87) < 1e-6
+
+    def test_csv_numpy_scalar_becomes_number_not_repr(self, tmp_path):
+        """np.float32 in a result row must not become a repr string in the CSV."""
+        import numpy as np
+        import pandas as pd
+        rows = [{"label": "x", "score": np.float32(0.95)}]
+        out = self._write(tmp_path, "r.csv", rows)
+        df = pd.read_csv(out)
+        # The cell must be a numeric type, not a string like 'np.float32(0.95)'
+        assert df["score"].dtype.kind in ("f", "i"), (
+            f"Expected numeric dtype, got {df['score'].dtype}: {df['score'].iloc[0]!r}"
+        )
+
+    def test_csv_empty_list_raises_clickexception(self, tmp_path):
+        """An empty result list must raise rather than create a headerless newline."""
+        import click
+        from semantica.cli import _write_result_output
+        out = tmp_path / "empty.csv"
+        with pytest.raises(click.ClickException, match="No results to write"):
+            _write_result_output(out, [])
+        assert not out.exists()
+
+    def test_csv_single_dict_written_as_one_row(self, tmp_path):
+        import pandas as pd
+        out = self._write(tmp_path, "r.csv", {"total": 5, "merged": 2})
+        df = pd.read_csv(out)
+        assert len(df) == 1
+        assert df["total"].iloc[0] == 5
+
+    # ── unsupported / no-extension ────────────────────────────────────────────
+
+    def test_unsupported_extension_raises_clickexception(self, tmp_path):
+        import click
+        from semantica.cli import _write_result_output
+        out = tmp_path / "report.txt"
+        with pytest.raises(click.ClickException, match="Unsupported output format"):
+            _write_result_output(out, {"k": "v"})
+        assert not out.exists()
+
+    def test_no_extension_raises_clickexception(self, tmp_path):
+        """No-extension paths must be rejected — not silently renamed to .json —
+        so the path reported to the user always matches the file created."""
+        import click
+        from semantica.cli import _write_result_output
+        out = tmp_path / "report"
+        with pytest.raises(click.ClickException, match="Unsupported output format"):
+            _write_result_output(out, {"k": "v"})
+        assert not out.exists()
+        assert not (tmp_path / "report.json").exists()
+
+    def test_txt_extension_raises_clickexception(self, tmp_path):
+        """.txt is not a documented format and must be rejected, consistent with
+        _write_embeddings_output which also rejects it."""
+        import click
+        from semantica.cli import _write_result_output
+        out = tmp_path / "r.txt"
+        with pytest.raises(click.ClickException, match="Unsupported output format"):
+            _write_result_output(out, {"k": "v"})
+        assert not out.exists()
+
+    def test_uppercase_extension_accepted(self, tmp_path):
+        """Extension matching must be case-insensitive (.CSV == .csv)."""
+        import pandas as pd
+        out = self._write(tmp_path, "r.CSV", [{"a": 1}])
+        df = pd.read_csv(out)
+        assert len(df) == 1
+
+
+class TestDeduplicateOutput:
+    """CLI-level regression tests for deduplicate --output integration.
+
+    Uses the same monkeypatching pattern as TestDeduplicate.test_detect_runtime_path:
+    patch _get_store and get_nodes at the graph_store.methods level, then patch
+    the deduplication module so no real model or DB is needed.
+    """
+
+    _ENTITIES = [
+        {"id": "e1", "name": "Alice", "type": "Person"},
+        {"id": "e2", "name": "Alice", "type": "Person"},
+    ]
+    _DETECT_RESULT = [
+        {"entity_1": "e1", "entity_2": "e2", "similarity": 0.9}
+    ]
+
+    def _patch_dedup(self, monkeypatch):
+        """Wire graph store + deduplication mocks for the detect action."""
+        entities = self._ENTITIES
+        detect_result = self._DETECT_RESULT
+
+        class FakeStore:
+            def get_nodes(self, labels=None, properties=None, limit=100, **opts):
+                return entities
+
+        monkeypatch.setattr(
+            "semantica.graph_store.methods._get_store", lambda: FakeStore()
+        )
+        monkeypatch.setattr(
+            "semantica.graph_store.methods.get_nodes", lambda **kw: entities
+        )
+        monkeypatch.setattr(
+            "semantica.deduplication.methods.detect_duplicates",
+            lambda *a, **k: detect_result,
+            raising=False,
+        )
+        # The CLI imports from .deduplication directly; patch that too.
+        import types
+        fake_dedup = _fake_module(detect_duplicates=lambda *a, **k: detect_result)
+        fake_merger_inst = types.SimpleNamespace(
+            merge_duplicates=lambda *a, **k: detect_result
+        )
+        fake_dedup.entity_merger = types.SimpleNamespace(
+            EntityMerger=lambda: fake_merger_inst
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.deduplication", fake_dedup
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "semantica.deduplication.entity_merger",
+            fake_dedup.entity_merger,
+        )
+
+    def test_deduplicate_output_json_is_valid(self, runner, monkeypatch, tmp_path):
+        """deduplicate --output report.json must produce parseable JSON, not a repr."""
+        import json
+        self._patch_dedup(monkeypatch)
+        out = tmp_path / "report.json"
+        result = runner.invoke(
+            cli_module.main,
+            ["deduplicate", "--action", "detect", "--output", str(out)],
+        )
+        _ok(result)
+        assert out.exists(), f"output file not created; output: {result.output!r}"
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert isinstance(data, (list, dict))
+
+    def test_deduplicate_output_csv_is_readable(self, runner, monkeypatch, tmp_path):
+        """deduplicate --output report.csv (documented format) must produce valid CSV."""
+        import pandas as pd
+        self._patch_dedup(monkeypatch)
+        out = tmp_path / "report.csv"
+        result = runner.invoke(
+            cli_module.main,
+            ["deduplicate", "--action", "detect", "--output", str(out)],
+        )
+        _ok(result)
+        assert out.exists(), f"CSV file not created; output: {result.output!r}"
+        df = pd.read_csv(out)
+        assert len(df) >= 1
+
+
+class TestOntologyAlignOutput:
+    """CLI-level regression tests for ontology align --output integration.
+
+    Uses runner.isolated_filesystem() so Click's exists=True source/target
+    validation passes, then patches semantica.ontology at the sys.modules level
+    before the import inside _action() fires — same pattern as
+    TestOntology.test_align_import_error_is_clean.
+    """
+
+    _ALIGN_RESULT = {
+        "alignments": [{"source": "A", "target": "B", "score": 0.8}],
+        "total": 1,
+    }
+
+    def _patch_align(self, monkeypatch, align_result=None):
+        result = align_result if align_result is not None else self._ALIGN_RESULT
+        import types
+        fake_gen = types.SimpleNamespace(align=lambda *a, **k: result)
+        fake_ontology = _fake_module(
+            OntologyGenerator=lambda **k: fake_gen,
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "semantica.ontology", fake_ontology
+        )
+
+    def test_ontology_align_output_json_is_valid(self, runner, monkeypatch, tmp_path):
+        """ontology align --output alignments.json must produce parseable JSON."""
+        import json
+        self._patch_align(monkeypatch)
+        out = tmp_path / "alignments.json"
+        with runner.isolated_filesystem():
+            open("s.ttl", "w").close()
+            open("t.ttl", "w").close()
+            result = runner.invoke(
+                cli_module.main,
+                ["ontology", "align",
+                 "--source", "s.ttl", "--target", "t.ttl",
+                 "--output", str(out)],
+            )
+        _ok(result)
+        assert out.exists(), f"output file not created; output: {result.output!r}"
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+        assert "alignments" in data
+
+    def test_ontology_align_output_jsonl_is_readable_by_pandas(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """ontology align --output alignments.jsonl must produce valid JSONL:
+        exactly one JSON object per line, readable by pd.read_json(lines=True).
+        Regression for F2: dict result must NOT be pretty-printed across multiple
+        lines into a .jsonl file."""
+        import pandas as pd
+        self._patch_align(monkeypatch)
+        out = tmp_path / "alignments.jsonl"
+        with runner.isolated_filesystem():
+            open("s.ttl", "w").close()
+            open("t.ttl", "w").close()
+            result = runner.invoke(
+                cli_module.main,
+                ["ontology", "align",
+                 "--source", "s.ttl", "--target", "t.ttl",
+                 "--output", str(out)],
+            )
+        _ok(result)
+        assert out.exists(), f"JSONL file not created; output: {result.output!r}"
+        raw = out.read_text(encoding="utf-8")
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        assert len(lines) == 1, (
+            f"Expected exactly 1 JSONL line for a dict result, got {len(lines)}:\n{raw!r}"
+        )
+        # pd.read_json(lines=True) must succeed — this is what the F2 bug broke.
+        df = pd.read_json(out, lines=True)
+        assert "alignments" in df.columns
+
+
+class TestProvenanceCliStorageEnv:
+    """#1810: `semantica provenance audit` must read the DB the Explorer writes.
+
+    The CLI builds ``ProvenanceManager(config=...)`` with no storage path, so
+    before the fix every read command inspected a fresh in-memory store and the
+    env var the Explorer honours was invisible to it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_storage(self, monkeypatch):
+        from semantica.provenance import ProvenanceManager
+
+        monkeypatch.delenv("SEMANTICA_PROVENANCE_DB", raising=False)
+        monkeypatch.delenv("EXPLORER_PROVENANCE_DB", raising=False)
+        original = ProvenanceManager._default_storage_path
+        ProvenanceManager._default_storage_path = None
+        try:
+            yield
+        finally:
+            ProvenanceManager._default_storage_path = original
+
+    @staticmethod
+    def _seed_db(path):
+        from semantica.provenance import ProvenanceManager
+
+        writer = ProvenanceManager(storage_path=str(path))
+        writer.track_entity(
+            entity_id="ent1", source="t.py", activity="creation", agent="tester"
+        )
+        writer.track_entity(
+            entity_id="ent2", source="t.py", activity="creation", agent="tester"
+        )
+
+    def test_audit_reads_the_db_named_by_the_env_var(
+        self, runner, monkeypatch, tmp_path
+    ):
+        db = tmp_path / "cli_prov.db"
+        self._seed_db(db)
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(db))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        entries = json.loads(result.output.strip())
+        assert [e["entity_id"] for e in entries] == ["ent1", "ent2"]
+
+    def test_audit_is_empty_when_no_env_var_points_at_a_db(self, runner, tmp_path):
+        self._seed_db(tmp_path / "cli_prov.db")
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        assert json.loads(result.output.strip()) == []
+
+    def test_configured_storage_path_wins_over_the_env_var(
+        self, runner, monkeypatch, tmp_path
+    ):
+        configured = tmp_path / "configured.db"
+        self._seed_db(configured)
+        monkeypatch.setenv("SEMANTICA_PROVENANCE__STORAGE_PATH", str(configured))
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(tmp_path / "other.db"))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        entries = json.loads(result.output.strip())
+        assert [e["entity_id"] for e in entries] == ["ent1", "ent2"]
+        assert not (tmp_path / "other.db").exists()
+
+    # #2166: opening a missing path creates an empty SQLite file, so a typo in
+    # the path read back as an empty, valid store and the command exited 0.
+    _READ_COMMANDS = [
+        ["audit", "--format", "json", "--json"],
+        ["verify-chain", "--json"],
+        ["check", "--json"],
+        ["lineage", "ent1", "--json"],
+        ["descendants", "ent1", "--json"],
+        ["export", "--format", "jsonld"],
+    ]
+
+    @pytest.mark.parametrize("args", _READ_COMMANDS, ids=lambda args: args[0])
+    def test_read_commands_refuse_a_missing_env_db_without_creating_it(
+        self, runner, monkeypatch, tmp_path, args
+    ):
+        missing = tmp_path / "typo.db"
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(missing))
+
+        result = runner.invoke(cli_module.main, ["provenance", *args])
+
+        assert result.exit_code != 0, result.output
+        assert "does not exist" in _flatten(result.output)
+        assert not missing.exists()
+
+    def test_read_command_refuses_a_missing_configured_db(
+        self, runner, monkeypatch, tmp_path
+    ):
+        missing = tmp_path / "configured.db"
+        monkeypatch.setenv("SEMANTICA_PROVENANCE__STORAGE_PATH", str(missing))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "verify-chain", "--json"]
+        )
+
+        assert result.exit_code != 0, result.output
+        assert "does not exist" in _flatten(result.output)
+        assert not missing.exists()
+
+    def test_invalidate_may_still_create_the_db(self, runner, monkeypatch, tmp_path):
+        db = tmp_path / "new.db"
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(db))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "invalidate", "ent1", "--by", "tester"]
+        )
+
+        # Nothing is tracked yet, so the entity is not found, but the command
+        # got as far as opening (and creating) the database it writes to.
+        assert "does not exist" not in _flatten(result.output)
+        assert db.exists()
+
+
+class _FakeUrlopenResponse:
+    """Minimal context-manager response for a stubbed urllib.request.urlopen."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeUrlopenResponse":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _stub_release(monkeypatch, tag_name: str) -> None:
+    """Make the changelog's GitHub release lookup return *tag_name*."""
+    import urllib.request
+
+    payload = json.dumps({"tag_name": tag_name, "body": "", "html_url": ""}).encode()
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **kw: _FakeUrlopenResponse(payload),
+    )
+
+
+class TestChangelogVersionTag:
+    """changelog must strip the "v" prefix, not a run of leading characters.
+
+    Regression for #1845: ``tag.lstrip("v")`` treats "v" as a character set, so
+    a tag like ``vv1.2.3`` lost both leading v's. ``removeprefix("v")`` strips
+    exactly one, which is the documented intent.
+    """
+
+    @pytest.mark.parametrize(
+        "tag_name,expected",
+        [
+            ("v1.2.3", "1.2.3"),
+            ("vv1.2.3", "v1.2.3"),
+            ("1.2.3", "1.2.3"),
+        ],
+    )
+    def test_changelog_json_latest_strips_one_v(
+        self, runner, monkeypatch, tag_name, expected
+    ):
+        _stub_release(monkeypatch, tag_name)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["latest"] == expected
+
+
+class TestChangelogUpdateCheck:
+    """changelog must order versions, not compare them as strings.
+
+    A build ahead of the latest release (e.g. 0.8.0 against a v0.7.0 tag) used
+    to be told "Update available: 0.8.0 → 0.7.0", recommending a downgrade.
+    """
+
+    @pytest.mark.parametrize(
+        "current,tag_name,expected",
+        [
+            ("0.7.0", "v0.8.0", True),
+            ("0.8.0", "v0.8.0", False),
+            ("0.8", "v0.8.0", False),
+            ("0.8.0", "v0.7.0", False),
+            ("0.8.0.dev1", "v0.7.0", False),
+            ("0.8.0rc1", "v0.8.0", True),
+            ("0.8.0", "unknown", None),
+        ],
+    )
+    def test_changelog_json_update_available(
+        self, runner, monkeypatch, current, tag_name, expected
+    ):
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["update_available"] is expected
+
+    @pytest.mark.parametrize(
+        "current,tag_name,shown,hidden",
+        [
+            ("0.7.0", "v0.8.0", "Update available", "ahead of the latest"),
+            ("0.8.0", "v0.8.0", "on the latest version", "Update available"),
+            ("0.8.0", "v0.7.0", "ahead of the latest", "Update available"),
+            ("0.8.0", "unknown", "Could not compare", "Update available"),
+        ],
+    )
+    def test_changelog_status_line(
+        self, runner, monkeypatch, current, tag_name, shown, hidden
+    ):
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog"])
+        _ok(result)
+        assert shown in result.output
+        assert hidden not in result.output
+
+
+class TestChangelogWithoutPackaging:
+    """packaging is not a core dependency (#1513), so a slim install may lack it.
+
+    The fallback must still order plain X.Y.Z releases and must never report
+    an update it cannot establish.
+    """
+
+    @pytest.mark.parametrize(
+        "current,tag_name,expected",
+        [
+            ("0.7.0", "v0.8.0", True),
+            ("0.8.0", "v0.7.0", False),
+            ("0.8", "v0.8.0", False),
+            ("0.10.0", "v0.9.0", False),
+            ("0.8.0.dev1", "v0.8.0.dev1", False),
+            ("0.8.0.dev1", "v0.7.0", None),
+            ("0.8.0", "unknown", None),
+        ],
+    )
+    def test_changelog_json_update_available_without_packaging(
+        self, runner, monkeypatch, current, tag_name, expected
+    ):
+        import sys
+
+        # A None entry makes ``from packaging.version import ...`` raise ImportError.
+        monkeypatch.setitem(sys.modules, "packaging.version", None)
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["update_available"] is expected
+
+
+# ─── subcommand smoke ─────────────────────────────────────────────────────────
+
+
+class TestSubcommandSmoke:
+    """Every registered subcommand must at least answer ``--help``.
+
+    The command-family tests invoke the subcommands they care about, so one that
+    was registered but never wired up — a decorator that dropped its options, an
+    argument the callback cannot accept — can break unnoticed until a user runs
+    it. Walk the whole command tree instead of a hand-picked list.
+    """
+
+    def test_every_registered_subcommand_answers_help(self, runner):
+        paths = list(_iter_subcommands(cli_module.main))
+        # Guard against the walk silently finding nothing and passing vacuously.
+        assert len(paths) > 20
+        failures = []
+        for path in paths:
+            result = runner.invoke(cli_module.main, list(path) + ["--help"])
+            if result.exit_code != 0:
+                failures.append((path, result.exit_code, result.output[-200:]))
+        assert failures == []

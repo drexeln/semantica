@@ -78,6 +78,7 @@ Production Use Cases:
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
+import json
 import numpy as np
 
 from ..embeddings import EmbeddingGenerator
@@ -147,7 +148,10 @@ class DecisionQuery:
                 if community_detection:
                     self.kg_components["community_detector"] = CommunityDetector()
                 if node_embeddings:
-                    self.kg_components["node_embedder"] = NodeEmbedder()
+                    try:
+                        self.kg_components["node_embedder"] = NodeEmbedder()
+                    except ImportError as e:
+                        self.logger.warning(f"Node2Vec embeddings disabled: {e}")
                 self.kg_components["path_finder"] = PathFinder()
                 self.kg_components["similarity_calculator"] = SimilarityCalculator()
                 if link_prediction:
@@ -932,6 +936,24 @@ class DecisionQuery:
             self.logger.error(f"Failed to find similar exceptions: {e}")
             raise
     
+    @staticmethod
+    def _deserialize_graph_metadata(metadata: Any) -> Dict[str, Any]:
+        """Deserialize metadata from graph node properties to a dictionary.
+        
+        Property-graph stores (e.g. Neo4j) persist metadata as JSON strings.
+        Decodes JSON strings back into Dict[str, Any] while gracefully handling
+        non-JSON strings and retaining already-native dicts.
+        """
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+                return parsed if isinstance(parsed, dict) else {"raw": metadata}
+            except (TypeError, ValueError):
+                return {"raw": metadata} if metadata else {}
+        elif isinstance(metadata, dict):
+            return metadata
+        return {}
+
     def _dict_to_decision(self, data: Dict[str, Any]) -> Decision:
         """Convert dictionary to Decision object."""
         # Handle timestamp conversion
@@ -953,7 +975,7 @@ class DecisionQuery:
             decision_maker=data.get("decision_maker", ""),
             reasoning_embedding=data.get("reasoning_embedding"),
             node2vec_embedding=data.get("node2vec_embedding"),
-            metadata=data.get("metadata", {}),
+            metadata=self._deserialize_graph_metadata(data.get("metadata")),
         )
     
     def _dict_to_exception(self, data: Dict[str, Any]) -> PolicyException:
@@ -976,7 +998,7 @@ class DecisionQuery:
             approver=data.get("approver", ""),
             approval_timestamp=data.get("approval_timestamp", datetime.now()),
             justification=data.get("justification", ""),
-            metadata=data.get("metadata", {}),
+            metadata=self._deserialize_graph_metadata(data.get("metadata")),
         )
     
     def _calculate_semantic_similarity(self, text1: str, text2: str) -> float:
@@ -1241,16 +1263,21 @@ class DecisionQuery:
             # Community detection
             if "community_detector" in self.kg_components:
                 subgraph = self._get_decision_subgraph(decision_id, max_depth)
-                communities = self.kg_components["community_detector"].detect_communities(subgraph)
-                
-                for community_id, members in communities.items():
-                    if decision_id in members:
-                        analysis["community_info"] = {
-                            "community_id": community_id,
-                            "community_size": len(members),
-                            "community_members": list(members)[:10]
-                        }
-                        break
+                community_detector = self.kg_components["community_detector"]
+                community_result = community_detector.detect_communities(subgraph)
+                node_assignments = community_result.get("node_assignments", {})
+
+                community_id = node_assignments.get(decision_id)
+                if community_id is not None:
+                    members = [
+                        node for node, assignment in node_assignments.items()
+                        if assignment == community_id
+                    ]
+                    analysis["community_info"] = {
+                        "community_id": community_id,
+                        "community_size": len(members),
+                        "community_members": members[:10]
+                    }
             
             self.logger.info(f"Completed influence analysis for decision {decision_id}")
             return analysis

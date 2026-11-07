@@ -408,6 +408,9 @@ utf8_text = handle_encoding(raw_bytes, operation="convert")
     currency_norm = CurrencyNormalizer()
     result = currency_norm.normalize_currency("$42.50")
     # → {"amount": 42.50, "currency": "USD", "original": "$42.50"}
+
+    result = currency_norm.normalize_currency("$5M")
+    # → {"amount": 5000000.0, "currency": "USD", "original": "$5M"}
     ```
   </Tab>
   <Tab title="Language & Encoding">
@@ -440,7 +443,19 @@ utf8_text = handle_encoding(raw_bytes, operation="convert")
     ```
 
     <Note>
-      `detect()` requires at least 10 characters for reliable detection. On shorter text it returns the `default_language` (default: `"en"`).
+      `detect()` skips detection on text shorter than `min_text_length` (default: 10 stripped characters) and returns the `default_language` instead. The fallback defaults to `"en"` (backward-compatible). Pass `default_language=UNKNOWN_LANGUAGE` to get an explicit `"unknown"` signal that is distinct from every ISO language code. Both `default_language` and `min_text_length` are configurable, per instance or per call:
+
+      ```python
+      # Lower the threshold for CJK, where 10 characters is far more than needed
+      detector = LanguageDetector(min_text_length=4)
+      detector.detect("短いテキスト")            # → "ja"
+
+      # Per-call override
+      LanguageDetector().detect("短いテキスト", min_text_length=4)   # → "ja"
+
+      # Opt into an unambiguous out-of-band sentinel instead of the "en" default
+      LanguageDetector(default_language="unknown").detect("Hi")     # → "unknown"
+      ```
     </Note>
 
     <Warning>
@@ -584,7 +599,7 @@ normalized = normalize_text("Apple Inc.", method="expand_suffixes")
 # → "Apple Incorporated"
 ```
 
-- [Parse](parse) — Parse documents before normalization.
-- [Split](split) — Chunk normalized text for embedding.
-- [Deduplication](deduplication) — Resolve duplicate entities after normalization.
-- [Pipeline](pipeline) — Include normalization as a named pipeline step.
+- [Parse](/reference/parse) — Parse documents before normalization.
+- [Split](/reference/split) — Chunk normalized text for embedding.
+- [Deduplication](/reference/deduplication) — Resolve duplicate entities after normalization.
+- [Pipeline](/reference/pipeline) — Include normalization as a named pipeline step.

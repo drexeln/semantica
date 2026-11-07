@@ -5,7 +5,7 @@ icon: "circle-question"
 ---
 
 <Info>
-  Use **Ctrl+F** / **Cmd+F** to search this page. Common jumps: [Installation](#installation) · [Data & Features](#data--features) · [Troubleshooting](#troubleshooting)
+  Use **Ctrl+F** / **Cmd+F** to search this page. Common jumps: [Installation](#installation) · [Data & Features](#data-&-features) · [Troubleshooting](#troubleshooting)
 </Info>
 
 ## Quick Answers
@@ -13,11 +13,11 @@ icon: "circle-question"
 | Question | Answer |
 | :-------- | :------ |
 | License? | MIT: free forever, no paywalled features |
-| Python version? | 3.8+ (3.11+ recommended) |
+| Python version? | 3.11–3.13 (3.10 support ended in 0.8.0) |
 | API key required? | Optional: pattern extraction works with no keys |
 | Works with LangChain / LlamaIndex? | Yes: Semantica is a layer on top, not a replacement |
-| Production-ready? | Yes: 1,000+ tests, v0.5.0 ships with 12 security fixes |
-| Latest version? | **v0.6.6** (August 2026) |
+| Production-ready? | Yes: 1,000+ tests, security fixes shipped in every release (see [CHANGELOG](https://github.com/semantica-agi/semantica/blob/main/CHANGELOG.md)) |
+| Latest version? | **v0.7.0** (September 2026) |
 | Local LLMs? | Yes: Ollama via LiteLLM, HuggingFaceLLM for air-gapped |
 
 
@@ -27,7 +27,7 @@ icon: "circle-question"
 
 <Accordion title="What is Semantica?" icon="info-circle">
 
-Semantica is an open-source framework for building context graphs and decision intelligence layers for AI. It transforms unstructured data: documents, APIs, databases: into structured knowledge graphs with full provenance tracking, making AI systems explainable and auditable.
+Semantica is an open-source framework for building context graphs and decision intelligence layers for AI. It transforms unstructured data (documents, APIs, databases) into structured knowledge graphs with full provenance tracking, making AI systems explainable and auditable.
 
 It's not a replacement for LangChain or LlamaIndex. It's the **accountability layer** that goes on top: recording decisions, tracing facts to sources, and making reasoning transparent.
 
@@ -46,7 +46,7 @@ It's not a replacement for LangChain or LlamaIndex. It's the **accountability la
 
 <Accordion title="What makes Semantica different from LangChain or LlamaIndex?" icon="scale-balanced">
 
-Most frameworks stop at retrieval or generation. Semantica adds an **accountability layer**: every decision is recorded, every fact links to a source, and every reasoning step is explainable. It's designed for environments where you need to audit *why* an AI reached a conclusion: not just what it said.
+Most frameworks stop at retrieval or generation. Semantica adds an **accountability layer**: every decision is recorded, every fact links to a source, and every reasoning step is explainable. It's designed for environments where you need to audit *why* an AI reached a conclusion, not just what it said.
 
 Semantica works alongside these frameworks, not against them.
 
@@ -54,11 +54,11 @@ Semantica works alongside these frameworks, not against them.
 
 <Accordion title="Does Semantica explain an LLM's internal reasoning or chain-of-thought?" icon="triangle-exclamation">
 
-No. This is **system-level explainability, not foundation-model explainability**. Semantica does not expose, reconstruct, or explain what happens *inside* the LLM/foundation model — its internal reasoning or chain-of-thought stays opaque, as it does for any external system.
+No. This is **system-level explainability, not foundation-model explainability**. Semantica does not expose, reconstruct, or explain what happens *inside* the LLM/foundation model. Its internal reasoning or chain-of-thought stays opaque, as it does for any external system.
 
 What Semantica explains is *outside* the model: what context and data were used, what decision was produced, the provenance behind it, the relevant relationships, the policies applied, and the resulting decision trail.
 
-In short: Semantica explains and audits *what the AI system did* — not the foundation model's private internal reasoning.
+In short, Semantica explains and audits *what the AI system did*, not the foundation model's private internal reasoning.
 
 </Accordion>
 
@@ -70,9 +70,9 @@ Yes: MIT licensed, no vendor lock-in, no paywalled features. Some capabilities r
 
 <Accordion title="What's the latest version?" icon="star">
 
-**v0.5.0**: released May 2026.
+**v0.7.0**: released September 2026.
 
-Highlights: Ontology Hub, Distance Intelligence, Parquet/XML ingestion, 12 security fixes, Graph Explorer redesign, NER gateway fix.
+Highlights: core install dependencies cut from 44 to 22 packages via optional extras (`pip install "semantica[all]"` for the old bundled behavior), Hierarchical Community GraphRAG (multi-level community detection, summarized reports, global/DRIFT hybrid search), six new data connectors (BigQuery, Redshift, Power BI, Airflow, plus JSONL ingestion), schema-guided extraction validation, source-aware truth maintenance with trust tiers for graph facts, a persistent SQLite extraction-cache backend, and 40+ correctness fixes. Requires Python 3.10+ (3.8/3.9 dropped). Two breaking changes: `Entity.confidence` is now `Optional[float]`, and `PolicyEngine.check_compliance` raises `ProcessingError` instead of returning `False` for unevaluable rules. The 0.6.x line also added every release being cryptographically signed (SLSA + Sigstore), real vector-store enumeration, and first-class Anthropic/Gemini/Ollama/DeepSeek/Novita LLM provider wrappers. See the [CHANGELOG](https://github.com/semantica-agi/semantica/blob/main/CHANGELOG.md) for the full history.
 
 ```bash
 pip install --upgrade semantica
@@ -93,13 +93,15 @@ pip install --upgrade semantica
 pip install semantica
 ```
 
-See [Installation](installation) for virtual environment setup, optional extras (`[gpu]`, `[all]`, provider-specific), and platform-specific troubleshooting.
+See [Installation](/installation) for virtual environment setup, optional extras (`[gpu]`, `[all]`, provider-specific), and platform-specific troubleshooting.
 
 </Accordion>
 
 <Accordion title="What Python version do I need?" icon="python">
 
-Python **3.8 or higher**. Python 3.11+ is recommended for best performance and compatibility.
+Python **3.11 or higher** (3.11–3.13 are supported).
+
+Python 3.10 support ended in **0.8.0**: 3.10 reached end of life in October 2026, and Pillow 13, which carries fixes for security advisories that no Pillow 12.x release has, requires 3.11. On Python 3.10, `pip install semantica` installs the last release that supports it (0.7.x), which no longer receives updates. Upgrade to Python 3.11 or newer to keep getting fixes.
 
 </Accordion>
 
@@ -119,7 +121,7 @@ If you're on an older version, install extras individually: `pip install "semant
 
 | Requirement | Minimum | Recommended |
 | :----------- | :------- | :----------- |
-| Python | 3.8 | 3.11+ |
+| Python | 3.11 | 3.11–3.13 |
 | RAM | 4 GB | 16 GB+ |
 | Storage | 2 GB | 20 GB+ |
 | GPU | Optional | CUDA for embeddings and ML models |
@@ -173,7 +175,7 @@ This includes PyTorch with CUDA, FAISS GPU, and CuPy.
 <Accordion title="How does Semantica handle large datasets?" icon="layer-group">
 
 - **Batching**: process documents in configurable chunks to control memory usage
-- **Parallel processing**: `Pipeline(workers=N)` runs extraction steps concurrently
+- **Parallel processing**: the `semantica.pipeline` module can run independent, parallel-safe steps in the same dependency layer concurrently (see the [Pipeline guide](/guides/pipeline))
 - **Delta processing**: update graphs incrementally without full recompute on new data
 - **Persistent backends**: swap in-memory NetworkX for Neo4j, FalkorDB, or Apache AGE for large-scale production graphs
 
@@ -269,13 +271,13 @@ Groq, OpenAI, Anthropic, Google Gemini, Ollama (fully local), DeepSeek, Novita A
 
 <Accordion title="Is Semantica production-ready?" icon="shield-check">
 
-Yes. v0.5.0 ships with:
+Yes. Every release ships with:
 
-- 1,000+ passing tests across Python 3.8–3.12
+- 1,000+ passing tests, with installs verified weekly on Python 3.11–3.13
 - `PipelineValidator` and `FailureHandler` with exponential backoff and configurable retry policies
 - W3C PROV-O provenance tracking across all modules
 - Change management with SHA-256 checksums and full audit trails
-- 12 security vulnerability fixes: eval injection, pickle deserialization, SQL injection, XXE, SSRF, ReDoS, path traversal, and more
+- Ongoing security hardening: eval injection, pickle deserialization, SQL injection, XXE, SSRF, ReDoS, and path traversal fixes have all landed across recent releases (see the [CHANGELOG](https://github.com/semantica-agi/semantica/blob/main/CHANGELOG.md) security sections)
 
 </Accordion>
 
@@ -348,6 +350,6 @@ set PYTHONIOENCODING=utf-8
 
 ## Support
 
-- [Discord](https://discord.gg/sV34vps5hH) — Community chat and live support.
-- [GitHub Issues](https://github.com/semantica-agi/semantica/issues) — Bug reports and feature requests.
-- [Contributing](contributing-guide) — Help improve Semantica.
+- [Discord](https://discord.gg/sV34vps5hH): community chat and live support.
+- [GitHub Issues](https://github.com/semantica-agi/semantica/issues): bug reports and feature requests.
+- [Contributing](/contributing-guide): help improve Semantica.

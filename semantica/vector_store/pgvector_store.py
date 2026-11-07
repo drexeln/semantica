@@ -513,7 +513,7 @@ class PgVectorStore:
         ids: List[str],
         vectors: Optional[Union[List[np.ndarray], np.ndarray]] = None,
         metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> bool:
+    ) -> List[str]:
         """
         Update existing vectors.
 
@@ -523,14 +523,16 @@ class PgVectorStore:
             metadata: Optional new metadata
 
         Returns:
-            True if successful
+            IDs the UPDATE matched, in request order and without
+            duplicates. Missing IDs are omitted. An empty request
+            returns an empty list.
 
         Raises:
             ValidationError: If input dimensions don't match
             ProcessingError: If database operation fails
         """
         if not ids:
-            return True
+            return []
 
         if vectors is None and metadata is None:
             raise ValidationError("Either vectors or metadata must be provided for update")
@@ -547,6 +549,8 @@ class PgVectorStore:
         with self._get_connection() as conn:
             try:
                 cur = conn.cursor()
+                confirmed_ids: List[str] = []
+                seen = set()
 
                 for i, vec_id in enumerate(ids):
                     updates = []
@@ -566,7 +570,8 @@ class PgVectorStore:
                         updates.append(psycopg_sql.SQL("metadata = %s"))
                         params.append(json.dumps(metadata[i]))
 
-                    # Build safe UPDATE query
+                    # Build safe UPDATE query. rowcount is read on this
+                    # statement so a mixed batch can name the matched ids.
                     update_sql = psycopg_sql.SQL("""
                         UPDATE {}
                         SET {}
@@ -577,11 +582,14 @@ class PgVectorStore:
                     )
                     params.append(vec_id)
                     cur.execute(update_sql, params)
+                    if cur.rowcount > 0 and vec_id not in seen:
+                        seen.add(vec_id)
+                        confirmed_ids.append(vec_id)
 
                 conn.commit()
                 cur.close()
-                self.logger.info(f"Updated {len(ids)} vectors")
-                return True
+                self.logger.info(f"Updated {len(confirmed_ids)} of {len(ids)} vectors")
+                return confirmed_ids
             except (ValidationError, ProcessingError):
                 conn.rollback()
                 raise
@@ -655,6 +663,52 @@ class PgVectorStore:
         except Exception as e:
             self.logger.warning(f"Failed to get metadata for {vector_id}: {e}")
             return None
+
+    def scan_vectors(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Page through stored vectors ordered by id.
+
+        Args:
+            offset: Number of rows to skip
+            limit: Maximum number of rows to return
+
+        Returns:
+            List of result dicts with 'id', 'metadata', and 'vector'
+        """
+        if not PSYCOPG3_AVAILABLE and not PSYCOPG2_AVAILABLE:
+            raise ProcessingError(
+                "Neither psycopg3 nor psycopg2 is available. "
+                "Install with: pip install psycopg[binary] or psycopg2-binary"
+            )
+
+        if limit <= 0:
+            return []
+
+        scan_sql = psycopg_sql.SQL("""
+            SELECT id, vector, metadata
+            FROM {}
+            ORDER BY id
+            LIMIT %s OFFSET %s
+        """).format(psycopg_sql.Identifier(self.table_name))
+
+        with self._get_connection() as conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(scan_sql, (limit, offset))
+                rows = cur.fetchall()
+                cur.close()
+
+                results = []
+                for row in rows:
+                    vec_id, vec, meta = row
+                    results.append({
+                        "id": vec_id,
+                        "metadata": meta if isinstance(meta, dict) else json.loads(meta) if meta else {},
+                        "vector": np.array(vec) if vec is not None else None,
+                    })
+                return results
+            except Exception as e:
+                raise ProcessingError(f"Failed to scan vectors: {str(e)}") from e
 
     def filter_by_metadata(
         self, filters: Dict[str, Any], limit: int = 10

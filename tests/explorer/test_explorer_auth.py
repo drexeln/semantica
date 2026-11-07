@@ -13,16 +13,16 @@ browsers can't set custom headers on a WebSocket handshake.
 import pytest
 
 from semantica.context.context_graph import ContextGraph
-from semantica.explorer.app import create_app
-from semantica.explorer.session import GraphSession
+# fastapi ships in the optional `explorer` extra, not in `dev`, so this module
+# must skip rather than fail collection when it is absent. The guard has to sit
+# above the import below, which pulls fastapi in transitively.
+pytest.importorskip("fastapi")
 
-try:
-    from starlette.testclient import TestClient
-except ImportError:
-    pytest.skip(
-        "starlette TestClient is required for explorer tests. Install semantica[explorer].",
-        allow_module_level=True,
-    )
+from semantica.explorer.app import create_app  # noqa: E402
+from semantica.explorer.session import GraphSession  # noqa: E402
+
+from starlette.testclient import TestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 
 def _build_sample_graph() -> ContextGraph:
@@ -32,7 +32,12 @@ def _build_sample_graph() -> ContextGraph:
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # create_app() reads the allowed origins from the environment, so an
+    # ALLOWED_ORIGINS or EXPLORER_CORS_ORIGINS exported in the developer's
+    # shell would replace the defaults these tests rely on.
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    monkeypatch.delenv("EXPLORER_CORS_ORIGINS", raising=False)
     session = GraphSession(_build_sample_graph())
     app = create_app(session=session)
     with TestClient(app) as test_client:
@@ -59,6 +64,22 @@ def test_write_route_also_refuses_when_auth_not_configured(client, monkeypatch):
     resp = client.post("/api/export", json={"format": "json"})
 
     assert resp.status_code == 503
+
+
+def test_markdown_write_route_requires_api_key(client, monkeypatch):
+    monkeypatch.delenv("SEMANTICA_ALLOW_ANONYMOUS", raising=False)
+    monkeypatch.setenv("SEMANTICA_API_KEY", "correct-key")
+
+    response = client.put(
+        "/api/markdown/context-node/python",
+        headers={"X-API-Key": "wrong-key"},
+        json={
+            "markdown": "---\nid: python\ntype: language\n---\n\nChanged",
+            "expected_revision": "sha256:" + ("0" * 64),
+        },
+    )
+
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +230,65 @@ def test_websocket_accepts_missing_origin_under_anonymous_mode(client, monkeypat
     with client.websocket_connect("/ws/graph-updates") as websocket:
         ack = websocket.receive_json()
     assert ack["event"] == "connection_ack"
+
+
+def test_websocket_accepts_default_port_8000_origin_under_anonymous_mode(client, monkeypatch):
+    """Regression test for #1257: default CLI port 8000 origin must be accepted."""
+    monkeypatch.setenv("SEMANTICA_ALLOW_ANONYMOUS", "true")
+    monkeypatch.delenv("SEMANTICA_API_KEY", raising=False)
+
+    for origin in ("http://127.0.0.1:8000", "http://localhost:8000"):
+        with client.websocket_connect(
+            "/ws/graph-updates", headers={"Origin": origin}
+        ) as websocket:
+            ack = websocket.receive_json()
+        assert ack["event"] == "connection_ack"
+
+
+def test_websocket_accepts_non_default_port_origin_when_configured(monkeypatch):
+    """Regression test for #1257: custom port origin (e.g. 8020) must be accepted when configured."""
+    monkeypatch.setenv("SEMANTICA_ALLOW_ANONYMOUS", "true")
+    monkeypatch.delenv("SEMANTICA_API_KEY", raising=False)
+
+    app = create_app(
+        session=GraphSession(_build_sample_graph()),
+        allowed_origins=["http://localhost:5173", "http://127.0.0.1:8020", "http://localhost:8020"],
+    )
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect(
+            "/ws/graph-updates", headers={"Origin": "http://127.0.0.1:8020"}
+        ) as websocket:
+            ack = websocket.receive_json()
+        assert ack["event"] == "connection_ack"
+
+        # Hostile origins must still be rejected
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with test_client.websocket_connect(
+                "/ws/graph-updates", headers={"Origin": "https://evil.example"}
+            ):
+                pass
+        assert excinfo.value.code == 4403
+
+
+def test_websocket_explicit_allowed_origins_preserves_user_allowlist(monkeypatch):
+    """Preserve explicit ALLOWED_ORIGINS: do not silently allow unlisted origins."""
+    monkeypatch.setenv("SEMANTICA_ALLOW_ANONYMOUS", "true")
+    monkeypatch.delenv("SEMANTICA_API_KEY", raising=False)
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://custom.example.com")
+
+    app = create_app(session=GraphSession(_build_sample_graph()))
+    with TestClient(app) as test_client:
+        # Specified origin is accepted
+        with test_client.websocket_connect(
+            "/ws/graph-updates", headers={"Origin": "https://custom.example.com"}
+        ) as websocket:
+            ack = websocket.receive_json()
+        assert ack["event"] == "connection_ack"
+
+        # Unlisted origins are rejected
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with test_client.websocket_connect(
+                "/ws/graph-updates", headers={"Origin": "http://127.0.0.1:8020"}
+            ):
+                pass
+        assert excinfo.value.code == 4403

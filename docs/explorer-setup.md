@@ -6,7 +6,7 @@ icon: "map"
 
 **`semantica-explorer`** is an **interactive browser dashboard** for knowledge graph exploration. You give it a graph file, it starts a local server, and opens a browser tab where you can search nodes, find paths, inspect provenance, and run analytics: no code required after launch.
 
-This page covers everything needed to go from zero to a running Explorer. For the full REST API reference and endpoint catalogue, see [Explorer Reference](reference/explorer).
+This page covers everything needed to go from zero to a running Explorer. For the full REST API reference and endpoint catalogue, see [Explorer Reference](/reference/explorer).
 
 
 ## Prerequisites
@@ -27,7 +27,7 @@ Verify:
 semantica-explorer --help
 ```
 
-You should see the usage message with the four available flags. If you see `command not found`, activate your virtual environment first. See [CLI Setup](cli-setup#troubleshooting) for PATH help.
+You should see the usage message with the four available flags. If you see `command not found`, activate your virtual environment first. See [CLI Setup](/cli-setup#troubleshooting) for PATH help.
 
 
 ## Minimal End-to-End Example
@@ -109,7 +109,7 @@ Explorer loads a graph from a JSON file on disk. You need to create that file fi
 </Steps>
 
 <Tip>
-  Already have a graph from a pipeline run? Skip straight to Step 2. The only requirement is that the file was saved with `ContextGraph.save_to_file()`.
+  Pipelines that already produced a saved graph can skip straight to Step 2, provided the file was saved with `ContextGraph.save_to_file()`.
 </Tip>
 
 
@@ -164,6 +164,10 @@ semantica-explorer --graph my_graph.json --no-browser
 <Warning>
   `--host 0.0.0.0` makes Explorer reachable on every network interface. Since v0.6.5 the Explorer API requires `SEMANTICA_API_KEY` (sent as the `X-API-Key` header) and fails closed with `503` when unconfigured; unauthenticated access is only possible when `SEMANTICA_ALLOW_ANONYMOUS=true` is set explicitly. Only use this on a trusted private network.
 </Warning>
+
+<Tip>
+  **CORS and WebSocket Origins:** `semantica-explorer` automatically allows browser connections from `localhost` and `127.0.0.1` on the configured `--port` (and Vite dev port `5173`). When `--host` is not a loopback address, `http://<host>:<port>` is allowed too, so a browser opened on the address the Explorer is served at can connect; an IPv6 host is written in brackets, as a browser sends it (`--host fe80::1` allows `http://[fe80::1]:<port>`). With `--port 0` the operating system picks the port after start-up, so no port origin is added: set `ALLOWED_ORIGINS` to include it. To allow external browser origins or custom domains for both HTTP CORS and `/ws/graph-updates` WebSocket connections, set the `ALLOWED_ORIGINS` environment variable (e.g. `ALLOWED_ORIGINS="https://explorer.example.com"`). An origin not in the allowlist causes the WebSocket handshake to fail with HTTP 403; add the origin to `ALLOWED_ORIGINS` to resolve this for custom or external clients. `EXPLORER_CORS_ORIGINS` is also supported as a legacy alias.
+</Tip>
 
 
 ## Browser Access
@@ -264,7 +268,7 @@ Once running, Explorer exposes a REST API and dashboard for:
 
 The full endpoint catalogue is documented in the Swagger UI at `/docs` and in the reference page below.
 
-- [Explorer Reference](reference/explorer) — Every REST endpoint, WebSocket events, analytics, and all supported flags.
-- [CLI Setup](cli-setup) — All five Semantica executables and when to use each one.
-- [Context Module](reference/context) — Full documentation for ContextGraph: build, query, save, and load.
-- [Quickstart](quickstart) — End-to-end pipeline: ingest → extract → build graph → export.
+- [Explorer Reference](/reference/explorer): every REST endpoint, WebSocket events, analytics, and all supported flags.
+- [CLI Setup](/cli-setup): all five Semantica executables and when to use each one.
+- [Context Module](/reference/context): full documentation for ContextGraph (build, query, save, and load).
+- [Quickstart](/quickstart): end-to-end pipeline (ingest → extract → build graph → export).

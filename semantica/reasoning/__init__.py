@@ -7,14 +7,26 @@ rule-based inference via Rete, SPARQL reasoning, abductive and deductive reasoni
 and native Datalog evaluation.
 """
 
-from .reasoner import Reasoner, InferenceResult, Rule, Fact, RuleType
-from .graph_reasoner import GraphReasoner
+from .datalog_reasoner import DatalogFact, DatalogReasoner, DatalogRule
 from .explanation_generator import (
     Explanation,
     ExplanationGenerator,
     Justification,
     ReasoningPath,
     ReasoningStep,
+)
+from .graph_reasoner import GraphReasoner
+from .reasoner import (
+    Action,
+    AssertAction,
+    CallAction,
+    EmitEventAction,
+    Fact,
+    InferenceResult,
+    Reasoner,
+    RetractAction,
+    Rule,
+    RuleType,
 )
 from .rete_engine import (
     AlphaNode,
@@ -25,9 +37,23 @@ from .rete_engine import (
     TerminalNode,
 )
 from .sparql_reasoner import SPARQLQueryResult, SPARQLReasoner
-
-from .datalog_reasoner import DatalogReasoner, DatalogFact, DatalogRule
-from .temporal_reasoning import IntervalRelation, TemporalInterval, TemporalReasoningEngine
+from .temporal_reasoning import (
+    IntervalRelation,
+    TemporalInterval,
+    TemporalReasoningEngine,
+)
+from .temporal_truth_maintenance import (
+    TemporalFactSnapshot,
+    TemporalTruthMaintenanceAdapter,
+)
+from .truth_maintenance import TruthMaintenanceSession
+from .truth_maintenance_types import (
+    Derivation,
+    FactExplanation,
+    FactSupport,
+    MaintenanceDelta,
+    TruthMaintenanceSnapshot,
+)
 
 __all__ = [
     # Reasoner facade
@@ -37,6 +63,12 @@ __all__ = [
     "Rule",
     "Fact",
     "RuleType",
+    # Rule-driven actions
+    "Action",
+    "AssertAction",
+    "RetractAction",
+    "CallAction",
+    "EmitEventAction",
     # Rete engine
     "ReteEngine",
     "ReteNode",
@@ -54,6 +86,16 @@ __all__ = [
     "TemporalInterval",
     "IntervalRelation",
     "TemporalReasoningEngine",
+    # Truth maintenance
+    "TruthMaintenanceSession",
+    "FactSupport",
+    "Derivation",
+    "FactExplanation",
+    "MaintenanceDelta",
+    "TruthMaintenanceSnapshot",
+    # Temporal truth maintenance
+    "TemporalTruthMaintenanceAdapter",
+    "TemporalFactSnapshot",
     # Explanation
     "ExplanationGenerator",
     "Explanation",

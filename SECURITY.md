@@ -2,17 +2,17 @@
 
 ## Supported Versions
 
-We actively support the following versions of Semantica with security updates:
+Security updates go to the latest release line. Older lines do not get fixes;
+upgrade to the latest release to receive them.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.2.3   | :white_check_mark: |
-| 0.2.2   | :white_check_mark: |
-| 0.2.1   | :white_check_mark: |
-| 0.2.0   | :white_check_mark: |
-| 0.1.1   | :white_check_mark: |
-| 0.1.0   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| Version | Python      | Supported          |
+| ------- | ----------- | ------------------ |
+| 0.8.x   | 3.11 – 3.13 | :white_check_mark: |
+| < 0.8   | 3.10 – 3.13 | :x:                |
+
+0.7.x is the last line that installs on Python 3.10, so Python 3.10 users
+receive no further fixes, including the Pillow 13 security fixes, which need
+Python 3.11. See the 0.8.0 entry in the CHANGELOG.
 
 ## Reporting a Vulnerability
 
@@ -153,7 +153,7 @@ that attack chain.
 - **Risk**: a PR merges without its security/CI checks passing.
   **Control**: merges require the `build`, `Analyze Python` (CodeQL), and `security-scan` checks to pass, in strict mode (checks must be re-run against the latest `main`).
 - **Risk**: a compromised scanner job reaches secrets or write access.
-  **Control**: scanning jobs (`CodeQL`, `security-scan.yml`, `security.yml`, `defender-for-devops.yml`) run with read-only, least-privilege permissions (typically `contents: read` + `security-events: write` only) and never share a job, environment, or secret scope with the publish job.
+  **Control**: scanning jobs (`CodeQL`, `security-scan.yml`, `defender-for-devops.yml`) run with read-only, least-privilege permissions (typically `contents: read` + `security-events: write` only) and never share a job, environment, or secret scope with the publish job.
 - **Risk**: secrets are committed accidentally.
   **Control**: GitHub secret scanning and push protection are both enabled at the repository level, rejecting pushes that contain recognizable credential patterns before they land in history.
 
@@ -164,8 +164,7 @@ Every scan below runs continuously in CI, not just at release time:
 - **CodeQL** (`security-and-quality` query pack) — Python source: injection, unsafe deserialization, and other code-level vulnerability classes. Runs in `codeql.yml` on every push/PR to `main` and weekly.
 - **Bandit** — Python-specific security anti-patterns (hardcoded secrets, unsafe `eval`/`pickle`, weak crypto, etc.); CI fails on any HIGH-severity finding. Runs in `security-scan.yml` on every push/PR to `main` and twice weekly.
 - **Semgrep** (`p/security` ruleset) — cross-language static-analysis security patterns. Runs in `security-scan.yml` on every push/PR to `main` and twice weekly.
-- **Safety** — known CVEs in Semantica's own installed dependencies, including optional LLM-provider extras such as LiteLLM; CI fails on any match. Runs in `security-scan.yml` on every push/PR to `main` and twice weekly.
-- **pip-audit** — independent, PyPA-maintained vulnerability database cross-check against installed dependencies (Safety and pip-audit use different advisory sources, so both run). Runs in `security.yml` weekly.
+- **pip-audit** — PyPA-maintained, OSV-backed vulnerability database cross-check against Semantica's pinned dependency tree, including optional LLM-provider extras such as LiteLLM; CI fails on any match. Runs in `security-scan.yml` on every push/PR to `main` and twice weekly, and can be triggered on demand via `workflow_dispatch`.
 - **Microsoft Defender for DevOps** (`eslint`, `templateanalyzer`, `terrascan`) — JavaScript/TypeScript lint-security rules and infrastructure-as-code misconfigurations. Runs in `defender-for-devops.yml` on every push/PR to `main` and weekly.
 - **Checkov** — Kubernetes, Helm, Dockerfile, GitHub Actions, and secrets-pattern IaC scanning; results upload to the same Security tab as CodeQL. Runs in `defender-for-devops.yml` on every push/PR to `main` and weekly.
 - **GitGuardian** — secret-detection check on every pull request, installed as a GitHub App integration (not a repo-local workflow). Runs on every PR.
@@ -230,6 +229,28 @@ We use automated tools to scan for vulnerabilities:
 - **Dependabot**: Automated dependency updates and security alerts
 - **GitHub Security Advisories**: Vulnerability tracking
 - **Manual Reviews**: Regular security audits
+
+### Accepted advisories
+
+Some dependency advisories cannot be fixed from inside this repository. Each
+one is recorded here with what it affects and when to revisit it, and its IDs
+are accepted in `osv-scanner.toml`.
+
+#### opentelemetry-api 1.43.0
+
+GHSA-xcq7-p3pf-p88h (CVE-2026-114603): `TraceState.from_header` parses an
+inbound W3C `tracestate` header in quadratic time. It is fixed in 1.45.1, but
+every google-adk release caps `opentelemetry-api<=1.44`. Overriding that cap
+in `[tool.uv]` makes pip's resolver reject `requirements-ci.txt`, so the fix
+waits on google-adk. The semgrep security-scan tool's own `~=1.37.0` pin is
+already overridden in `.github/requirements/security-scan-tools-overrides.txt`.
+
+- **Exposure**: Semantica never imports opentelemetry and its google-adk
+  integration runs no HTTP server, so no inbound `tracestate` header is
+  parsed.
+- **Revisit**: when google-adk allows 1.45.1. Accepted until 2027-01-23 in
+  `osv-scanner.toml` and in `IGNORED_VULN_IDS` in
+  `.github/workflows/security-scan.yml`.
 
 ## Best Practices for Users
 

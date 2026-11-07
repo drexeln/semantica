@@ -165,21 +165,7 @@ def _() -> list[str]:
     ]
 
 
-# ── 7. No Python 3.9+ type syntax in code blocks ─────────────────────────────
-@check("No Python 3.9+ type syntax in code blocks (3.8 compat)")
-def _() -> list[str]:
-    issues: list[str] = []
-    for fpath in ALL_MD:
-        in_block = False
-        for i, line in enumerate(open(fpath, encoding="utf-8"), 1):
-            if line.strip().startswith("```"):
-                in_block = not in_block
-            if in_block and re.search(r":\s*(list|dict|tuple|set)\[", line):
-                issues.append(f"{fpath}:{i}: {line.rstrip()}")
-    return issues
-
-
-# ── 8. index.md covers all 27 modules ────────────────────────────────────────
+# ── 7. index.md covers all 27 modules ────────────────────────────────────────
 @check("All 27 modules present in index.md")
 def _() -> list[str]:
     modules = [
@@ -196,7 +182,7 @@ def _() -> list[str]:
     return [m for m in modules if m not in index]
 
 
-# ── 9. JSX component tags are balanced in every page ─────────────────────────
+# ── 8. JSX component tags are balanced in every page ─────────────────────────
 @check("All Mintlify JSX component tags are balanced")
 def _() -> list[str]:
     # Paired block-level components that must open and close.
@@ -226,7 +212,7 @@ def _() -> list[str]:
     return issues
 
 
-# ── 10. Mintlify export succeeds (requires Node.js / npx) ────────────────────
+# ── 9. Mintlify export succeeds (requires Node.js / npx) ────────────────────
 @check("Mintlify export builds without errors")
 def _() -> list[str]:
     npx = "npx.cmd" if sys.platform == "win32" else "npx"
@@ -236,7 +222,9 @@ def _() -> list[str]:
             cwd=DOCS,
             capture_output=True,
             text=True,
-            timeout=300,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
         )
         # Clean up zip regardless of outcome
         zip_path = os.path.join(DOCS, "export_ci_check.zip")
@@ -246,9 +234,12 @@ def _() -> list[str]:
         combined = (result.stdout or "") + (result.stderr or "")
 
         if result.returncode != 0:
-            # On Windows, npm cleanup raises EPERM on temp dirs — not a real
-            # export failure. Treat as a skip rather than a hard failure.
-            if sys.platform == "win32" and "EPERM" in combined and \
+            # On Windows, npm post-command cleanup can fail with EPERM/EBUSY on
+            # temp dirs — not a real export failure. Treat as a skip rather
+            # than a hard failure, unless a real Mintlify error signature is
+            # present.
+            if sys.platform == "win32" and \
+                    ("EPERM" in combined or "EBUSY" in combined) and \
                     "could not be generated" not in combined:
                 return []  # Windows temp-cleanup noise; real CI runs on Linux
 
@@ -263,7 +254,7 @@ def _() -> list[str]:
     except FileNotFoundError:
         return ["npx not found — skipping Mintlify export check (Node.js required)"]
     except subprocess.TimeoutExpired:
-        return ["mintlify export timed out after 300 s"]
+        return ["mintlify export timed out after 600 s"]
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────

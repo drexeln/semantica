@@ -1,15 +1,15 @@
 ---
 title: "LLM Integrations"
-description: "Connect Semantica to Groq, OpenAI, Anthropic, HuggingFace, Novita AI, and 100+ LLM providers through a unified interface."
+description: "Connect Semantica to generative LLM providers and TypeSafe Jev typed decisions."
 ---
 
-Semantica exposes a unified provider interface — a single `.generate()` method — across Groq, OpenAI, Anthropic Claude, HuggingFace, Novita AI, and 100+ providers via LiteLLM. Use it when you need to swap providers for latency, accuracy, cost, or data-residency reasons without touching application code.
+Semantica exposes a unified generation interface — the same `.generate()`, `.generate_structured()` and `.generate_typed()` methods — across Groq, OpenAI, Anthropic Claude, HuggingFace, Novita AI, and 100+ providers via LiteLLM. It also provides a deliberately separate decision-only interface for TypeSafe Jev, whose typed Choice, Noul, and Score results are not text generations.
 
 ## What Are LLM Integrations?
 
-The `semantica.llms` module provides a unified interface for connecting to Large Language Model providers. Instead of learning different APIs for each provider, you use the same methods (`.generate()`, `.generate_structured()`) regardless of whether you're calling Groq, OpenAI, Anthropic, or local HuggingFace models.
+The `semantica.llms` module provides a unified interface for connecting to Large Language Model providers. Instead of learning different APIs for each generative provider, you use the same methods (`.generate()`, `.generate_structured()`, `.generate_typed()`) regardless of whether you're calling Groq, OpenAI, Anthropic, or local HuggingFace models. TypeSafe Jev is the decision-only exception: it exposes `.decide()` because it returns typed decisions rather than generated text.
 
-**Unified interface across providers:** All LLM providers in Semantica expose identical methods, so switching from OpenAI to Anthropic requires changing only the provider constructor, not your application code.
+**Unified interface across generative providers:** Generative LLM providers in Semantica expose identical methods, so switching from OpenAI to Anthropic requires changing only the provider constructor, not your application code. Jev remains separate so its calibrated probabilities and strict decision types are not flattened into a chat-completion response.
 
 **Provider wrappers vs semantic extraction provider strings:** The `semantica.llms` classes (`Groq`, `OpenAI`, `LiteLLM`, `HuggingFaceLLM`) are Python objects for text generation. The `semantica.semantic_extract` module accepts provider names as strings for entity and relationship extraction. Both approaches are covered in this guide.
 
@@ -19,7 +19,7 @@ The `semantica.llms` module provides a unified interface for connecting to Large
 
 **Reduced vendor lock-in.** Avoid tying your application to a single LLM provider's API. If pricing changes or service availability issues arise, switching providers is straightforward.
 
-**Consistent APIs.** Use the same `.generate()` and `.generate_structured()` methods across all providers instead of learning provider-specific interfaces.
+**Consistent APIs.** Use the same `.generate()`, `.generate_structured()`, and `.generate_typed()` methods across all providers instead of learning provider-specific interfaces.
 
 **Multi-provider workflows.** Run fast models for initial classification and expensive frontier models for complex reasoning in the same pipeline.
 
@@ -28,6 +28,7 @@ The `semantica.llms` module provides a unified interface for connecting to Large
 ## When To Use / When Not To Use
 
 **Use LLM integrations for:**
+
 - Text generation, summarization, and question-answering tasks
 - Complex reasoning that requires natural language understanding
 - Structured data extraction from unstructured text
@@ -35,6 +36,7 @@ The `semantica.llms` module provides a unified interface for connecting to Large
 - Tasks where context, ambiguity, or domain knowledge matter
 
 **Deterministic tools may be better for:**
+
 - Pattern matching that regular expressions can handle
 - Simple rule-based classification with clear criteria
 - Mathematical calculations or statistical analysis
@@ -42,13 +44,14 @@ The `semantica.llms` module provides a unified interface for connecting to Large
 - Data transformations with known logic
 
 **A full LLM may be unnecessary for:**
+
 - Simple keyword search or exact string matching
 - Deterministic workflows with predefined decision trees
 - High-frequency, low-latency operations where inference overhead matters
 - Tasks where explainability requires transparent rule-based logic
 
 <Info>
-  The providers in `semantica.llms` (`Groq`, `OpenAI`, `LiteLLM`, `HuggingFaceLLM`) are for text generation and `query_with_reasoning()`. For structured entity and relation extraction, `semantica.semantic_extract` accepts provider names as strings. Both patterns are covered here.
+  Generative providers in `semantica.llms` (`Groq`, `OpenAI`, `LiteLLM`, `HuggingFaceLLM`) are for text generation and `query_with_reasoning()`. `Jev` and `AsyncJev` are decision-only and are not drop-in `llm_provider=` values. For structured entity and relation extraction, `semantica.semantic_extract` accepts provider names as strings.
 </Info>
 
 ## Choosing a Provider
@@ -59,25 +62,122 @@ Four factors drive provider selection, each optimized for different use cases:
 
 **Accuracy** matters most in high-stakes decisions: clinical contraindication checks, credit committee reasoning, and legal document analysis. Frontier models like Claude or GPT-4 available through `LiteLLM` provide the strongest reasoning capabilities.
 
-**Data residency** constraints eliminate cloud providers for classified or HIPAA-regulated workloads. `HuggingFaceLLM` with local model paths enables fully air-gapped deployments without network calls.
+**Data residency** constraints eliminate cloud providers for classified or HIPAA-regulated workloads. `HuggingFaceLLM` with local model paths, or `Ollama` pointed at a local server, both enable fully air-gapped deployments without network calls.
 
 **Cost at scale** favors high-throughput providers like Novita AI for bulk extraction pipelines processing thousands of documents per hour where per-token costs accumulate quickly.
 
 The unified interface means you can prototype with Groq for speed, validate accuracy with Claude, and deploy to Azure OpenAI for compliance — without changing application code.
 
-## The Shared Interface
+## The Shared Generation Interface
 
-Every provider exposes the same two methods:
+Every generative provider exposes the same methods:
 
 ```python
 provider.generate(prompt: str, **kwargs) -> str
-provider.generate_structured(prompt: str, **kwargs) -> dict
+provider.generate_structured(prompt: str, **kwargs) -> dict | list
+provider.generate_typed(prompt: str, schema: Type[BaseModel], max_retries: int = 3, **kwargs) -> BaseModel
 provider.is_available() -> bool
 ```
 
-`generate()` returns a plain string. `generate_structured()` instructs the model to respond in JSON and returns a parsed `dict`. `is_available()` lets you health-check the provider before committing to a call — useful in retry logic and warm-up checks.
+`generate()` returns a plain string. `generate_structured()` instructs the model to respond in JSON and returns the parsed result — a `dict` for a top-level JSON object, or a `list` if the model returns a top-level JSON array. `generate_typed()` takes a Pydantic model, validates the model's output against it, and retries up to `max_retries` times with the validation error fed back into the prompt — reach for it when downstream code needs a guaranteed shape rather than best-effort JSON. `is_available()` lets you health-check the provider before committing to a call — useful in retry logic and warm-up checks.
 
-This means every place in Semantica that accepts an LLM — `query_with_reasoning()`, semantic extraction, custom reasoning loops — accepts any of these providers interchangeably.
+This means every place in Semantica that accepts a generative LLM — `query_with_reasoning()`, semantic extraction, custom reasoning loops — accepts any of these providers interchangeably. Jev is not part of this interface because it never returns free text.
+
+## Jev — Typed Decisions for Low-Latency Routing
+
+**TypeSafe Jev** is a System One model for typed decisions over application state. Use it for bounded routing, classification, binary checks, or scoring when the valid outcomes are known in advance. Use a chat LLM instead when the task needs an explanation, synthesis, open-ended text, or multi-step reasoning.
+
+<Warning>
+  Jev is an experimental, early-access provider. Pin and test the SDK version used by your deployment, choose confidence thresholds for your domain, and keep a human or reasoning-model escalation path for high-impact decisions.
+</Warning>
+
+<Warning>
+  TypeSafe SDK 0.7 wire logs include complete request and response bodies at `DEBUG`. Because `state` can contain financial, security, or personal data, keep the `typesafe_sdk` logger at `INFO` or higher in sensitive deployments. Setting the root logger to `DEBUG` can also expose these bodies unless the SDK logger has an explicit higher level.
+</Warning>
+
+```python
+import logging
+
+logging.getLogger("typesafe_sdk").setLevel(logging.INFO)
+```
+
+Install the optional dependency (Python 3.11 or newer, like Semantica itself):
+
+```bash
+pip install "semantica[llm-typesafe]"
+```
+
+Set `TYPESAFE_API_KEY`, or pass `api_key=` explicitly:
+
+```python
+from semantica.llms import Jev
+
+jev = Jev(model="jev-latest")  # reads TYPESAFE_API_KEY
+
+result = jev.decide(
+    state={
+        "amount_usd": 12_500,
+        "destination_country": "US",
+        "policy_flags": [],
+    },
+    question="How should this transaction be routed?",
+    kind="choice",
+    choices={
+        "approve": "All automatic-approval requirements are met.",
+        "escalate": "A person must review the transaction.",
+    },
+)
+
+print(result.value)          # "approve" or "escalate"
+print(result.confidence)     # routing certainty
+print(result.probabilities) # full Choice distribution
+print(result.request_id)     # retain for audit/support correlation
+```
+
+The three decision kinds have intentionally different result semantics:
+
+| Kind | Input criteria | `result.value` | Confidence semantics |
+| :--- | :--- | :--- | :--- |
+| Choice | Choice labels, optionally with descriptions | Selected label | SDK-provided confidence |
+| Noul | Optional `true` and `false` descriptions | Boolean using the 0.5 boundary | `abs(2 * probability - 1)`; `result.probability` preserves the raw probability of yes |
+| Score | Ordered rubric levels | Probability-weighted numeric score | SDK-provided confidence; the full distribution and legend are preserved |
+
+Semantica owns the reasoning, policy checks, escalation, and provenance around the decision. The provider does not silently call a fallback model:
+
+```python
+from semantica.context import ContextGraph
+
+graph = ContextGraph()
+threshold = 0.85
+
+if result.confidence < threshold:
+    route = "human_review"  # or invoke a reasoning LLM in caller code
+else:
+    route = str(result.value)
+
+decision_id = graph.record_decision(
+    category="transaction_routing",
+    scenario="Route wire transfer after evidence and policy evaluation",
+    reasoning="Semantica policy checks completed before the Jev routing step.",
+    outcome=route,
+    confidence=result.confidence,
+    decision_maker="jev:{}".format(result.model),
+    metadata={"typesafe_jev": result.to_dict()},
+)
+```
+
+For asynchronous applications, use `AsyncJev` with the same arguments and result type:
+
+```python
+from semantica.llms import AsyncJev
+
+async with AsyncJev() as jev:
+    result = await jev.decide(
+        state="The transaction was submitted from a known device.",
+        question="Does this transaction require manual review?",
+        kind="noul",
+    )
+```
 
 ## Groq — Fast Inference for Real-Time Agents
 
@@ -143,24 +243,149 @@ risk_data = oai.generate_structured(
 
 The default model `gpt-3.5-turbo` is fine for classification and light extraction. Switch to `gpt-4o` for complex multi-step regulatory reasoning or document understanding.
 
+## Anthropic — Complex Reasoning and Structured Extraction
+
+**Anthropic** provides the Claude model family, built with an emphasis on careful, instruction-following behavior and strong performance on multi-step reasoning, long-document analysis, and code-related tasks. Claude models tend to be more cautious about ambiguous instructions than other providers. That matters when the cost of a confidently wrong answer is high.
+
+The `Anthropic` provider wraps the Claude API. Reach for it when the task involves reasoning through several dependent steps (not just single-turn extraction), when you're processing long source documents that need to stay in context, or when you need schema-validated structured output rather than best-effort JSON.
+
+Install with `pip install "semantica[llm-anthropic]"` (or just `pip install anthropic`) before using this provider.
+
+```python
+from semantica.llms import Anthropic
+
+claude = Anthropic(model="claude-sonnet-4-6", api_key="YOUR_ANTHROPIC_KEY")
+# api_key falls back to the ANTHROPIC_API_KEY environment variable
+
+# is_available() only confirms a client was constructed from some key.
+# It does not validate the key or check network reachability - an
+# invalid or expired key still passes this check and fails at generate().
+if not claude.is_available():
+    raise RuntimeError("Anthropic provider not configured - set ANTHROPIC_API_KEY")
+
+# Plain generation - multi-step reasoning over a contract clause
+verdict = claude.generate(
+    "A vendor contract has a 30-day termination-for-convenience clause "
+    "but a 90-day data-return obligation that survives termination. "
+    "If the customer terminates on day 1, when must vendor-held data "
+    "be returned? Answer with the date basis only.",
+    temperature=0.1,
+)
+print(verdict)
+# "Day 120 from termination notice. The 90-day return period runs from
+#  the termination date (day 30), not from the notice date."
+
+# Structured, schema-validated output
+from pydantic import BaseModel
+
+class ContractRisk(BaseModel):
+    clause: str
+    risk_level: str
+    days_to_deadline: int
+
+risk = claude.generate_typed(
+    "Extract the termination clause risk from: vendor contract, "
+    "30-day termination for convenience, 90-day post-termination "
+    "data return obligation.",
+    schema=ContractRisk,
+)
+print(risk.risk_level, risk.days_to_deadline)
+# "medium" 90
+```
+
+Model selection follows the same tier structure as the other providers: a Haiku model for high-volume classification where cost matters more than depth, a Sonnet model as the default for most extraction and reasoning tasks, an Opus model when a task genuinely needs the deepest reasoning available and latency/cost are secondary. Check Anthropic's docs for the current model identifiers, since they're versioned and change over time.
+
+## Gemini — Long Context and Multimodal Input
+
+**Gemini** is Google's model family, with a context window large enough to hold entire codebases or long regulatory filings in a single call, and native support for image and document input alongside text. Reach for it when a task needs to reference a large amount of source material at once, or when the input isn't plain text.
+
+The `Gemini` provider tries the newer `google-genai` SDK first and falls back to the older `google-generativeai` package if that's what's installed. Install with `pip install "semantica[llm-gemini]"` (or `pip install google-genai`) before using this provider.
+
+```python
+from semantica.llms import Gemini
+
+gemini = Gemini(model="gemini-pro", api_key="YOUR_GEMINI_KEY")
+# api_key falls back to the GEMINI_API_KEY environment variable
+
+if not gemini.is_available():
+    raise RuntimeError("Gemini provider not configured - set GEMINI_API_KEY")
+
+response = gemini.generate(
+    "Summarize the key obligations in a standard NDA in three bullet points."
+)
+print(response)
+
+data = gemini.generate_structured(
+    "Extract the party names and effective date from: "
+    "This Agreement is entered into between Acme Corp and Globex LLC, "
+    "effective January 1, 2026."
+)
+print(data)
+```
+
+## Ollama — Local, Air-Gapped Inference
+
+**Ollama** runs models entirely on your own machine, with no API key and no outbound network call. It's the right choice for air-gapped environments, offline development, or any workload where the source data can't leave the local network.
+
+Unlike the other providers here, `Ollama` takes a `base_url` instead of an `api_key`. It talks to a local Ollama server over HTTP. Start the server with `ollama serve` and pull a model with `ollama pull llama2` before using this provider. Install the Python client with `pip install "semantica[llm-ollama]"` (or `pip install ollama`).
+
+```python
+from semantica.llms import Ollama
+
+llm = Ollama(model="llama2", base_url="http://localhost:11434")
+
+if not llm.is_available():
+    raise RuntimeError("Ollama provider not configured - is 'ollama serve' running?")
+
+response = llm.generate("Explain the difference between a hash map and a tree map.")
+print(response)
+```
+
+`is_available()` for Ollama does a real connectivity check (it calls the server's `list()` endpoint), unlike the API-key-based providers above, so a `False` here usually means the server isn't running rather than a missing credential.
+
+## DeepSeek — Budget Reasoning at Scale
+
+**DeepSeek** exposes an OpenAI-compatible API at a fraction of the cost of the larger US providers, with reasoning quality that holds up well for extraction and classification work. It's a reasonable default when you're processing a large volume of documents and don't need the deepest reasoning tier.
+
+Install with `pip install "semantica[llm-deepseek]"` (or `pip install openai`, since DeepSeek is accessed through the OpenAI client pointed at a different base URL).
+
+```python
+from semantica.llms import DeepSeek
+
+llm = DeepSeek(model="deepseek-chat", api_key="YOUR_DEEPSEEK_KEY")
+# api_key falls back to the DEEPSEEK_API_KEY environment variable
+
+if not llm.is_available():
+    raise RuntimeError("DeepSeek provider not configured - set DEEPSEEK_API_KEY")
+
+response = llm.generate("List three risks of using a floating IP in a Kubernetes ingress.")
+print(response)
+
+data = llm.generate_structured(
+    "Extract the CVE ID and affected product from: "
+    "CVE-2024-3400 affects PAN-OS GlobalProtect gateways."
+)
+print(data)
+```
+
 ## LiteLLM — One Interface, 100+ Providers
 
 **LiteLLM** is a universal adapter that provides a single interface to over 100 different LLM providers, including Anthropic Claude, Azure OpenAI, AWS Bedrock, Google Vertex AI, and local Ollama instances. It acts as a translation layer, converting your unified API calls into provider-specific requests, enabling easy switching between providers without code changes.
 
-`LiteLLM` is the Swiss Army knife. It wraps the `litellm` library, which speaks to every major provider using a unified completion API. The model string encodes both provider and model name: `"anthropic/claude-sonnet-4-20250514"`, `"azure/gpt-4o"`, `"bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"`, `"ollama/llama3.2"`. Change the string, change the provider — no other code changes needed.
+`LiteLLM` is the Swiss Army knife. It wraps the `litellm` library, which speaks to every major provider using a unified completion API. The model string encodes both provider and model name: `"anthropic/claude-sonnet-5"`, `"azure/gpt-4o"`, `"bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0"`, `"ollama/llama3.2"`. Change the string, change the provider — no other code changes needed.
 
 ```python
 from semantica.llms import LiteLLM
 
 # Anthropic Claude — highest accuracy for complex reasoning
-llm = LiteLLM(model="anthropic/claude-sonnet-4-20250514")
+llm = LiteLLM(model="anthropic/claude-sonnet-5")
 # Reads ANTHROPIC_API_KEY from environment
 
 # Azure OpenAI — compliance and data-residency requirements
 llm = LiteLLM(model="azure/gpt-4o", api_key="YOUR_AZURE_KEY")
 
 # AWS Bedrock — existing cloud agreement, no new vendor
-llm = LiteLLM(model="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+llm = LiteLLM(model="bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0")
 
 # Google Vertex AI
 llm = LiteLLM(model="vertex_ai/gemini-1.5-pro")
@@ -178,7 +403,7 @@ The environment-variable convention for each provider: `ANTHROPIC_API_KEY`, `AZU
 import os
 
 PROVIDER_MAP = {
-    "prod":    "anthropic/claude-sonnet-4-20250514",
+    "prod":    "anthropic/claude-sonnet-5",
     "staging": "openai/gpt-4o-mini",
     "local":   "ollama/llama3.2",
     "azure":   "azure/gpt-4o",
@@ -250,7 +475,7 @@ print("FAST: {}  (conf={:.0%})".format(fast_result["response"], fast_result["con
 
 # Tier 2: deep answer with Claude if confidence is below threshold
 if fast_result["confidence"] < 0.85:
-    deep_llm = LiteLLM(model="anthropic/claude-sonnet-4-20250514")
+    deep_llm = LiteLLM(model="anthropic/claude-sonnet-5")
     deep_result = context.query_with_reasoning(
         query, llm_provider=deep_llm, max_results=15, max_hops=3
     )
@@ -306,30 +531,32 @@ for t in triplets:
 
 ## Novita AI — Cost-Efficient Bulk Extraction
 
-Novita AI exposes an OpenAI-compatible API and is available as a built-in provider for the extraction layer. It is accessed differently from the `semantica.llms` classes — through `create_provider` from `semantica.semantic_extract.providers` — making it the right choice for high-volume NER pipelines where per-call cost matters.
+**Novita AI** exposes an OpenAI-compatible API at low per-call cost, making it a reasonable choice for high-volume NER pipelines where cost matters more than getting the single best answer.
+
+Install with `pip install "semantica[llm-novita]"` (or `pip install openai`, since Novita is accessed through the OpenAI client pointed at a different base URL).
 
 ```python
-from semantica.semantic_extract.providers import create_provider
+from semantica.llms import Novita
+
+llm = Novita(model="deepseek/deepseek-v3.2", api_key="YOUR_NOVITA_KEY")
+# api_key falls back to the NOVITA_API_KEY environment variable
+
+if not llm.is_available():
+    raise RuntimeError("Novita provider not configured - set NOVITA_API_KEY")
+
+response = llm.generate("Summarize the Basel III leverage ratio requirement.")
+
+data = llm.generate_structured(
+    "Extract drug names and dosages from: "
+    "Patient received warfarin 5mg daily, aspirin 75mg daily, metformin 500mg twice daily."
+)
+```
+
+Novita is also reachable as a provider name string for the NER interface, without going through the `Novita` class directly:
+
+```python
 from semantica.semantic_extract import NamedEntityRecognizer
 
-# create_provider pools instances — same key reuses the same object
-provider = create_provider(
-    "novita",
-    api_key="YOUR_NOVITA_KEY",       # or set NOVITA_API_KEY env var
-    model="deepseek/deepseek-v3.2",  # default model
-)
-
-if provider.is_available():
-    # Plain generation
-    response = provider.generate("Summarise the Basel III leverage ratio requirement.")
-
-    # Structured extraction — returns parsed dict
-    data = provider.generate_structured(
-        "Extract drug names and dosages from: "
-        "Patient received warfarin 5mg daily, aspirin 75mg daily, metformin 500mg twice daily."
-    )
-
-# Use Novita through the NER interface — provider name as string
 ner = NamedEntityRecognizer(
     methods=["llm"],
     provider="novita",
@@ -339,10 +566,8 @@ entities = ner.extract_entities(
     "CVE-2024-3400 is exploited by UNC3886 targeting PAN-OS GlobalProtect."
 )
 for e in entities:
-    print("{} ({}) — conf={:.2f}".format(e.text, e.label, e.confidence))
+    print("{} ({}) conf={:.2f}".format(e.text, e.label, e.confidence))
 ```
-
-Novita requires the `openai` Python client under the hood — install with `pip install "semantica[llm-openai]"` or `pip install openai`.
 
 ## Domain Examples
 
@@ -406,10 +631,10 @@ context.save("./classified_output/q4_analysis/")
 </Tab>
 
 <Tab title="Security — SOC/Incident">
-A SOC pipeline uses two providers at different tiers: Groq for sub-500ms initial triage that keeps the analyst in flow, and Anthropic Claude for deep ATT&CK analysis when Tier 1 confidence falls below the escalation threshold. The provider switch is determined programmatically — no manual handoff required.
+A SOC pipeline uses Semantica to collect the alert and applicable runbook evidence, Jev for the bounded Tier 1 routing decision, and Anthropic Claude for deep ATT&CK analysis when Jev is uncertain. The escalation policy stays in caller code; Jev never invokes the fallback itself.
 
 ```python
-from semantica.llms import Groq, LiteLLM
+from semantica.llms import Jev, LiteLLM
 from semantica.context import AgentContext, ContextGraph
 from semantica.vector_store import VectorStore
 
@@ -422,12 +647,13 @@ context = AgentContext(
     decision_tracking=True,
 )
 
-# Preload MITRE ATT&CK runbook knowledge
-context.store([
+# Preload MITRE ATT&CK runbook evidence
+runbook = [
     "T1087.002 (Domain Account Discovery): anomalous LDAP enumeration — isolate source host, reset service account passwords",
     "T1053.005 (Scheduled Task/Job): encoded PowerShell via wmiprvse.exe — collect task XML, check persistence keys, notify IR",
     "T1021.002 (SMB/Windows Admin Shares): PsExec lateral movement to DC — immediate host isolation, reset service accounts",
-])
+]
+context.store(runbook)
 
 alert = (
     "SIEM Alert: host ws-finance-03, user jsmith — scheduled task with base64-encoded PowerShell. "
@@ -435,18 +661,23 @@ alert = (
 )
 context.store(alert, metadata={"type": "alert", "severity": "high"})
 
-# Tier 1: fast triage with Groq — target < 500ms end-to-end
-fast_llm = Groq(model="llama-3.1-8b-instant", api_key="YOUR_GROQ_KEY")
-triage = context.query_with_reasoning(
-    "Is this alert a true positive? One sentence verdict and confidence.",
-    llm_provider=fast_llm,
-    max_results=5,
+# Tier 1: a bounded Jev decision over the alert and policy/runbook state
+fast_decider = Jev(model="jev-latest")  # reads TYPESAFE_API_KEY
+triage = fast_decider.decide(
+    state={"alert": alert, "applicable_runbook": runbook[1]},
+    question="How should the SOC route this alert?",
+    kind="choice",
+    choices={
+        "true_positive": "Evidence strongly matches malicious scheduled-task activity.",
+        "benign": "Evidence supports an authorized administrative action.",
+        "escalate": "Evidence is insufficient or conflicting; an analyst must review it.",
+    },
 )
-print("TRIAGE: {} (conf={:.0%})".format(triage["response"], triage["confidence"]))
+print("TRIAGE: {} (conf={:.0%})".format(triage.value, triage.confidence))
 
-# Tier 2: escalate to Claude for deep analysis if Tier 1 is uncertain
-if triage["confidence"] < 0.88:
-    deep_llm = LiteLLM(model="anthropic/claude-sonnet-4-20250514")
+# Tier 2: caller-controlled escalation to Claude when Jev is uncertain
+if triage.value == "escalate" or triage.confidence < 0.88:
+    deep_llm = LiteLLM(model="anthropic/claude-sonnet-5")
     deep = context.query_with_reasoning(
         "Full MITRE ATT&CK analysis of this alert: identify the attack chain, "
         "blast radius, affected systems, and recommended containment steps.",
@@ -455,16 +686,24 @@ if triage["confidence"] < 0.88:
         max_hops=3,
     )
     print("DEEP ANALYSIS: {}".format(deep["response"]))
+    outcome = "escalated_tier2"
+    confidence = deep["confidence"]
+    reasoning = deep["reasoning_path"]
+else:
+    outcome = str(triage.value)
+    confidence = triage.confidence
+    reasoning = "Semantica evidence and runbook policy were evaluated before Jev routing."
 
-    context.record_decision(
-        category="escalation",
-        scenario="Scheduled task T1053.005 on ws-finance-03 — Tier 1 conf {:.0%}".format(triage["confidence"]),
-        reasoning=deep["reasoning_path"],
-        outcome="escalated_tier2",
-        confidence=deep["confidence"],
-        entities=["ws-finance-03", "jsmith", "T1053.005"],
-        decision_maker="soc_pipeline_v3",
-    )
+context.record_decision(
+    category="soc_triage",
+    scenario="Scheduled task T1053.005 on ws-finance-03 — Jev conf {:.0%}".format(triage.confidence),
+    reasoning=reasoning,
+    outcome=outcome,
+    confidence=confidence,
+    entities=["ws-finance-03", "jsmith", "T1053.005"],
+    decision_maker="jev:{}".format(triage.model),
+    cross_system_context={"typesafe_jev": triage.to_dict()},
+)
 ```
 
 </Tab>
@@ -502,7 +741,7 @@ for d in drugs:
 # trastuzumab (conf=0.98), pertuzumab (conf=0.97), docetaxel (conf=0.96)
 
 # Report synthesis with Claude — switch to azure/gpt-4o for HIPAA by changing one string
-report_llm = LiteLLM(model="anthropic/claude-sonnet-4-20250514")
+report_llm = LiteLLM(model="anthropic/claude-sonnet-5")
 # For HIPAA-constrained Azure deployment:
 # report_llm = LiteLLM(model="azure/gpt-4o", api_key="YOUR_AZURE_KEY")
 
@@ -554,7 +793,7 @@ question = (
 
 # Two-provider consensus — same query, same graph, different LLMs
 gpt4o  = OpenAI(model="gpt-4o", api_key="YOUR_OAI_KEY")
-claude = LiteLLM(model="anthropic/claude-sonnet-4-20250514")
+claude = LiteLLM(model="anthropic/claude-sonnet-5")
 
 answer_a = context.query_with_reasoning(question, llm_provider=gpt4o,  max_results=10)
 answer_b = context.query_with_reasoning(question, llm_provider=claude, max_results=10)
@@ -583,7 +822,11 @@ for src in best["sources"]:
 
 **Using LLMs for deterministic pattern matching that regex can handle.** If your task is extracting email addresses, phone numbers, or other pattern-based entities, regular expressions are faster, cheaper, and more reliable than LLM extraction. Use LLMs when context, ambiguity, or domain knowledge matter for correct interpretation.
 
-**Not validating structured outputs.** The `generate_structured()` method returns parsed JSON, but LLMs can still produce malformed or incomplete structures. Always validate the returned dictionary against your expected schema before using the data downstream.
+**Not validating structured outputs.** The `generate_structured()` method returns parsed JSON (a dict, or a list for a top-level array), but LLMs can still produce malformed or incomplete structures. Validate the result against your expected schema before using it downstream — or use `generate_typed()`, which validates against a Pydantic model for you.
+
+**Treating a Noul probability as routing confidence.** Noul returns the probability of yes, so both `0.01` and `0.99` are highly certain while `0.5` is maximally uncertain. Use `result.probability` for the raw yes-probability and `result.confidence` for Semantica's derived routing certainty.
+
+**Using Jev when the output must explain itself.** Jev makes bounded typed decisions and does not generate reasoning text. Build the evidence and policy context in Semantica, use a reasoning LLM or human review when an explanation is required, and record both steps in provenance.
 
 **Switching providers without testing prompt behavior.** Different models respond differently to the same prompt. A prompt optimized for GPT-4 may produce poor results with Llama or Claude. When switching providers, test your prompts and adjust temperature, instructions, or examples as needed.
 
@@ -591,7 +834,7 @@ for src in best["sources"]:
 
 ## Related Guides
 
-- [Agent Memory](agent-memory) — using `query_with_reasoning()` with any LLM provider for graph-grounded retrieval
-- [Multi-Agent Systems](multi-agent) — wiring different LLM providers to different agent tiers in a shared-graph pipeline
-- [Semantic Extraction](semantic-extraction) — LLM-powered NER, relation extraction, event detection, and triplet extraction
-- [GraphRAG](graphrag) — multi-hop graph reasoning with `query_with_reasoning()`
+- [Agent Memory](/guides/agent-memory) — using `query_with_reasoning()` with any LLM provider for graph-grounded retrieval
+- [Multi-Agent Systems](/guides/multi-agent) — wiring different LLM providers to different agent tiers in a shared-graph pipeline
+- [Semantic Extraction](/guides/semantic-extraction) — LLM-powered NER, relation extraction, event detection, and triplet extraction
+- [GraphRAG](/guides/graphrag) — multi-hop graph reasoning with `query_with_reasoning()`

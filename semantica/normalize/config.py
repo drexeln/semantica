@@ -71,10 +71,11 @@ class NormalizeConfig:
                         self._configs.update(data.get("normalize", {}))
                         self._method_configs.update(data.get("normalize_methods", {}))
                 elif config_file.endswith(".toml"):
-                    import toml
+                    # tomllib needs a binary file.
+                    import tomllib
 
-                    with open(config_file, "r") as f:
-                        data = toml.load(f) or {}
+                    with open(config_file, "rb") as f:
+                        data = tomllib.load(f) or {}
                         if "normalize" in data:
                             self._configs.update(data["normalize"])
                         if "normalize_methods" in data:
@@ -98,7 +99,7 @@ class NormalizeConfig:
             if value:
                 try:
                     if type_func == bool:
-                        self._configs[config_key] = value.lower() in (
+                        self._configs[config_key] = value.strip().lower() in (
                             "true",
                             "1",
                             "yes",
@@ -113,8 +114,8 @@ class NormalizeConfig:
         for key, value in os.environ.items():
             if key.startswith(env_prefix) and key not in env_mappings:
                 config_key = key[len(env_prefix) :].lower()
-                if value.lower() in ("true", "false"):
-                    self._configs[config_key] = value.lower() == "true"
+                if value.strip().lower() in ("true", "false"):
+                    self._configs[config_key] = value.strip().lower() == "true"
                 elif value.isdigit():
                     self._configs[config_key] = int(value)
                 else:
@@ -136,12 +137,12 @@ class NormalizeConfig:
         value = os.getenv(env_key)
         if value:
             try:
-                if isinstance(default, int):
+                if isinstance(default, bool):
+                    return value.strip().lower() in ("true", "1", "yes", "on")
+                elif isinstance(default, int):
                     return int(value)
                 elif isinstance(default, float):
                     return float(value)
-                elif isinstance(default, bool):
-                    return value.lower() in ("true", "1", "yes", "on")
                 return value
             except (ValueError, TypeError):
                 pass

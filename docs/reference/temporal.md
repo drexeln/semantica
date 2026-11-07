@@ -4,6 +4,11 @@ description: "Bi-temporal facts, point-in-time snapshots, Allen interval algebra
 icon: "clock"
 ---
 
+For rule-backed conclusions that must follow evidence expiration and corrections,
+see [Temporal Truth Maintenance](/reference/temporal_truth_maintenance). The opt-in
+adapter uses independent `valid_at` and `known_at` coordinates and keeps historical
+queries separate from the live reasoning state.
+
 Temporal Intelligence gives your knowledge graph a complete understanding of *when* — not just what is true, but when it was true in the real world, when it was recorded, and how facts have evolved over time.
 
 Shipped across **v0.3.0** (context temporal validity) and **v0.4.0** (full temporal stack), the system covers five layers:
@@ -350,8 +355,9 @@ Each pattern dict has: `pattern_type`, `signature` (tuple of node IDs), `frequen
 `TemporalReasoningEngine` operates on `TemporalInterval` objects — a frozen dataclass with `start: datetime` and `end: datetime | TemporalBound`:
 
 ```python
-from semantica.kg import (
-    TemporalReasoningEngine, TemporalInterval, IntervalRelation, TemporalBound
+from semantica.kg import TemporalBound
+from semantica.reasoning import (
+    TemporalReasoningEngine, TemporalInterval, IntervalRelation
 )
 from datetime import datetime, timezone
 
@@ -874,10 +880,10 @@ kg:
       engine: allen                   # allen | point_in_time_only
 ```
 
-- [Knowledge Graph Module](kg) — Core graph construction, `GraphBuilder`, analytics.
-- [Context Module](context) — Decision temporal windows and `find_active_nodes()`.
-- [Provenance](provenance) — W3C PROV-O lineage stamped alongside temporal metadata.
-- [Export](export) — OWL, Turtle, JSON-LD, and Parquet export with temporal annotations.
+- [Knowledge Graph Module](/reference/kg) — Core graph construction, `GraphBuilder`, analytics.
+- [Context Module](/reference/context) — Decision temporal windows and `find_active_nodes()`.
+- [Provenance](/reference/provenance) — W3C PROV-O lineage stamped alongside temporal metadata.
+- [Export](/reference/export) — OWL, Turtle, JSON-LD, and Parquet export with temporal annotations.
 
 - [Temporal Knowledge Graphs](https://github.com/semantica-agi/semantica/blob/main/cookbook/advanced/10_Temporal_Knowledge_Graphs.ipynb) — Temporal reasoning and Allen algebra · Advanced
 - [Context Module](https://github.com/semantica-agi/semantica/blob/main/cookbook/introduction/19_Context_Module.ipynb) — Including temporal decision windows · Intermediate

@@ -6,9 +6,21 @@ enabling users to interact with the framework via terminal commands.
 """
 
 import json
+import contextlib
 import os
+import re
 import sys
 import time
+
+try:  # POSIX advisory locking
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows advisory locking
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 # Reconfigure stdout/stderr to UTF-8 on Windows before any other import
 # captures sys.stdout (Rich, Click). This prevents UnicodeEncodeError from
@@ -19,9 +31,13 @@ if sys.platform == "win32":
     if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import ast
 from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    Optional, Sequence, Tuple)
 
 import yaml
 
@@ -43,6 +59,30 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
+
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
+# pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
+# 3.10 was dropped in 0.8.0: it is past end of life and Pillow 13, which has
+# the security fixes 12.x lacks, needs 3.11 (#2067).
+MIN_PYTHON = (3, 11)
+MAX_PYTHON_EXCLUSIVE = (3, 14)
+
+
+def _python_version_check(version: Sequence[int]) -> Tuple[str, Optional[str]]:
+    """Return ``(status, hint)`` for an interpreter ``(major, minor, ...)``."""
+    supported = (
+        f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+        f"-{MAX_PYTHON_EXCLUSIVE[0]}.{MAX_PYTHON_EXCLUSIVE[1] - 1}"
+    )
+    major_minor = (version[0], version[1])
+    if major_minor < MIN_PYTHON:
+        return "fail", f"upgrade to Python {supported}"
+    if major_minor >= MAX_PYTHON_EXCLUSIVE:
+        return "warn", f"Python {supported} is supported; newer versions are untested"
+    return "ok", None
 
 # ─── Visual style constants ───────────────────────────────────────────────────
 _BRAND    = "bold blue"
@@ -95,7 +135,26 @@ _ERROR_HINTS: Dict[type, str] = {
 }
 
 
+def _json_error_mode() -> bool:
+    """True when this invocation promised machine-readable stdout.
+
+    Covers both the global ``--json`` flag (stored on the CLI context) and a
+    subcommand's local ``--json`` flag (uniformly named ``local_json``).
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    if ctx.params.get("local_json"):
+        return True
+    return isinstance(ctx.obj, CLIContext) and ctx.obj.json_output
+
+
 def _show_error_card(title: str, detail: str, hint: Optional[str] = None) -> None:
+    if _json_error_mode():
+        # --json promises machine-readable stdout with errors on stderr, so
+        # emit a structured error line there instead of a Rich panel.
+        click.echo(json.dumps({"error": detail, "type": title}), err=True)
+        return
     body = f"[bold]{title}[/bold]\n[{_DIM}]{detail}[/{_DIM}]"
     if hint:
         body += f"\n\n[{_KEY}]→[/{_KEY}] [{_DIM}]{hint}[/{_DIM}]"
@@ -105,7 +164,7 @@ def _show_error_card(title: str, detail: str, hint: Optional[str] = None) -> Non
 
 
 def _run_with_error_handling(action: Callable[[], None]) -> None:
-    """Run a CLI action with Rich error cards on failure."""
+    """Run a CLI action with error cards (or JSON-mode stderr errors) on failure."""
     try:
         action()
     except click.ClickException as exc:
@@ -153,6 +212,24 @@ def _load_config_data(file_path: Path) -> Dict[str, Any]:
     return config_data
 
 
+def default_config_path() -> Path:
+    """The config file `semantica init` writes, loaded when --config is absent."""
+    return Path.home() / ".semantica" / "config.yaml"
+
+
+def _resolve_config_path(config_path: Optional[str]) -> Optional[str]:
+    """Return the config file to load: --config, else init's file if it exists.
+
+    Without this, `semantica init` wrote ``~/.semantica/config.yaml`` and nothing
+    ever read it — so accepting its defaults still left every command using the
+    built-in fallback rather than the backend the user had just chosen (#1481).
+    """
+    if config_path:
+        return config_path
+    default = default_config_path()
+    return str(default) if default.is_file() else None
+
+
 def _build_runtime_config(
     config_path: Optional[str],
     log_level: Optional[str],
@@ -160,8 +237,9 @@ def _build_runtime_config(
     """Resolve CLI config from file plus global flag overrides."""
     config_manager = ConfigManager()
 
-    if config_path:
-        config_data = _load_config_data(Path(config_path))
+    resolved_path = _resolve_config_path(config_path)
+    if resolved_path:
+        config_data = _load_config_data(Path(resolved_path))
     else:
         config_data = {}
 
@@ -282,16 +360,20 @@ def _run_build(cli_ctx: CLIContext, sources: Sequence[str]) -> None:
         return
 
     framework = _get_framework(cli_ctx)
+    # Every build call is kept: the multi-source progress loop below calls
+    # build_knowledge_base once per file, and keeping only the last result
+    # would make the empty-graph check and the reported counts reflect one
+    # file instead of the whole build.
+    results: List[Dict[str, Any]] = []
     if cli_ctx.quiet or cli_ctx.json_output:
-        result = framework.build_knowledge_base(sources=list(sources))
+        results.append(framework.build_knowledge_base(sources=list(sources)))
     elif len(sources) == 1:
         with console.status(
             f"[{_DIM}]Building knowledge base from {Path(sources[0]).name}…[/{_DIM}]",
             spinner="dots",
         ):
-            result = framework.build_knowledge_base(sources=list(sources))
+            results.append(framework.build_knowledge_base(sources=list(sources)))
     elif not cli_ctx.json_output:
-        result: Dict[str, Any] = {}
         with Progress(
             SpinnerColumn(),
             TextColumn("[{task.description}]", style=_DIM),
@@ -304,13 +386,41 @@ def _run_build(cli_ctx: CLIContext, sources: Sequence[str]) -> None:
             task = progress.add_task("waiting", total=len(sources))
             for src in sources:
                 progress.update(task, description=Path(src).name)
-                result = framework.build_knowledge_base(sources=[src])
+                results.append(framework.build_knowledge_base(sources=[src]))
                 progress.advance(task)
 
-    stats = result.get("statistics", {}) if isinstance(result, dict) else {}
-    processed = stats.get("sources_processed")
+    results = [r for r in results if isinstance(r, dict)]
+    processed_counts = [
+        r.get("statistics", {}).get("sources_processed") for r in results
+    ]
+    processed_counts = [c for c in processed_counts if c is not None]
+    processed = sum(processed_counts) if processed_counts else None
+
+    # A source count alone does not mean anything was built: with no pipeline
+    # configured the default pipeline passes its input through untouched, so
+    # every source is "processed" and the graph stays empty. Reporting success
+    # there hid the failure completely (#1352). Only results that actually
+    # carry a knowledge_graph are judged; a result without one is not evidence
+    # of an empty graph.
+    graphs = [r["knowledge_graph"] or {} for r in results if "knowledge_graph" in r]
+    entity_count = sum(len(g.get("entities") or []) for g in graphs)
+    relationship_count = sum(len(g.get("relationships") or []) for g in graphs)
+
+    if graphs and processed and not entity_count and not relationship_count:
+        raise click.ClickException(
+            f"{processed} source(s) processed but the knowledge graph is empty "
+            "— no entities or relationships were extracted. This usually means "
+            "no pipeline was configured, so the sources were read but never "
+            "parsed or extracted. Supply a pipeline with --config, or use "
+            "'semantica extract' to check the sources yield entities."
+        )
+
     if processed is not None:
-        _ok(cli_ctx, f"Knowledge base built — {processed} source(s) processed.")
+        _ok(
+            cli_ctx,
+            f"Knowledge base built — {processed} source(s) processed, "
+            f"{entity_count} entities, {relationship_count} relationships.",
+        )
     else:
         _ok(cli_ctx, "Knowledge base build completed.")
 
@@ -338,7 +448,7 @@ def _run_build_command(
             allow_file_fallback=False,
         )
         command_ctx = CLIContext(
-            config_path=command_config_path,
+            config_path=_resolve_config_path(command_config_path),
             config=cmd_config,
             log_level=cli_ctx.log_level,
             log_level_override=cli_ctx.log_level_override,
@@ -445,13 +555,8 @@ def _show_startup(cli_ctx: CLIContext) -> None:
     if cli_ctx.quiet or cli_ctx.json_output:
         return
     cfg = cli_ctx.config.to_dict()
-    graph_store = (
-        cli_ctx.store_backend or cfg.get("graph_db", {}).get("backend", "memory")
-    )
-    vector_store = (
-        cli_ctx.vector_store_backend
-        or cfg.get("vector_store", {}).get("backend", "faiss")
-    )
+    graph_store = _resolve_graph_backend(cli_ctx)
+    vector_store = _configured_vector_backend(cli_ctx) or _DEFAULT_VECTOR_BACKEND
     profile = cfg.get("profile", "default")
 
     console.print()
@@ -553,10 +658,11 @@ def main(
         # Reinitialize the module-level console if --no-color was requested so
         # all subsequent console.print() calls in this invocation respect the flag.
         if no_color:
-            global console  # noqa: PLW0603
+            global console, err_console  # noqa: PLW0603
             console = Console(no_color=True)
+            err_console = Console(stderr=True, no_color=True)
         ctx.obj = CLIContext(
-            config_path=config_path,
+            config_path=_resolve_config_path(config_path),
             config=config,
             log_level=effective_log_level,
             log_level_override=log_level.upper() if log_level else None,
@@ -718,6 +824,42 @@ def shell(ctx: click.Context) -> None:
             _warn(cli_ctx, f"Error: {exc}")
 
 
+def _plain_release(version: str) -> Optional[Tuple[int, ...]]:
+    """Parse a plain X.Y.Z release into a comparable tuple, or None.
+
+    Trailing zero components are dropped so 0.8 and 0.8.0 compare equal.
+    """
+    if not re.fullmatch(r"\d+(\.\d+)*", version):
+        return None
+    parts = [int(p) for p in version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _compare_versions(a: str, b: str) -> Optional[int]:
+    """Compare two version strings: 1 if a > b, 0 if equal, -1 if a < b.
+
+    Uses PEP 440 ordering when packaging is installed. It is not a core
+    dependency (#1513), so without it only plain X.Y.Z releases are ordered.
+    Returns None when no ordering can be established (e.g. a missing release
+    tag), so callers never guess an update from string equality.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        ra, rb = _plain_release(a), _plain_release(b)
+        if ra is None or rb is None:
+            return 0 if a == b else None
+        return (ra > rb) - (ra < rb)
+
+    try:
+        va, vb = Version(a), Version(b)
+    except InvalidVersion:
+        return None
+    return (va > vb) - (va < vb)
+
+
 @main.command()
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -741,20 +883,36 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
         tag: str = data.get("tag_name", "unknown")
         body: str = data.get("body", "").strip()
         html_url: str = data.get("html_url", "")
-        latest = tag.lstrip("v")
+        latest = tag.removeprefix("v")
         current = __version__
+        order = _compare_versions(latest, current)
+        update_available = None if order is None else order > 0
 
         if _is_json(cli_ctx, local_json):
-            _jecho({"current": current, "latest": latest, "url": html_url, "notes": body})
+            _jecho({
+                "current": current,
+                "latest": latest,
+                "update_available": update_available,
+                "url": html_url,
+                "notes": body,
+            })
             return
 
-        up_to_date = latest == current
-        status = (
-            f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
-            if up_to_date
-            else f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
-                 f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
-        )
+        if order is None:
+            status = f"[{_DIM}]Could not compare {current} with release {tag}[/{_DIM}]"
+        elif order > 0:
+            status = (
+                f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
+                f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
+            )
+        elif order == 0:
+            status = f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
+        else:
+            # A dev or unreleased build sorts above the latest published release.
+            status = (
+                f"[{_SUCCESS}]You are ahead of the latest release "
+                f"({current} > {latest})[/{_SUCCESS}]"
+            )
         console.print(
             Panel(
                 Text.from_markup(
@@ -767,16 +925,28 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
                 padding=(1, 2),
             )
         )
-        if html_url and not up_to_date:
+        if html_url and update_available:
             console.print(f"  [{_DIM}]Full notes: {html_url}[/{_DIM}]")
 
     _run_with_error_handling(_action)
 
 
+class _DeepEmbeddingFailure(Exception):
+    """A deep-probe failure from doctor's embedding checks.
+
+    Marks failures that happened AFTER the backend imported cleanly — model
+    load, probe, or runtime problems — so the check's hint can point at the
+    real remediation instead of `pip install`.
+    """
+
+
 @main.command()
 @click.option("--json", "local_json", is_flag=True, default=False)
+@click.option("--deep-embeddings", "deep_embeddings", is_flag=True, default=False,
+              help="Also instantiate the local embedding backends and embed a probe "
+                   "text (catches backends that import cleanly but cannot load).")
 @click.pass_obj
-def doctor(cli_ctx: CLIContext, local_json: bool) -> None:
+def doctor(cli_ctx: CLIContext, local_json: bool, deep_embeddings: bool) -> None:
     """Run a health check on all Semantica components and backends."""
     import importlib.metadata
     cli_ctx = _require_ctx(cli_ctx)
@@ -787,6 +957,16 @@ def doctor(cli_ctx: CLIContext, local_json: bool) -> None:
         try:
             note = fn()
             return label, "ok", note, None
+        except _DeepEmbeddingFailure as exc:
+            # A deep-probe failure means the package IMPORTED fine: the pip
+            # hint would be the wrong remediation for what is actually a
+            # runtime/model-load problem (broken torch, failed model
+            # download, missing shared libs).
+            return label, "fail", str(exc), (
+                "runtime/model-load failure — reinstalling the package usually "
+                "does not help; check the warnings above (torch install, model "
+                "download, disk space)"
+            )
         except Exception as exc:
             return label, "fail", str(exc), hint
 
@@ -795,9 +975,9 @@ def doctor(cli_ctx: CLIContext, local_json: bool) -> None:
 
         # Python version
         pv = sys.version_info
-        checks.append(("Python", "ok" if pv >= (3, 8) else "fail",
-                        f"{pv.major}.{pv.minor}.{pv.micro}",
-                        "upgrade to Python 3.8+" if pv < (3, 8) else None))
+        py_status, py_hint = _python_version_check(pv)
+        checks.append(("Python", py_status,
+                        f"{pv.major}.{pv.minor}.{pv.micro}", py_hint))
 
         # Semantica version
         checks.append(("semantica", "ok", __version__, None))
@@ -809,23 +989,138 @@ def doctor(cli_ctx: CLIContext, local_json: bool) -> None:
 
         # Graph store reachability
         def _graph() -> str:
-            cfg = cli_ctx.config.to_dict()
-            backend = cli_ctx.store_backend or cfg.get("graph_db", {}).get("backend", "memory")
-            if backend == "memory":
-                return "memory (always available)"
+            backend = _resolve_graph_backend(cli_ctx)
+            if backend == MEMORY_GRAPH_BACKEND:
+                # No server to reach; prove the graph file is readable instead,
+                # which is the only way this backend can actually fail.
+                # Keep this short: the Note column truncates at 80 columns.
+                graph = _load_context_graph(cli_ctx)
+                count = len(graph.get_nodes_by_label("decision"))
+                return f"memory, {count} decision(s)"
             gs = _get_graph_store(cli_ctx)
             gs.ping() if hasattr(gs, "ping") else gs.connect()
             return f"{backend} reachable"
         checks.append(_check("Graph store", _graph, hint="run 'semantica store list' to see configured backends"))
 
-        # Vector store
+        # Vector store: the one CLI commands build (--vector-store or
+        # vector_store.backend). The MCP server's own store is checked below.
+        configured_vector = _configured_vector_backend(cli_ctx)
+        mcp_configured = _mcp_stores_configured()
+
         def _vector() -> str:
-            cfg = cli_ctx.config.to_dict()
-            backend = cli_ctx.vector_store_backend or cfg.get("vector_store", {}).get("backend", "faiss")
+            backend = configured_vector or _DEFAULT_VECTOR_BACKEND
             if backend == "faiss":
                 import faiss  # noqa: F401
+            elif backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
             return f"{backend} importable"
-        checks.append(_check("Vector store", _vector, hint="pip install semantica[vectorstore-…]"))
+        vector_row = _check(
+            "Vector store", _vector, hint="pip install semantica[vectorstore-…]"
+        )
+        if vector_row[1] == "fail" and not configured_vector and mcp_configured:
+            # Nothing asked the CLI for faiss and this deployment configures
+            # the MCP server instead, so the missing default is not an error
+            # for it — only for CLI vector commands (#1818).
+            vector_row = (
+                "Vector store", "warn", f"{vector_row[2]} (CLI default)",
+                "set vector_store.backend to use CLI vector commands",
+            )
+        checks.append(vector_row)
+
+        # MCP server stores (#1818): configured only through the environment
+        # and resolved by the server's own session helpers, so this reports
+        # exactly what `semantica mcp` would build.
+        def _mcp_vector() -> str:
+            from semantica_mcp.mcp.session import resolve_vector_backend
+
+            backend, _ = resolve_vector_backend()
+            if backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
+            return backend
+
+        def _mcp_graph() -> str:
+            from semantica_mcp.mcp.session import kg_file_to_load, kg_path
+            from .context import ContextGraph
+
+            if not kg_path():
+                return "in-memory, not persisted (SEMANTICA_KG_PATH unset)"
+            path = kg_file_to_load()
+            if path is None:
+                return "new graph, created on first save"
+            graph = ContextGraph()
+            try:
+                graph.load_from_file(path)
+            except Exception as exc:
+                # The server would start empty and refuse to save over it.
+                raise RuntimeError(
+                    f"cannot load {path}: {exc}; persistence would be disabled"
+                ) from exc
+            return f"{len(graph.get_nodes_by_label('decision'))} decision(s)"
+
+        if mcp_configured:
+            checks.append(_check(
+                "MCP vector store", _mcp_vector,
+                hint="check SEMANTICA_VECTOR_*; sqlite needs "
+                     "pip install 'semantica[vectorstore-sqlite]'",
+            ))
+            checks.append(_check(
+                "MCP graph", _mcp_graph,
+                hint="fix or move the file at SEMANTICA_KG_PATH",
+            ))
+
+        # Embedding backends (#994): `doctor` used to report all green while
+        # every local embedding backend was non-functional — import success
+        # says nothing about model loading. Default checks stay cheap
+        # (import + version); --deep-embeddings (or
+        # SEMANTICA_DOCTOR_DEEP_EMBEDDINGS=1) instantiates the backend through
+        # TextEmbedder and embeds a probe, which is the only level that
+        # catches a backend that imports cleanly but cannot actually load.
+        deep = deep_embeddings or os.environ.get("SEMANTICA_DOCTOR_DEEP_EMBEDDINGS", "").strip().lower() in ("1", "true", "yes", "on")
+
+        def _embedding_backend(method: str) -> str:
+            if method == "sentence_transformers":
+                import sentence_transformers  # noqa: F401
+                try:
+                    ver = importlib.metadata.version("sentence-transformers")
+                except Exception:
+                    ver = getattr(sentence_transformers, "__version__", "installed")
+                note = f"importable ({ver})"
+            else:
+                import fastembed  # noqa: F401
+                try:
+                    ver = importlib.metadata.version("fastembed")
+                except Exception:
+                    ver = getattr(fastembed, "__version__", "installed")
+                note = f"importable ({ver})"
+            if not deep:
+                return note
+            try:
+                from .embeddings import TextEmbedder
+                embedder = TextEmbedder(method=method)
+                if embedder.model is None and embedder.fastembed_model is None:
+                    raise RuntimeError(
+                        "model failed to load — the hash fallback is active "
+                        "(see warnings above); embedding quality is degraded"
+                    )
+                probe = embedder.embed_text("semantica doctor embedding probe")
+            except _DeepEmbeddingFailure:
+                raise
+            except Exception as exc:
+                raise _DeepEmbeddingFailure(str(exc)) from exc
+            return f"{note}; deep probe ok ({len(probe)}-dim)"
+
+        checks.append(_check(
+            "Embeddings (sentence-transformers)",
+            lambda: _embedding_backend("sentence_transformers"),
+            hint="pip install 'semantica[embeddings-local]'",
+        ))
+        checks.append(_check(
+            "Embeddings (fastembed)",
+            lambda: _embedding_backend("fastembed"),
+            hint="pip install 'semantica[embeddings-local]'",
+        ))
 
         # LLM provider keys
         for provider, var in [("OpenAI", "OPENAI_API_KEY"), ("Anthropic", "ANTHROPIC_API_KEY"),
@@ -851,11 +1146,11 @@ def doctor(cli_ctx: CLIContext, local_json: bool) -> None:
                     for lbl, st, note, hint in checks])
             return
 
-        tbl = Table(box=_TABLE_BOX, show_edge=False, padding=(0, 2))
-        tbl.add_column("Check",  style=_KEY, no_wrap=True, min_width=16)
-        tbl.add_column("Status", no_wrap=True, min_width=6)
-        tbl.add_column("Note",   style=_DIM)
-        tbl.add_column("Hint",   style=_DIM)
+        tbl = Table(box=_TABLE_BOX, show_edge=False, padding=(0, 2), expand=True)
+        tbl.add_column("Check",  style=_KEY, no_wrap=True, min_width=34)
+        tbl.add_column("Status", no_wrap=True, min_width=4)
+        tbl.add_column("Note",   style=_DIM, min_width=15, ratio=2, overflow="fold")
+        tbl.add_column("Hint",   style=_DIM, min_width=20, ratio=3, overflow="fold")
 
         icons = {"ok": f"[{_SUCCESS}] ✓[/{_SUCCESS}]",
                  "warn": f"[{_WARN_STY}] ⚠[/{_WARN_STY}]",
@@ -952,7 +1247,7 @@ def init_cmd(cli_ctx: CLIContext, force: bool) -> None:
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--type", "ingestor_type", default=None, help="Force ingestor type.")
 @click.option("--store", "store_override", default=None, help="Target graph backend.")
-@click.option("--patterns", default="*.pdf,*.docx,*.txt,*.csv,*.json",
+@click.option("--patterns", default="*.pdf,*.docx,*.txt,*.csv,*.json,*.jsonl,*.ndjson",
               show_default=True, help="Comma-separated glob patterns to match.")
 @click.pass_obj
 def watch_cmd(cli_ctx: CLIContext, path: str, ingestor_type: Optional[str],
@@ -1080,13 +1375,703 @@ def build_alias(
 # ─── Graph store helper ──────────────────────────────────────────────────────
 
 
-def _get_graph_store(cli_ctx: CLIContext) -> Any:
-    """Return a GraphStore instance wired from the current CLIContext config."""
+MEMORY_GRAPH_BACKEND = "memory"
+_NO_RATIONALE = "(no rationale provided)"
+_LOCK_TIMEOUT_SECONDS = 10.0
+# `semantica init` offers memory as its default and ContextGraph serves it
+# without any server, so it is also the fallback when nothing is configured.
+_DEFAULT_GRAPH_BACKEND = MEMORY_GRAPH_BACKEND
+# VectorStore's own default: what CLI vector commands build when neither
+# --vector-store nor vector_store.backend is set.
+_DEFAULT_VECTOR_BACKEND = "faiss"
+# Environment that configures the MCP server's stores
+# (semantica_mcp/mcp/session.py). It never changes what the CLI builds, so
+# ``doctor`` reports it in rows of its own rather than folding it into the
+# CLI's vector and graph checks (#1818).
+_MCP_STORE_ENV_VARS = (
+    "SEMANTICA_VECTOR_BACKEND",
+    "SEMANTICA_VECTOR_DB_PATH",
+    "SEMANTICA_VECTOR_PATH",
+    "SEMANTICA_KG_PATH",
+)
+
+
+def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
+    """Return the graph backend this invocation will actually use.
+
+    Single source of truth for the three places that used to resolve this
+    independently (status, ``doctor`` and ``_get_graph_store``) with two
+    different defaults — the inconsistency behind #1481.
+    """
+    graph_db = cli_ctx.config.to_dict().get("graph_db", {})
+    return cli_ctx.store_backend or graph_db.get(
+        "backend", _DEFAULT_GRAPH_BACKEND
+    )
+
+
+def _configured_vector_backend(cli_ctx: CLIContext) -> Optional[str]:
+    """The ``--vector-store`` flag or ``vector_store.backend``; None if unset."""
+    return cli_ctx.vector_store_backend or cli_ctx.config.to_dict().get(
+        "vector_store", {}
+    ).get("backend")
+
+
+def _mcp_stores_configured() -> bool:
+    """True when the environment configures the MCP server's stores."""
+    return any(os.environ.get(var, "").strip() for var in _MCP_STORE_ENV_VARS)
+
+
+def _probe_sqlite_vec() -> None:
+    """Raise unless the sqlite-vec extension actually loads.
+
+    ``SQLITE_VEC_AVAILABLE`` is a ``find_spec`` probe: it proves the package is
+    discoverable, not that the native extension loads. Building a throwaway
+    in-memory store runs the store's real load path, so a broken install fails
+    here rather than on first use.
+    """
+    from .vector_store.sqlite_vec_store import SQLITE_VEC_AVAILABLE, SQLiteVecStore
+
+    if not SQLITE_VEC_AVAILABLE:
+        raise ImportError("sqlite-vec is not installed")
+    SQLiteVecStore(db_path=":memory:", table_name="doctor_probe", dimension=1).close()
+
+
+def _uses_memory_graph(cli_ctx: CLIContext) -> bool:
+    """True when decisions and exports are served by an in-process ContextGraph.
+
+    ``GraphStore`` has no ``memory`` backend — it supports neo4j, falkordb,
+    age and neptune — so ``memory`` is served by ``ContextGraph``, which
+    already works in memory and is what the Python quickstart uses.
+    """
+    return _resolve_graph_backend(cli_ctx) == MEMORY_GRAPH_BACKEND
+
+
+def _memory_graph_path(cli_ctx: CLIContext) -> Path:
+    """Where the memory backend's graph is persisted between invocations.
+
+    The CLI is one process per command, so an in-memory graph that is never
+    written back would make ``decision record`` pointless. Defaults to
+    ``~/.semantica/context_graph.json`` (beside ``config.yaml``); override with
+    ``graph_db.path`` in the config.
+    """
+    configured = cli_ctx.config.to_dict().get("graph_db", {}).get("path")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".semantica" / "context_graph.json"
+
+
+def _load_context_graph(cli_ctx: CLIContext) -> Any:
+    """Return the persisted ContextGraph, or an empty one if none exists yet."""
+    from .context import ContextGraph
+
+    graph = ContextGraph()
+    path = _memory_graph_path(cli_ctx)
+    if path.exists():
+        try:
+            graph.load_from_file(path)
+        except Exception as exc:
+            raise click.ClickException(
+                f"Could not read the graph at {path}: {exc}"
+            ) from exc
+    return graph
+
+
+def _save_context_graph(cli_ctx: CLIContext, graph: Any) -> None:
+    """Persist the ContextGraph so the next command sees this one's writes."""
+    path = _memory_graph_path(cli_ctx)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph.save_to_file(path)
+
+
+def _try_lock_exclusive(fd: int) -> bool:
+    """Take an exclusive advisory lock on ``fd`` without blocking."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    if msvcrt is not None:  # pragma: no cover - Windows only
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    # No locking primitive available: proceed rather than refuse to record.
+    return True
+
+
+def _unlock(fd: int) -> None:
+    """Release the advisory lock held on ``fd``."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover - Windows only
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def _memory_graph_lock(cli_ctx: CLIContext) -> Iterator[None]:
+    """Serialise read-modify-write of the memory graph across CLI processes.
+
+    ``decision record`` loads the whole graph, adds a node and writes it back.
+    Two invocations that load before either saves would silently lose the
+    earlier decision — ``save_to_file`` replaces the file atomically, so the
+    write is never torn, but the lost update is invisible.
+
+    Uses an OS advisory lock (``flock``, or ``msvcrt.locking`` on Windows) on a
+    sidecar ``.lock`` file. The kernel releases it when the holder exits, so
+    there is no staleness timeout to guess at and a crashed writer cannot wedge
+    the CLI. Deliberately never unlinks the file: removing it would let a
+    second process create a fresh inode and lock that instead, re-introducing
+    the double-entry this prevents — which is exactly what an mtime-based
+    "reclaim an old lock" rule does to a writer that is merely slow or
+    suspended.
+    """
+    lock_path = _memory_graph_path(cli_ctx).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    try:
+        while not _try_lock_exclusive(fd):
+            if time.monotonic() >= deadline:
+                raise click.ClickException(
+                    f"Timed out waiting for another semantica command to finish "
+                    f"writing {_memory_graph_path(cli_ctx)}."
+                )
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _decision_from_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise a ContextGraph decision node to the CLI's decision shape.
+
+    Mirrors the fields the ``GraphStore`` path reads off a ``Decision``
+    (``decision_id``, ``scenario``, ``category``, ``outcome``, ``confidence``)
+    so both backends print identically.
+    """
+    meta = node.get("metadata", {}) or {}
+    # Carry every stored field, not just the ones the tables print:
+    # check_decision_rules() indexes decision["reasoning"] and reads
+    # decision_maker, valid_from/valid_until and nested metadata.
+    decision = {
+        "id": node.get("id", ""),
+        "decision_id": node.get("id", ""),
+        "scenario": meta.get("scenario", node.get("content", "")),
+        "category": meta.get("category", ""),
+        "outcome": meta.get("outcome", ""),
+        "confidence": meta.get("confidence", 0.0),
+        "timestamp": meta.get("timestamp", 0.0),
+        "recorded_at": meta.get("recorded_at", ""),
+        "reasoning": meta.get("reasoning", ""),
+        "decision_maker": meta.get("decision_maker") or "",
+    }
+    for key in ("valid_from", "valid_until", "metadata"):
+        if key in meta:
+            decision[key] = meta[key]
+    return decision
+
+
+def _memory_decisions(cli_ctx: CLIContext, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Decisions from the memory backend, newest first."""
+    graph = _load_context_graph(cli_ctx)
+    decisions = [
+        _decision_from_node(n) for n in graph.get_nodes_by_label("decision")
+    ]
+    decisions.sort(key=lambda d: d.get("timestamp") or 0.0, reverse=True)
+    return decisions[:limit] if limit is not None else decisions
+
+
+def _memory_decision_records(
+    cli_ctx: CLIContext,
+    limit: Optional[int] = None,
+    since_ts: Optional[float] = None,
+) -> List[SimpleNamespace]:
+    """Memory-backend decisions as records with a ``Decision``-shaped surface.
+
+    The commands read ``.decision_id`` / ``.scenario`` / ``.category`` /
+    ``.outcome`` / ``.confidence`` off whatever the store returns, so matching
+    that surface lets both backends share one formatting path.
+    """
+    rows = [
+        d for d in _memory_decisions(cli_ctx)
+        if since_ts is None or (d.get("timestamp") or 0.0) >= since_ts
+    ]
+    if limit is not None:
+        rows = rows[:limit]
+    return [
+        SimpleNamespace(
+            decision_id=d["id"], scenario=d["scenario"], category=d["category"],
+            outcome=d["outcome"], confidence=d["confidence"],
+        )
+        for d in rows
+    ]
+
+
+def _get_graph_store(cli_ctx: CLIContext, backend: Optional[str] = None) -> Any:
+    """Return a GraphStore instance wired from the current CLIContext config.
+
+    ``backend`` overrides the configured/store backend for callers that take
+    their own ``--backend`` option.
+    """
     from .graph_store import GraphStore
     cfg = cli_ctx.config.to_dict()
     graph_db = dict(cfg.get("graph_db", {}))
-    backend = cli_ctx.store_backend or graph_db.pop("backend", "neo4j")
-    return GraphStore(backend=backend, **graph_db)
+    graph_db.pop("path", None)
+    # Pop unconditionally: `store_backend or graph_db.pop(...)` short-circuits,
+    # so an override left the configured backend in the kwargs and GraphStore
+    # received it twice.
+    configured = graph_db.pop("backend", None)
+    resolved = backend or cli_ctx.store_backend or configured or _DEFAULT_GRAPH_BACKEND
+    if resolved == MEMORY_GRAPH_BACKEND:
+        # Reached only if a new caller forgets to route memory through
+        # ContextGraph; GraphStore would raise "Unknown backend: memory".
+        raise click.ClickException(
+            "The 'memory' backend is served by ContextGraph, not GraphStore — "
+            "this command has not been wired for it yet. Use --store neo4j "
+            "(or falkordb/age/neptune) for a real graph database."
+        )
+    return GraphStore(backend=resolved, **graph_db)
+
+
+def _load_policy_rules(path: str) -> Dict[str, Any]:
+    """Load a decision policy rules file as a mapping.
+
+    Distinct from ``_load_rule_definitions()``, which loads reasoning rules as a
+    list of strings. ``ContextGraph.check_decision_rules()`` takes a mapping of
+    policy constraints, so anything else is a usage error worth naming.
+    """
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Policy rules file '{path}' must be a YAML mapping of rules; "
+            f"got {type(data).__name__}."
+        )
+    return data
+
+
+def _load_rule_definitions(path: str) -> List[str]:
+    """Load reasoning rule definitions from a YAML or plain-text rules file.
+
+    YAML files may hold a list of rule strings or a mapping with a ``rules``
+    list; anything else (e.g. Datalog) is read as one rule per non-comment
+    line. The strings are handed to ``Reasoner.add_rule()`` untouched.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        data = None
+    if isinstance(data, dict):
+        rules_value = data.get("rules")
+        if rules_value is None and "rules" not in data:
+            raise click.ClickException(
+                f"Rules file '{path}' is a YAML mapping but has no 'rules' key. "
+                "Expected either a YAML list or a mapping with a 'rules' list."
+            )
+        data = rules_value
+    if isinstance(data, list):
+        return [str(item) for item in data]
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _load_premises(path: str) -> List[Any]:
+    """Load DeductiveReasoner ``Premise`` objects from a YAML file.
+
+    Mirrors _load_rule_definitions()'s format conventions: a YAML list of
+    plain statement strings, a list of ``{statement, confidence}`` mappings,
+    a top-level ``{"premises": [...]}`` mapping, or plain-text lines.
+
+    ``confidence`` is accepted and parsed onto the Premise (the dataclass
+    has the field, so a doc-shaped input shouldn't be rejected), but
+    DeductiveReasoner.apply_logic() never reads premise.confidence -- every
+    derived Conclusion's confidence comes from the firing rule's confidence
+    instead. Setting it currently has no effect on the result.
+    """
+    from .reasoning.deductive_reasoner import Premise
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        data = None
+    if isinstance(data, dict):
+        if "premises" not in data:
+            raise click.ClickException(
+                f"Premises file '{path}' is a YAML mapping but has no 'premises' key. "
+                "Expected either a YAML list or a mapping with a 'premises' list."
+            )
+        premises_value = data["premises"]
+        # A present-but-non-list value (e.g. "premises: null") must be a
+        # clear error, not silently fall through to reinterpreting the raw
+        # file text as one-statement-per-line plain text.
+        if not isinstance(premises_value, list):
+            raise click.ClickException(
+                f"Premises file '{path}' has a 'premises' key that is not a list."
+            )
+        data = premises_value
+    elif not isinstance(data, list):
+        data = [line.strip() for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    premises = []
+    for i, item in enumerate(data):
+        if isinstance(item, dict):
+            statement = item.get("statement")
+            if not statement:
+                raise click.ClickException(
+                    f"Premise entry {i} in '{path}' is missing 'statement'.")
+            premises.append(Premise(
+                premise_id=str(item.get("id", f"premise_{i}")),
+                statement=str(statement),
+                confidence=float(item.get("confidence", 1.0)),
+            ))
+        else:
+            premises.append(Premise(premise_id=f"premise_{i}", statement=str(item)))
+    if not premises:
+        raise click.ClickException(f"Premises file '{path}' contains no premises.")
+    return premises
+
+
+def _load_observations(path: str) -> List[Any]:
+    """Load AbductiveReasoner ``Observation`` objects from a YAML file.
+
+    Mirrors _load_rule_definitions()'s format conventions: a YAML list of
+    plain description strings, a list of ``{description, facts}`` mappings,
+    a top-level ``{"observations": [...]}`` mapping, or plain-text lines.
+
+    ``facts`` is accepted and parsed onto the Observation (the dataclass
+    has the field), but nothing in abductive_reasoner.py currently reads
+    observation.facts -- hypothesis generation only matches a rule's
+    conclusion against observation.description. Setting it currently has
+    no effect on the result.
+    """
+    from .reasoning.abductive_reasoner import Observation
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        data = None
+    if isinstance(data, dict):
+        if "observations" not in data:
+            raise click.ClickException(
+                f"Observations file '{path}' is a YAML mapping but has no 'observations' key. "
+                "Expected either a YAML list or a mapping with an 'observations' list."
+            )
+        obs_value = data["observations"]
+        # A present-but-non-list value (e.g. "observations: null") must be
+        # a clear error, not silently fall through to reinterpreting the
+        # raw file text as one-description-per-line plain text -- that
+        # path could otherwise hand find_explanations() a single bogus
+        # observation and report a misleading "success".
+        if not isinstance(obs_value, list):
+            raise click.ClickException(
+                f"Observations file '{path}' has an 'observations' key that is not a list."
+            )
+        data = obs_value
+    elif not isinstance(data, list):
+        data = [line.strip() for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    observations = []
+    for i, item in enumerate(data):
+        if isinstance(item, dict):
+            description = item.get("description")
+            if not description:
+                raise click.ClickException(
+                    f"Observation entry {i} in '{path}' is missing 'description'.")
+            observations.append(Observation(
+                observation_id=str(item.get("id", f"obs_{i}")),
+                description=str(description),
+                facts=item.get("facts", []),
+            ))
+        else:
+            observations.append(Observation(observation_id=f"obs_{i}", description=str(item)))
+    if not observations:
+        raise click.ClickException(f"Observations file '{path}' contains no observations.")
+    return observations
+
+
+def _graph_store_facts(cli_ctx: CLIContext) -> List[str]:
+    """Read the configured graph store into Reasoner fact strings.
+
+    Follows the same conventions ``Reasoner.add_fact()`` applies to
+    KG-style dicts: nodes become ``Label(name)`` and relationships become
+    ``TYPE(source, target)``, with internal node ids resolved to names.
+    """
+    gs = _get_graph_store(cli_ctx)
+    nodes = gs.get_nodes(limit=sys.maxsize)
+    relationships = gs.get_relationships(limit=sys.maxsize)
+    names: Dict[Any, Any] = {}
+    facts: List[str] = []
+    for node in nodes:
+        props = node.get("properties") or {}
+        name = props.get("name") or props.get("id") or node.get("id")
+        names[node.get("id")] = name
+        for label in node.get("labels") or ["Entity"]:
+            facts.append(f"{label}({name})")
+    for rel in relationships:
+        source = names.get(rel.get("start_node_id"), rel.get("start_node_id"))
+        target = names.get(rel.get("end_node_id"), rel.get("end_node_id"))
+        facts.append(f"{rel.get('type', 'RELATED_TO')}({source}, {target})")
+    return facts
+
+
+def _graph_store_as_context(
+    cli_ctx: CLIContext, by_id: bool = False
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Read the configured graph store into GraphReasoner's expected shape.
+
+    GraphReasoner._prepare_graph_context() reads a plain
+    ``{"entities": [...], "relationships": [...]}`` dict -- distinct from
+    both the raw GraphStore rows and the ``Label(arg)`` fact strings
+    ``_graph_store_facts()`` builds for the other engines.
+
+    Each node's display name stands in for its ID, which suits the reasoning
+    path. ``by_id`` keeps the store ID instead (the name stays in ``name``), so
+    two nodes sharing a display name are not merged.
+    """
+    gs = _get_graph_store(cli_ctx)
+    nodes = gs.get_nodes(limit=sys.maxsize)
+    relationships = gs.get_relationships(limit=sys.maxsize)
+    names: Dict[Any, Any] = {}
+    entities = []
+    for node in nodes:
+        props = node.get("properties") or {}
+        node_id = node.get("id")
+        name = props.get("name") or props.get("id") or node_id
+        names[node_id] = node_id if by_id else name
+        labels = node.get("labels") or ["Entity"]
+        # Multiple labels are all real classifications (mirrors the one
+        # fact-per-label convention _graph_store_facts() uses); joining them
+        # keeps a node with e.g. ["Person", "Employee"] fully described
+        # instead of silently dropping every label but the first.
+        entities.append({
+            "id": names[node_id], "name": name, "type": "/".join(labels),
+            "properties": props,
+        })
+    rel_out = []
+    for rel in relationships:
+        source = names.get(rel.get("start_node_id"), rel.get("start_node_id"))
+        target = names.get(rel.get("end_node_id"), rel.get("end_node_id"))
+        rel_out.append({
+            "source": source, "target": target,
+            "type": rel.get("type", "RELATED_TO"),
+            "properties": rel.get("properties") or {},
+        })
+    return {"entities": entities, "relationships": rel_out}
+
+
+def _knowledge_graph_dict(cli_ctx: CLIContext) -> Dict[str, List[Dict[str, Any]]]:
+    """Entities and relationships for the configured graph backend.
+
+    Mirrors the routing `export` uses: the ``memory`` backend is served by the
+    in-process ContextGraph, every other backend by GraphStore. Callers that
+    only read entities and relationships (conflict detection, ontology
+    generation) go through here instead of `_graph_store_as_context`, which
+    raises for the default ``memory`` backend.
+    """
+    if _uses_memory_graph(cli_ctx):
+        kg = _load_context_graph(cli_ctx).to_kg_dict()
+        return {
+            "entities": kg.get("entities", []),
+            "relationships": kg.get("relationships", []),
+        }
+    return _graph_store_as_context(cli_ctx)
+
+
+def _flatten_properties(entity: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy an entity with its nested business attributes lifted to the top level.
+
+    Both graph adapters keep an entity's attributes under ``properties``, while
+    the consumers behind these commands (ontology property inference, conflict
+    detection) read top-level keys. Structural fields win on a name clash so
+    ``id``/``type`` keep their meaning.
+    """
+    flattened = dict(entity)
+    for key, value in (entity.get("properties") or {}).items():
+        flattened.setdefault(key, value)
+    return flattened
+
+
+def _ontology_input_graph(
+    graph: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Adapt a graph for OntologyGenerator's entity shape.
+
+    Its property inference reads top-level keys and lists ``properties`` itself
+    as a control field, so a graph read from a backend otherwise produced an
+    ontology with no properties at all (#1814 review).
+    """
+    return {
+        "entities": [_flatten_properties(e) for e in graph.get("entities", [])],
+        "relationships": graph.get("relationships", []),
+    }
+
+
+def _conflict_entities(
+    graph: Dict[str, List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Adapt a graph for ConflictDetector's entity shape.
+
+    Its value and property strategies read ``property_name`` off the entity
+    itself, so a stored attribute under ``properties`` was never compared and
+    no conflict was reported (#1814 review).
+    """
+    return [_flatten_properties(e) for e in graph.get("entities", [])]
+
+
+def _ontology_from_graph(
+    cli_ctx: CLIContext,
+    graph: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    """Build an ontology dict from the configured graph's entities/relationships."""
+    from .ontology import OntologyGenerator
+
+    data = graph if graph is not None else _knowledge_graph_dict(cli_ctx)
+    return OntologyGenerator(config=cli_ctx.config.to_dict()).generate_ontology(
+        _ontology_input_graph(data)
+    )
+
+
+def _normalize_kg_dict(kg: Dict[str, Any]) -> Dict[str, Any]:
+    """Map ``ContextGraph.to_kg_dict()`` onto the shape the kg APIs read.
+
+    ``to_kg_dict()`` emits ``source_id``/``target_id`` and no entity ``name``;
+    ``GraphValidator`` requires ``name`` and the NetworkX projection reads
+    ``source``/``target``.
+    """
+    entities = []
+    for entity in kg.get("entities", []) or []:
+        mapped = dict(entity)
+        properties = mapped.get("properties") or {}
+        mapped.setdefault("name", mapped.get("text") or properties.get("name")
+                          or mapped.get("id"))
+        mapped.setdefault("type", "Entity")
+        entities.append(mapped)
+    relationships = []
+    for rel in kg.get("relationships", []) or []:
+        mapped = dict(rel)
+        mapped.setdefault("source", mapped.get("source_id"))
+        mapped.setdefault("target", mapped.get("target_id"))
+        relationships.append(mapped)
+    return {"entities": entities, "relationships": relationships}
+
+
+def _kg_graph(cli_ctx: CLIContext) -> Dict[str, Any]:
+    """Load the configured graph as ``{"entities", "relationships"}`` (#1941)."""
+    if _uses_memory_graph(cli_ctx):
+        return _normalize_kg_dict(_load_context_graph(cli_ctx).to_kg_dict())
+    # The kg APIs key on entity ID, and two store nodes may share a name.
+    return _graph_store_as_context(cli_ctx, by_id=True)
+
+
+def _kg_nx_graph(cli_ctx: CLIContext) -> Any:
+    """NetworkX view of the configured graph for PathFinder and LinkPredictor.
+
+    Both duck-type against NetworkX methods and find nothing in the plain
+    dict, the same defect explorer fixed for PathFinder in #1725. Edges are
+    collapsed as in explorer's ``build_nx_graph``.
+    """
+    import networkx as nx
+
+    kg = _kg_graph(cli_ctx)
+    graph = nx.DiGraph()
+    for entity in kg.get("entities", []):
+        node_id = entity.get("id")
+        if node_id is not None:
+            graph.add_node(node_id, name=entity.get("name"))
+    for rel in kg.get("relationships", []):
+        source = rel.get("source")
+        target = rel.get("target")
+        if source is None or target is None:
+            continue
+        properties = rel.get("properties") or {}
+        try:
+            weight = float(rel.get("weight", properties.get("weight", 1.0)))
+        except (TypeError, ValueError):
+            weight = 1.0
+        existing = graph.get_edge_data(source, target)
+        if existing is not None:
+            weight = min(weight, existing.get("weight", weight))
+        graph.add_edge(source, target, weight=weight, type=rel.get("type"))
+    return graph
+
+
+def _resolve_entity(graph: Any, token: str) -> Any:
+    """Map a ``--from``/``--to`` entity name or ID onto its graph node ID."""
+    if token in graph:
+        return token
+    # Click passes every option value as a string, but some graph stores
+    # (Neo4j) key nodes by integer ID, so retry a numeric token as an int
+    # (#2179).
+    if token.isdigit():
+        # isdigit() accepts characters int() rejects (superscripts), and
+        # int() caps digit-string length, so a failed conversion must fall
+        # through to name matching rather than crash.
+        try:
+            numeric_token = int(token)
+        except ValueError:
+            pass
+        else:
+            if numeric_token in graph:
+                return numeric_token
+    matches = [
+        node for node, attrs in graph.nodes(data=True)
+        if attrs.get("name") == token
+    ]
+    if not matches:
+        raise click.ClickException(
+            f"No entity named '{token}' in the graph. Pass an entity name or ID "
+            "that `semantica kg query` reports."
+        )
+    if len(matches) > 1:
+        raise click.ClickException(
+            f"Entity name '{token}' is ambiguous ({len(matches)} nodes); pass "
+            "the entity ID instead: " + ", ".join(sorted(str(m) for m in matches))
+        )
+    return matches[0]
+
+
+def _lowercase_datalog_args(fact_str: str) -> str:
+    """Lowercase only a fact string's arguments, keeping the predicate's
+    case untouched.
+
+    DatalogReasoner reads a leading-uppercase *argument* as a variable
+    (constants must be lowercase), but places no such constraint on the
+    predicate. Lowercasing the whole string would still satisfy the
+    constant check but would break matching against Datalog rules written
+    against the graph's own label spelling, e.g. "Human(X) :- Person(X)."
+    expects a "Person(...)" fact, not "person(...)".
+    """
+    match = re.match(r'^([a-zA-Z0-9_]+)\((.*)\)$', fact_str.strip())
+    if not match:
+        return fact_str
+    predicate, args_str = match.groups()
+    args = [arg.strip().lower() for arg in args_str.split(',')]
+    return f"{predicate}({', '.join(args)})"
+
+
+def _run_reasoning_with_status(
+    cli_ctx: CLIContext, engine: str, local_json: bool, fn: Callable[[], Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Run a reasoning computation, showing a spinner unless output is quiet/JSON.
+
+    Checks _is_json() (global --json OR the command's own --json flag), not
+    just cli_ctx.json_output -- otherwise `reason run --json` (the local
+    flag, global --json omitted) would still print spinner status text to
+    stdout ahead of the JSON payload, corrupting it for a parser.
+    """
+    if cli_ctx.quiet or _is_json(cli_ctx, local_json):
+        return fn()
+    with console.status(
+        f"[{_DIM}]Running {engine} reasoning engine…[/{_DIM}]", spinner="dots"
+    ):
+        return fn()
 
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
@@ -1109,7 +2094,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -1205,7 +2193,7 @@ def kg_stats(cli_ctx: CLIContext, fmt: str, local_json: bool) -> None:
 
             stats = GraphAnalyzer(
                 config=cli_ctx.config.to_dict()
-            ).compute_metrics()
+            ).compute_metrics(graph=_kg_graph(cli_ctx))
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
         if json_out:
@@ -1237,7 +2225,18 @@ def kg_analyze(cli_ctx: CLIContext, mode: str, local_json: bool) -> None:
             from .kg import GraphAnalyzer
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
-        result = GraphAnalyzer(config=cli_ctx.config.to_dict()).analyze(mode=mode)
+        analyzer = GraphAnalyzer(config=cli_ctx.config.to_dict())
+        graph = _kg_graph(cli_ctx)
+        # analyze() has no `mode`; it would run the whole analysis (#1941).
+        if mode == "all":
+            result = analyzer.analyze(graph)
+        else:
+            steps = {
+                "centrality": analyzer.calculate_centrality,
+                "community": analyzer.detect_communities,
+                "connectivity": analyzer.analyze_connectivity,
+            }
+            result = steps[mode](graph)
         if json_out:
             _jecho(result if isinstance(result, dict) else {"result": str(result)})
         else:
@@ -1250,7 +2249,7 @@ def kg_analyze(cli_ctx: CLIContext, mode: str, local_json: bool) -> None:
 @click.option("--from", "from_entity", required=True, help="Source entity name.")
 @click.option("--to", "to_entity", required=True, help="Target entity name.")
 @click.option("--type", "path_type",
-              type=click.Choice(["shortest", "semantic", "causal"]),
+              type=click.Choice(["shortest"]),
               default="shortest", show_default=True)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -1265,8 +2264,11 @@ def kg_find_path(cli_ctx: CLIContext, from_entity: str, to_entity: str,
             from .kg import PathFinder
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
-        path = PathFinder(config=cli_ctx.config.to_dict()).find_path(
-            from_entity, to_entity, path_type=path_type
+        graph = _kg_nx_graph(cli_ctx)
+        path = PathFinder().dijkstra_shortest_path(
+            graph,
+            _resolve_entity(graph, from_entity),
+            _resolve_entity(graph, to_entity),
         )
         if json_out:
             _jecho(path if isinstance(path, dict) else {"path": path})
@@ -1280,7 +2282,7 @@ def kg_find_path(cli_ctx: CLIContext, from_entity: str, to_entity: str,
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
 def kg_resolve(cli_ctx: CLIContext, local_json: bool) -> None:
-    """Run entity resolution across the knowledge graph."""
+    """Resolve duplicate entities and report the merged result (read-only)."""
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
@@ -1288,11 +2290,25 @@ def kg_resolve(cli_ctx: CLIContext, local_json: bool) -> None:
             from .kg import EntityResolver
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
-        result = EntityResolver(config=cli_ctx.config.to_dict()).resolve()
+        # resolve_entities() returns the merged list and writes nothing back.
+        entities = _kg_graph(cli_ctx).get("entities", [])
+        resolved = EntityResolver(
+            config=cli_ctx.config.to_dict()
+        ).resolve_entities(entities)
+        result = {
+            "input": len(entities),
+            "resolved": len(resolved),
+            "merged": max(len(entities) - len(resolved), 0),
+            "entities": resolved,
+        }
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"result": str(result)})
+            _jecho(result)
         else:
-            _ok(cli_ctx, f"Entity resolution complete: {result}")
+            _ok(
+                cli_ctx,
+                f"Entity resolution computed (read-only, nothing written back): "
+                f"{len(entities)} in, {len(resolved)} out, {result['merged']} merged",
+            )
 
     _run_with_error_handling(_action)
 
@@ -1309,9 +2325,16 @@ def kg_predict(cli_ctx: CLIContext, local_json: bool) -> None:
             from .kg import LinkPredictor
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
-        result = LinkPredictor(config=cli_ctx.config.to_dict()).predict()
+        predictions = LinkPredictor().predict_links(graph=_kg_nx_graph(cli_ctx))
+        result = {
+            "count": len(predictions),
+            "predictions": [
+                {"source": source, "target": target, "score": score}
+                for source, target, score in predictions
+            ],
+        }
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"result": str(result)})
+            _jecho(result)
         else:
             _pprint(cli_ctx, result)
 
@@ -1330,11 +2353,223 @@ def kg_validate_cmd(cli_ctx: CLIContext, local_json: bool) -> None:
             from .kg import GraphValidator
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
-        result = GraphValidator(config=cli_ctx.config.to_dict()).validate()
+        result = GraphValidator().validate(_kg_graph(cli_ctx)).to_dict()
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"result": str(result)})
+            _jecho(result)
         else:
             _ok(cli_ctx, f"Graph validation: {result}")
+
+    _run_with_error_handling(_action)
+
+
+@kg.command("global")
+@click.argument("query_str")
+@click.option(
+    "--reports",
+    "reports_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to JSON file containing community reports.",
+)
+@click.option(
+    "--hierarchy",
+    "hierarchy_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to JSON file containing community hierarchy.",
+)
+@click.option(
+    "--level",
+    type=int,
+    default=None,
+    help="Coarsening level to query.",
+)
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=4000,
+    show_default=True,
+    help="Token budget for retrieval context.",
+)
+@click.option(
+    "--min-relevance",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Minimum relevance score (0.0 to 10.0).",
+)
+@click.option("--json", "local_json", is_flag=True, default=False)
+@click.pass_obj
+def kg_global_cmd(
+    cli_ctx: CLIContext,
+    query_str: str,
+    reports_path: Optional[str],
+    hierarchy_path: Optional[str],
+    level: Optional[int],
+    max_tokens: int,
+    min_relevance: float,
+    local_json: bool,
+) -> None:
+    """Run global Map-Reduce search over hierarchical community reports."""
+    cli_ctx = _require_ctx(cli_ctx)
+    json_out = _is_json(cli_ctx, local_json)
+
+    def _action() -> None:
+        try:
+            from .context.methods import retrieve_global
+            from .kg.community_hierarchy import CommunityHierarchy
+        except ImportError as exc:
+            raise click.ClickException(f"Module not available: {exc}") from exc
+
+        loaded_reports = None
+        if reports_path:
+            try:
+                with open(reports_path, "r", encoding="utf-8") as f:
+                    loaded_reports = json.load(f)
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Failed to read reports file '{reports_path}': {exc}"
+                ) from exc
+        else:
+            raise click.ClickException(
+                "Global retrieval requires --reports. "
+                "Please provide a path to community reports."
+            )
+
+        loaded_hierarchy = None
+        if hierarchy_path:
+            try:
+                with open(hierarchy_path, "r", encoding="utf-8") as f:
+                    h_data = json.load(f)
+                    loaded_hierarchy = CommunityHierarchy.from_dict(h_data)
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Failed to read hierarchy file '{hierarchy_path}': {exc}"
+                ) from exc
+
+        result = retrieve_global(
+            query=query_str,
+            reports=loaded_reports,
+            hierarchy=loaded_hierarchy,
+            level=level,
+            max_context_tokens=max_tokens,
+            min_relevance_score=min_relevance,
+        )
+
+        if json_out:
+            _jecho(result.to_dict())
+        else:
+            _ok(
+                cli_ctx,
+                f"Global Search Results (Level {result.level}, "
+                f"Reports: {len(result.community_reports_used)}):",
+            )
+            console.print(f"\n{result.response}\n")
+            if result.citations:
+                console.print(f"Citations: {', '.join(result.citations)}")
+            console.print(
+                f"Key Points: {len(result.key_points)} | "
+                f"Time: {result.metrics.get('time_taken', 0.0):.2f}s"
+            )
+
+    _run_with_error_handling(_action)
+
+
+@kg.command("drift")
+@click.argument("query_str")
+@click.option(
+    "--reports",
+    "reports_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to JSON file containing community reports.",
+)
+@click.option(
+    "--graph",
+    "graph_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to JSON file containing knowledge graph.",
+)
+@click.option(
+    "--depth",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Traversal depth for entity exploration.",
+)
+@click.option(
+    "--drift-threshold",
+    type=float,
+    default=0.35,
+    show_default=True,
+    help="Threshold for semantic drift pruning.",
+)
+@click.option("--json", "local_json", is_flag=True, default=False)
+@click.pass_obj
+def kg_drift_cmd(
+    cli_ctx: CLIContext,
+    query_str: str,
+    reports_path: Optional[str],
+    graph_path: Optional[str],
+    depth: int,
+    drift_threshold: float,
+    local_json: bool,
+) -> None:
+    """Run DRIFT hybrid search combining global framing and local exploration."""
+    cli_ctx = _require_ctx(cli_ctx)
+    json_out = _is_json(cli_ctx, local_json)
+
+    def _action() -> None:
+        try:
+            from .context.methods import retrieve_drift
+        except ImportError as exc:
+            raise click.ClickException(f"Module not available: {exc}") from exc
+
+        loaded_reports = None
+        if reports_path:
+            try:
+                with open(reports_path, "r", encoding="utf-8") as f:
+                    loaded_reports = json.load(f)
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Failed to read reports file '{reports_path}': {exc}"
+                ) from exc
+
+        loaded_graph = None
+        if graph_path:
+            try:
+                with open(graph_path, "r", encoding="utf-8") as f:
+                    loaded_graph = json.load(f)
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Failed to read graph file '{graph_path}': {exc}"
+                ) from exc
+
+        result = retrieve_drift(
+            query=query_str,
+            knowledge_graph=loaded_graph,
+            reports=loaded_reports,
+            max_depth=depth,
+            drift_threshold=drift_threshold,
+        )
+
+        if json_out:
+            _jecho(result.to_dict())
+        else:
+            _ok(
+                cli_ctx,
+                f"DRIFT Hybrid Search Results (Depth {result.depth_reached}, "
+                f"Facts: {len(result.verified_local_contexts)}):",
+            )
+            console.print(f"\n{result.answer}\n")
+            if result.citations:
+                console.print(f"Citations: {', '.join(result.citations)}")
+            console.print(
+                f"Facets Explored: {len(result.facets_explored)} | "
+                f"Pruned Facts: {result.pruned_fact_count} | "
+                f"Time: {result.metrics.get('time_taken', 0.0):.2f}s"
+            )
 
     _run_with_error_handling(_action)
 
@@ -1348,7 +2583,34 @@ _INGEST_TYPES = [
     "snowflake", "stream",
 ]
 
-_INGEST_FORMATS = ["pdf", "docx", "csv", "excel", "html", "json", "parquet", "xml", "rdf"]
+_INGEST_FORMATS = [
+    "pdf", "docx", "csv", "excel", "html", "json", "jsonl", "ndjson", "parquet", "xml", "rdf"
+]
+_GRAPH_STORE_ENV_BACKEND_HINTS = {
+    "GRAPH_STORE_NEO4J_URI": "neo4j",
+    "GRAPH_STORE_FALKORDB_HOST": "falkordb",
+    "GRAPH_STORE_NEPTUNE_ENDPOINT": "neptune",
+    "GRAPH_STORE_AGE_CONNECTION_STRING": "age",
+}
+
+
+def _configured_ingest_graph_backend(
+    cli_ctx: CLIContext, store_override: Optional[str]
+) -> Optional[str]:
+    graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
+    backend = store_override or cli_ctx.store_backend or graph_db.get("backend")
+    if backend:
+        return str(backend)
+
+    env_backend = os.environ.get("GRAPH_STORE_DEFAULT_BACKEND")
+    if env_backend:
+        return env_backend
+
+    for env_var, hinted_backend in _GRAPH_STORE_ENV_BACKEND_HINTS.items():
+        if os.environ.get(env_var):
+            return hinted_backend
+
+    return None
 
 
 @main.command()
@@ -1361,8 +2623,13 @@ _INGEST_FORMATS = ["pdf", "docx", "csv", "excel", "html", "json", "parquet", "xm
 @click.option("--watch", is_flag=True, default=False, help="Re-ingest on file changes.")
 @click.option("--batch-size", default=500, type=int, show_default=True)
 @click.option("--store", "store_override", default=None,
-              help="Target graph backend: neo4j falkordb age neptune")
-@click.option("--output", default=None, type=click.Path(), help="Write to file instead of graph store.")
+              help="Target graph backend: neo4j falkordb age neptune. "
+                   "Not yet implemented — ingest cannot persist to a graph "
+                   "store, so this only determines whether the command "
+                   "refuses to report false success; use --output instead.")
+@click.option("--output", default=None, type=click.Path(),
+              help="Write ingested content to a .json/.jsonl/.csv file "
+                   "instead of the (unimplemented) graph store.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -1386,6 +2653,19 @@ def ingest(
             _dry(cli_ctx, "ingest", json_out=_is_json(cli_ctx, local_json),
                  source=source, type=ingestor_type, format=fmt)
             return
+        graph_backend = _configured_ingest_graph_backend(cli_ctx, store_override)
+        if graph_backend and graph_backend.lower() != "memory" and not output:
+            raise click.ClickException(
+                f"A graph backend is configured ({graph_backend}), but "
+                "semantica ingest does not write to graph stores yet — no CLI "
+                "command currently does (tracked in issues #1351, #1352). "
+                "Pass --output <file>.json to save the ingested content "
+                "instead, or build a GraphStore/GraphBuilder directly in "
+                "Python."
+            )
+        # NOTE: --store/GRAPH_STORE_DEFAULT_BACKEND are read only to decide
+        # whether to raise the error above — nothing downstream of this point
+        # writes to a graph store, so neither is forwarded as an ingest kwarg.
         kwargs: Dict[str, Any] = {"batch_size": batch_size}
         if ingestor_type:
             kwargs["source_type"] = ingestor_type
@@ -1395,10 +2675,6 @@ def ingest(
             kwargs["recursive"] = True
         if watch:
             kwargs["watch"] = True
-        if store_override or cli_ctx.store_backend:
-            kwargs["store"] = store_override or cli_ctx.store_backend
-        if output:
-            kwargs["output"] = output
         try:
             from .ingest import ingest as _ingest
             label = Path(source).name if Path(source).exists() else source
@@ -1412,7 +2688,10 @@ def ingest(
                     result = _ingest(source, **kwargs)
         except ImportError as exc:
             raise click.ClickException(f"Ingest module not available: {exc}") from exc
-        if _is_json(cli_ctx, local_json):
+        if output:
+            _write_result_output(Path(output), result)
+            _ok(cli_ctx, f"Wrote {output}")
+        elif _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"status": "ok"})
         else:
             _ok(cli_ctx, f"Ingested: {source}")
@@ -1604,29 +2883,56 @@ def extract(
             if model:
                 extractor_config["llm_model"] = model
 
-            def _run_extraction() -> Any:
-                if mode == "triplets":
+            def _run_single(
+                target: str,
+                *,
+                entities: Optional[List[Any]] = None,
+                relations: Optional[List[Any]] = None,
+            ) -> Any:
+                if target == "triplets":
                     extractor = TripletExtractor(
                         method=method, include_temporal=temporal, **extractor_config
                     )
-                    return extractor.extract(text)
-                elif mode == "relations":
-                    ner = NERExtractor(method=method, **extractor_config)
-                    entities = ner.extract(text)
+                    return extractor.extract(text, entities=entities, relations=relations)
+                if target == "relations":
+                    if entities is None:
+                        ner = NERExtractor(method=method, **extractor_config)
+                        entities = ner.extract(text)
                     extractor = RelationExtractor(
                         method=method, confidence_threshold=confidence, **extractor_config
                     )
                     return extractor.extract(text, entities=entities)
-                elif mode == "ner":
+                if target == "ner":
                     extractor = NERExtractor(method=method, **extractor_config)
                     return extractor.extract(text)
-                elif mode == "events":
+                if target == "events":
                     extractor = EventDetector(method=method, **extractor_config)
                     return extractor.extract(text)
-                else:
-                    raise click.ClickException(
-                        f"Extraction mode '{mode}' is not yet wired to a runtime extractor."
+                raise click.ClickException(
+                    f"Extraction mode '{target}' is not yet wired to a runtime extractor."
+                )
+
+            def _run_extraction() -> Any:
+                # 'all' is the default, so it must not be the one value that
+                # raises. Run every mode that has a runtime extractor and nest
+                # each result under its own key (#1789).
+                if mode == "all":
+                    # Reuse each stage's output instead of recomputing it: the
+                    # triplet stage would otherwise run its own NER + relation
+                    # pass on top of the ones already run here, tripling the
+                    # inference cost of the default command.
+                    entities = _run_single("ner")
+                    relations = _run_single("relations", entities=entities)
+                    triplets = _run_single(
+                        "triplets", entities=entities, relations=relations
                     )
+                    return {
+                        "ner": entities,
+                        "relations": relations,
+                        "triplets": triplets,
+                        "events": _run_single("events"),
+                    }
+                return _run_single(mode)
 
             if cli_ctx.quiet or cli_ctx.json_output:
                 result = _run_extraction()
@@ -1664,6 +2970,103 @@ def embed(ctx: click.Context) -> None:
     """Generate, index, and search embeddings."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
+
+
+def _json_default(obj) -> object:
+    """JSON serialiser that converts NumPy scalars/arrays to native Python types.
+
+    Also expands dataclasses (e.g. ``FileObject`` from ``ingest``) to plain
+    dicts and decodes ``bytes`` as UTF-8 text where possible, so a domain
+    object round-trips through ``--output`` as data instead of a repr string.
+    Falls back to ``str()`` for everything else so the writer never crashes on
+    unexpected types (e.g. ``datetime``).
+    """
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except UnicodeDecodeError:
+            return obj.hex()
+    try:
+        import numpy as np  # local import — only needed when result contains numpy
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+    except ImportError:
+        pass
+    return str(obj)
+
+
+def _write_result_output(out_path: Path, result) -> None:
+    """Serialize a structured CLI result (dict or list) for ``--output``.
+
+    Domain commands like ``deduplicate`` and ``ontology align`` produce dicts
+    and lists, not numeric matrices — routing them through the embeddings
+    writer rejected their shapes and extensions (.csv is documented for
+    deduplicate). JSON-family formats serialize anything; CSV serializes a
+    list of dicts (or a single dict as one row).
+
+    Accepted extensions: .json, .jsonl, .csv  (no-extension and .txt are
+    rejected so the path reported to the caller always matches the file
+    actually created, consistent with every other --output in the CLI).
+    """
+    import json as _json
+
+    suffix = out_path.suffix.lower()
+
+    # ── JSON ────────────────────────────────────────────────────────────────
+    if suffix == ".json":
+        with open(out_path, "w", encoding="utf-8") as fh:
+            _json.dump(result, fh, indent=2, default=_json_default)
+        return
+
+    # ── JSON Lines ──────────────────────────────────────────────────────────
+    # Every record must occupy exactly one line.  Wrap a bare dict in a list
+    # so callers never need to know whether their result is singular or plural.
+    if suffix == ".jsonl":
+        items = result if isinstance(result, list) else [result]
+        with open(out_path, "w", encoding="utf-8") as fh:
+            for item in items:
+                fh.write(_json.dumps(item, default=_json_default) + "\n")
+        return
+
+    # ── CSV ─────────────────────────────────────────────────────────────────
+    if suffix == ".csv":
+        import pandas as pd
+
+        rows = result if isinstance(result, list) else [result]
+        if not rows:
+            raise click.ClickException(
+                "No results to write — output file not created."
+            )
+        # Normalise numpy scalars/arrays to Python natives so to_csv() does
+        # not fall back to repr() strings for array-valued cells.
+        def _normalise(row):
+            if not isinstance(row, dict):
+                return row
+            out = {}
+            for k, v in row.items():
+                try:
+                    import numpy as np
+                    if isinstance(v, np.ndarray):
+                        v = v.tolist()
+                    elif isinstance(v, np.generic):
+                        v = v.item()
+                except ImportError:
+                    pass
+                out[k] = v
+            return out
+
+        pd.DataFrame([_normalise(r) for r in rows]).to_csv(out_path, index=False)
+        return
+
+    # ── unsupported ─────────────────────────────────────────────────────────
+    display = suffix if suffix else "(no extension)"
+    raise click.ClickException(
+        f"Unsupported output format '{display}'. Use .json, .jsonl, or .csv"
+    )
 
 
 @embed.command("generate")
@@ -1708,7 +3111,43 @@ def embed_generate(cli_ctx: CLIContext, input_path: str, model: str,
         except ImportError as exc:
             raise click.ClickException(f"Embeddings module not available: {exc}") from exc
         if output:
-            Path(output).write_text(json.dumps(result, default=str), encoding="utf-8")
+            output_path = Path(output)
+            suffix = output_path.suffix.lower()
+            try:
+                import numpy as np
+                import pandas as pd
+                arr = np.asarray(result)
+                if arr.ndim == 1:
+                    arr = arr[np.newaxis, :]
+                if arr.ndim != 2:
+                    raise click.ClickException(
+                        f"embed generate --output expects a 1-D or 2-D array, "
+                        f"got {arr.ndim}-D (shape {arr.shape})"
+                    )
+                rows = [list(row) for row in arr]
+                if suffix == ".parquet":
+                    # Schema: single 'embedding' column (list[float] per row).
+                    # embed index detects vector columns via
+                    # isinstance(df[c].iloc[0], (list, np.ndarray)).
+                    df = pd.DataFrame({"embedding": rows})
+                    df.to_parquet(output_path, index=False)
+                elif suffix in (".json", ".jsonl"):
+                    df = pd.DataFrame({"embedding": rows})
+                    df.to_json(
+                        output_path,
+                        orient="records",
+                        lines=(suffix == ".jsonl"),
+                    )
+                else:
+                    raise click.ClickException(
+                        f"Unsupported output format '{suffix}'. "
+                        "Use .parquet, .json, or .jsonl"
+                    )
+            except ImportError as exc:
+                raise click.ClickException(
+                    f"Missing dependency for --output: {exc}. "
+                    "Install pyarrow with: pip install pyarrow"
+                ) from exc
             _ok(cli_ctx, f"Wrote {output}")
         elif _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"status": "ok"})
@@ -1930,7 +3369,7 @@ def deduplicate(
         except ImportError as exc:
             raise click.ClickException(f"Deduplication module not available: {exc}") from exc
         if output:
-            Path(output).write_text(json.dumps(result, default=str), encoding="utf-8")
+            _write_result_output(Path(output), result)
             _ok(cli_ctx, f"Wrote {output}")
         elif _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, (dict, list)) else {"result": str(result)})
@@ -1957,33 +3396,220 @@ def reason(ctx: click.Context) -> None:
                                   "datalog", "sparql", "graph"]),
               default="rete", show_default=True)
 @click.option("--rules", default=None, type=click.Path(exists=True),
-              help="Custom rules file (YAML/Datalog/SPARQL).")
+              help="Custom rules file (YAML for rete, Datalog Horn clauses for datalog).")
+@click.option("--query", "query_text", default=None,
+              help="Natural-language question, required for --engine graph.")
+@click.option("--premises", "premises_file", default=None, type=click.Path(exists=True),
+              help="Premises file for --engine deductive (YAML list of statements; "
+                   "falls back to graph-store facts if omitted).")
+@click.option("--observations", "observations_file", default=None, type=click.Path(exists=True),
+              help="Observations file for --engine abductive (required).")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
 def reason_run(cli_ctx: CLIContext, engine: str, rules: Optional[str],
-               local_json: bool) -> None:
+               query_text: Optional[str], premises_file: Optional[str],
+               observations_file: Optional[str], local_json: bool) -> None:
     """Execute a reasoning engine against the knowledge graph.
 
     \b
     Example:
       semantica reason run --engine rete --rules business-rules.yaml
+      semantica reason run --engine datalog --rules facts.dl
+      semantica reason run --engine graph --query "Who manages Bob?"
+      semantica reason run --engine deductive --premises premises.yaml --rules rules.yaml
+      semantica reason run --engine abductive --observations observations.yaml --rules rules.yaml
     """
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        try:
-            from .reasoning import Reasoner
-            r = Reasoner(engine=engine, config=cli_ctx.config.to_dict())
-            if cli_ctx.quiet or cli_ctx.json_output:
-                result = r.run(rules_file=rules)
-            else:
-                with console.status(
-                    f"[{_DIM}]Running {engine} reasoning engine…[/{_DIM}]",
-                    spinner="dots",
-                ):
-                    result = r.run(rules_file=rules)
-        except ImportError as exc:
-            raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+        if engine in ("rete", "forward-chain"):
+            try:
+                from .reasoning import Reasoner
+                # Reasoner has no run() method (#1354); dispatch to its real
+                # API: facts from the configured graph store + rules from the
+                # optional --rules file into infer_facts().
+                r = Reasoner(engine=engine, config=cli_ctx.config.to_dict())
+                rule_defs = _load_rule_definitions(rules) if rules else None
+                facts = _graph_store_facts(cli_ctx)
+
+                def _infer() -> Dict[str, Any]:
+                    inferred = r.infer_facts(facts, rule_defs)
+                    return {
+                        "engine": engine,
+                        "facts": len(facts),
+                        "inferred_count": len(inferred),
+                        "inferred_facts": inferred,
+                    }
+
+                result = _run_reasoning_with_status(cli_ctx, engine, local_json, _infer)
+            except ImportError as exc:
+                raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+
+        elif engine == "datalog":
+            try:
+                from .reasoning import DatalogReasoner
+                dr = DatalogReasoner(config=cli_ctx.config.to_dict())
+                for rule_def in (_load_rule_definitions(rules) if rules else []):
+                    dr.add_rule(rule_def)
+                # Datalog reads a leading-uppercase *argument* as a variable
+                # (see datalog_reasoner.py _is_variable(); predicate case is
+                # unconstrained), so graph-store facts like "Person(Alice)"
+                # need their arguments -- not the predicate -- lowercased to
+                # read as ground constants. Lowercasing the whole string
+                # would also break matching against rules written against
+                # the graph's own (typically title-case) label spelling,
+                # e.g. "Human(X) :- Person(X)."
+                fact_strings = [_lowercase_datalog_args(f) for f in _graph_store_facts(cli_ctx)]
+                for fact_str in fact_strings:
+                    dr.add_fact(fact_str)
+
+                def _infer() -> Dict[str, Any]:
+                    before = set(fact_strings)
+                    derived = dr.derive_all()
+                    inferred = [f for f in derived if f not in before]
+                    return {
+                        "engine": engine,
+                        "facts": len(fact_strings),
+                        "inferred_count": len(inferred),
+                        "inferred_facts": inferred,
+                    }
+
+                result = _run_reasoning_with_status(cli_ctx, engine, local_json, _infer)
+            except ImportError as exc:
+                raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+
+        elif engine == "graph":
+            if not query_text:
+                raise click.ClickException(
+                    "Engine 'graph' requires --query \"<question>\".")
+            try:
+                from .reasoning import GraphReasoner
+                gr = GraphReasoner(config=cli_ctx.config.to_dict())
+                graph = _graph_store_as_context(cli_ctx)
+
+                def _infer() -> Dict[str, Any]:
+                    answer = gr.reason(graph, query_text)
+                    # GraphReasoner.reason() never raises on an LLM-side
+                    # failure (no provider configured, generation error) --
+                    # it returns a string starting with "Error" instead.
+                    # Surface that as a real command failure (non-zero exit)
+                    # rather than a successful result an automated caller
+                    # would read as a real answer.
+                    if answer.startswith("Error: LLM provider not initialized") or \
+                            answer.startswith("Error during reasoning:"):
+                        raise click.ClickException(answer)
+                    return {
+                        "engine": engine,
+                        "query": query_text,
+                        "facts": len(graph["entities"]) + len(graph["relationships"]),
+                        "answer": answer,
+                    }
+
+                result = _run_reasoning_with_status(cli_ctx, engine, local_json, _infer)
+            except ImportError as exc:
+                raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+
+        elif engine == "deductive":
+            try:
+                # DeductiveReasoner/Premise aren't re-exported from
+                # semantica.reasoning's __init__ (unlike DatalogReasoner/
+                # GraphReasoner) -- import from the submodule directly.
+                from .reasoning.deductive_reasoner import DeductiveReasoner, Premise
+                dr = DeductiveReasoner(config=cli_ctx.config.to_dict())
+                for rule_def in (_load_rule_definitions(rules) if rules else []):
+                    dr.reasoner.add_rule(rule_def)
+                # DeductiveReasoner uses the same "IF X THEN Y" / "?x"
+                # syntax as rete (both go through Reasoner.add_rule()), so
+                # --rules files are shared across the two engines unchanged.
+                if premises_file:
+                    premises = _load_premises(premises_file)
+                else:
+                    premises = [Premise(premise_id=f"fact_{i}", statement=fact)
+                                for i, fact in enumerate(_graph_store_facts(cli_ctx))]
+
+                def _infer() -> Dict[str, Any]:
+                    # apply_logic() scans self.reasoner.rules once, not to a
+                    # fixpoint -- a conclusion whose prerequisite premise is
+                    # itself a *later* rule's conclusion would be silently
+                    # dropped from a single call. known_facts persists on
+                    # the DeductiveReasoner instance across calls (premises
+                    # are just re-added, which is a no-op on a set), so
+                    # looping until a call yields nothing new reaches the
+                    # same fixpoint infer_facts()/derive_all() reach for
+                    # the other engines.
+                    conclusions: List[Any] = []
+                    while True:
+                        new_conclusions = dr.apply_logic(premises)
+                        if not new_conclusions:
+                            break
+                        conclusions.extend(new_conclusions)
+                    return {
+                        "engine": engine,
+                        "facts": len(premises),
+                        "inferred_count": len(conclusions),
+                        "inferred_facts": [c.statement for c in conclusions],
+                    }
+
+                result = _run_reasoning_with_status(cli_ctx, engine, local_json, _infer)
+            except ImportError as exc:
+                raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+
+        elif engine == "abductive":
+            if not observations_file:
+                raise click.ClickException(
+                    "Engine 'abductive' requires --observations <file>.")
+            try:
+                from .reasoning.abductive_reasoner import AbductiveReasoner
+                ab = AbductiveReasoner(config=cli_ctx.config.to_dict())
+                for rule_def in (_load_rule_definitions(rules) if rules else []):
+                    ab.reasoner.add_rule(rule_def)
+                # Deliberately not calling _graph_store_facts()/
+                # add_knowledge() here: AbductiveReasoner's current
+                # generate_hypotheses()/find_explanations() never reads
+                # knowledge_base, so it would have no effect on the result
+                # while forcing every abductive run to depend on the
+                # configured graph store being reachable -- even a fully
+                # self-contained --rules + --observations run would fail if
+                # the graph backend is down. Revisit once knowledge_base is
+                # actually consumed by the ranking/generation algorithm.
+                observations = _load_observations(observations_file)
+
+                def _infer() -> Dict[str, Any]:
+                    explanations = ab.find_explanations(observations)
+                    return {
+                        "engine": engine,
+                        "observations": len(observations),
+                        "explanations": [
+                            {
+                                "observation": exp.observation.description,
+                                "best_hypothesis": (
+                                    exp.best_hypothesis.explanation
+                                    if exp.best_hypothesis else None
+                                ),
+                                "confidence": exp.confidence,
+                                "hypotheses_considered": len(exp.hypotheses),
+                            }
+                            for exp in explanations
+                        ],
+                    }
+
+                result = _run_reasoning_with_status(cli_ctx, engine, local_json, _infer)
+            except ImportError as exc:
+                raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+
+        else:
+            # sparql is the only remaining engine choice, and it has no
+            # execution path to dispatch to at all: SPARQLReasoner.
+            # execute_query() raises NotImplementedError unconditionally
+            # and the class has no .query() method either. Fail honestly
+            # instead of silently forward-chaining under another engine's
+            # name.
+            raise click.ClickException(
+                "Engine 'sparql' is not wired to 'reason run' yet; "
+                "supported engines: rete, forward-chain, datalog, graph, "
+                "deductive, abductive. Use 'semantica reason query' for "
+                "SPARQL queries.")
+
         if _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"result": str(result)})
         else:
@@ -2121,7 +3747,6 @@ def decision_record(cli_ctx: CLIContext, title: str, tags: Optional[str],
             return
         try:
             from .context.decision_methods import record_decision
-            graph_store = _get_graph_store(cli_ctx)
             cross_ctx: Dict[str, Any] = {"tags": tag_list}
             if valid_from:
                 cross_ctx["valid_from"] = valid_from
@@ -2130,15 +3755,42 @@ def decision_record(cli_ctx: CLIContext, title: str, tags: Optional[str],
             # Map CLI flags to API: title→scenario, rationale→reasoning,
             # first tag (if any)→category, outcome and confidence use defaults.
             category = tag_list[0] if tag_list else "general"
-            result = record_decision(
-                graph_store,
-                category=category,
-                scenario=title,
-                reasoning=rationale or "",
-                outcome="recorded",
-                confidence=1.0,
-                cross_system_context=cross_ctx,
-            )
+            # --rationale is optional, but ContextGraph rejects empty reasoning.
+            # Normalise once so both backends store the same thing rather than
+            # one storing "" and the other refusing the command.
+            reasoning = rationale or _NO_RATIONALE
+            if _uses_memory_graph(cli_ctx):
+                with _memory_graph_lock(cli_ctx):
+                    graph = _load_context_graph(cli_ctx)
+                    result = graph.record_decision(
+                        category=category,
+                        scenario=title,
+                        reasoning=reasoning,
+                        outcome="recorded",
+                        confidence=1.0,
+                        # ContextGraph tracks node validity itself, so pass the
+                        # dates as validity rather than leaving them in
+                        # metadata, where they would not bound the node.
+                        # They are kept out of the metadata as well, since the
+                        # graph ignores metadata keys that name node fields.
+                        metadata={
+                            k: v for k, v in cross_ctx.items()
+                            if k not in ("valid_from", "valid_until")
+                        },
+                        valid_from=valid_from,
+                        valid_until=valid_until,
+                    )
+                    _save_context_graph(cli_ctx, graph)
+            else:
+                result = record_decision(
+                    _get_graph_store(cli_ctx),
+                    category=category,
+                    scenario=title,
+                    reasoning=reasoning,
+                    outcome="recorded",
+                    confidence=1.0,
+                    cross_system_context=cross_ctx,
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -2160,13 +3812,16 @@ def decision_list(cli_ctx: CLIContext, limit: int, fmt: str, local_json: bool) -
 
     def _action() -> None:
         try:
-            from .context.decision_query import DecisionQuery
-            dq = DecisionQuery(_get_graph_store(cli_ctx))
-            results_raw = dq.find_by_time_range(
-                __import__("datetime").datetime.min,
-                __import__("datetime").datetime.now(),
-                limit=limit,
-            )
+            if _uses_memory_graph(cli_ctx):
+                results_raw = _memory_decision_records(cli_ctx, limit=limit)
+            else:
+                from .context.decision_query import DecisionQuery
+                dq = DecisionQuery(_get_graph_store(cli_ctx))
+                results_raw = dq.find_by_time_range(
+                    __import__("datetime").datetime.min,
+                    __import__("datetime").datetime.now(),
+                    limit=limit,
+                )
             results = [
                 {"id": d.decision_id, "title": d.scenario, "tags": [d.category]}
                 for d in (results_raw or [])
@@ -2189,6 +3844,24 @@ def decision_list(cli_ctx: CLIContext, limit: int, fmt: str, local_json: bool) -
     _run_with_error_handling(_action)
 
 
+def _tag_filter_value(filter_str: str) -> str:
+    """Return the value part of a ``tag:<value>`` decision filter, lowercased.
+
+    ``str.lstrip("tag:")`` strips any leading ``t``, ``a``, ``g`` or ``:``
+    *characters*, not the prefix: ``tag:auth`` became ``uth`` and ``tag:git``
+    became ``it``, so the filter silently matched the wrong text. Anything
+    without the prefix is passed through unchanged. An empty value is rejected,
+    since ``"" in category`` is true for every decision.
+    """
+    value = filter_str.removeprefix("tag:").lower()
+    if not value:
+        raise click.BadParameter(
+            "tag: filter requires a non-empty value, e.g. tag:finance",
+            param_hint="'--filter'",
+        )
+    return value
+
+
 @decision.command("query")
 @click.option("--filter", "filter_str", default=None, help="e.g. tag:finance")
 @click.option("--since", default=None, help="ISO 8601 date.")
@@ -2201,18 +3874,24 @@ def decision_query(cli_ctx: CLIContext, filter_str: Optional[str],
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
+        tag_value = _tag_filter_value(filter_str) if filter_str is not None else None
         try:
-            from .context.decision_query import DecisionQuery
             import datetime as _dt
-            dq = DecisionQuery(_get_graph_store(cli_ctx))
             since_dt = _dt.datetime.fromisoformat(since) if since else _dt.datetime.min
-            raw = dq.find_by_time_range(since_dt, _dt.datetime.now(), limit=500)
+            if _uses_memory_graph(cli_ctx):
+                raw = _memory_decision_records(
+                    cli_ctx, limit=500,
+                    since_ts=since_dt.timestamp() if since else None,
+                )
+            else:
+                from .context.decision_query import DecisionQuery
+                dq = DecisionQuery(_get_graph_store(cli_ctx))
+                raw = dq.find_by_time_range(since_dt, _dt.datetime.now(), limit=500)
             results: List[Dict[str, Any]] = [
                 {"id": d.decision_id, "category": d.category, "scenario": d.scenario,
                  "outcome": d.outcome, "confidence": d.confidence}
                 for d in (raw or [])
-                if filter_str is None
-                or filter_str.lstrip("tag:").lower() in d.category.lower()
+                if tag_value is None or tag_value in d.category.lower()
             ]
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
@@ -2241,8 +3920,11 @@ def decision_trace(cli_ctx: CLIContext, decision_id: str, fmt: str, local_json: 
 
     def _action() -> None:
         try:
-            from .context.decision_methods import get_causal_chain
-            chain_raw = get_causal_chain(_get_graph_store(cli_ctx), decision_id)
+            if _uses_memory_graph(cli_ctx):
+                chain_raw = _load_context_graph(cli_ctx).get_causal_chain(decision_id)
+            else:
+                from .context.decision_methods import get_causal_chain
+                chain_raw = get_causal_chain(_get_graph_store(cli_ctx), decision_id)
             chain: Any = [
                 {"id": d.decision_id, "scenario": d.scenario, "outcome": d.outcome}
                 for d in chain_raw
@@ -2269,7 +3951,14 @@ def decision_similar(cli_ctx: CLIContext, decision_id: str, top_k: int, local_js
     def _action() -> None:
         try:
             from .context.decision_methods import find_precedents
-            raw = find_precedents(_get_graph_store(cli_ctx), decision_id, limit=top_k)
+            if _uses_memory_graph(cli_ctx):
+                raw = _load_context_graph(cli_ctx).find_precedents(
+                    decision_id, limit=top_k
+                )
+            else:
+                raw = find_precedents(
+                    _get_graph_store(cli_ctx), decision_id, limit=top_k
+                )
             results: List[Dict[str, Any]] = [
                 {"id": d.decision_id, "scenario": d.scenario, "category": d.category,
                  "confidence": d.confidence}
@@ -2296,7 +3985,14 @@ def decision_impact(cli_ctx: CLIContext, decision_id: str, local_json: bool) -> 
     def _action() -> None:
         try:
             from .context.decision_methods import analyze_decision_impact
-            result = analyze_decision_impact(_get_graph_store(cli_ctx), decision_id)
+            if _uses_memory_graph(cli_ctx):
+                result = _load_context_graph(cli_ctx).analyze_decision_impact(
+                    decision_id
+                )
+            else:
+                result = analyze_decision_impact(
+                    _get_graph_store(cli_ctx), decision_id
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -2320,13 +4016,29 @@ def decision_check(cli_ctx: CLIContext, decision_id: str, rules: Optional[str],
 
     def _action() -> None:
         try:
-            from .context.decision_methods import check_decision_compliance
-            # The API expects a policy_id string; derive it from the rules file stem
-            # if provided, otherwise use the decision ID itself as the policy key.
-            policy_id = Path(rules).stem if rules else decision_id
-            result = check_decision_compliance(
-                _get_graph_store(cli_ctx), decision_id, policy_id
-            )
+            if _uses_memory_graph(cli_ctx):
+                graph = _load_context_graph(cli_ctx)
+                decision = next(
+                    (d for d in _memory_decisions(cli_ctx) if d["id"] == decision_id),
+                    None,
+                )
+                if decision is None:
+                    raise click.ClickException(
+                        f"No decision {decision_id!r} in "
+                        f"{_memory_graph_path(cli_ctx)}. Run 'semantica decision "
+                        f"list' to see what is recorded."
+                    )
+                result = graph.check_decision_rules(
+                    decision, rules=_load_policy_rules(rules) if rules else None
+                )
+            else:
+                from .context.decision_methods import check_decision_compliance
+                # The API expects a policy_id string; derive it from the rules file
+                # stem if provided, otherwise use the decision ID as the policy key.
+                policy_id = Path(rules).stem if rules else decision_id
+                result = check_decision_compliance(
+                    _get_graph_store(cli_ctx), decision_id, policy_id
+                )
         except ImportError as exc:
             raise click.ClickException(f"Context module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -2345,13 +4057,88 @@ def temporal(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
+def _load_temporal_kg(cli_ctx: CLIContext) -> Dict[str, Any]:
+    """Load the CLI's persisted graph in the ``{"entities", "relationships"}``
+    shape the temporal engines consume."""
+    if not _uses_memory_graph(cli_ctx):
+        raise click.ClickException(
+            "The temporal commands read the CLI's persisted memory-backend "
+            "graph and are not wired for the "
+            f"{_resolve_graph_backend(cli_ctx)!r} backend yet."
+        )
+    from .kg.temporal_model import parse_temporal_value
+
+    graph = _load_context_graph(cli_ctx).to_kg_dict()
+    # The export keeps ``recorded_at`` inside properties/metadata, but the
+    # temporal engines read temporal fields at the fact's top level. Lift it
+    # (normalised to UTC) so a fact recorded without explicit validity dates
+    # still has a history event.
+    for fact in (*graph.get("entities", []), *graph.get("relationships", [])):
+        if "recorded_at" in fact:
+            continue
+        recorded_at = (fact.get("properties") or {}).get("recorded_at") or (
+            fact.get("metadata") or {}
+        ).get("recorded_at")
+        parsed = parse_temporal_value(recorded_at) if recorded_at is not None else None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            fact["recorded_at"] = parsed.isoformat()
+    return graph
+
+
+def _parse_allen_interval(spec: str) -> Any:
+    """Parse a ``start/end`` interval spec into a ``TemporalInterval``.
+
+    Values keep their exact precision instead of being normalised to a
+    granularity: expanding the end to the last microsecond of its second (as
+    ``normalize_interval`` does) makes an end that equals the next interval's
+    start report ``overlaps`` where Allen algebra says ``meets``.
+    """
+    from .kg.temporal_model import (
+        TemporalBound,
+        parse_temporal_bound,
+        parse_temporal_value,
+    )
+    from .kg.temporal_reasoning import TemporalInterval
+
+    parts = spec.split("/", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise click.ClickException(
+            f"Interval must be given as start/end, got: {spec!r}"
+        )
+    start = parse_temporal_value(parts[0].strip())
+    if start is None:
+        raise click.ClickException(f"Invalid interval start: {parts[0].strip()!r}")
+    end: Any = parse_temporal_bound(parts[1].strip(), default=TemporalBound.OPEN)
+    if end is not TemporalBound.OPEN:
+        end = parse_temporal_value(end)
+        if end is None:
+            raise click.ClickException(f"Invalid interval end: {parts[1].strip()!r}")
+    # Keep naive values comparable with aware ones inside relation().
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if isinstance(end, datetime) and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if isinstance(end, datetime) and end < start:
+        raise click.ClickException(f"Interval end precedes its start: {spec!r}")
+    return TemporalInterval(start=start, end=end)
+
+
 @temporal.command("snapshot")
 @click.option("--at", "at_time", required=True, help="ISO 8601 datetime.")
-@click.option("--format", "fmt", type=click.Choice(["json", "table"]),
-              default="json", show_default=True)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["json", "table"]),
+    default="json",
+    show_default=True,
+)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def temporal_snapshot(cli_ctx: CLIContext, at_time: str, fmt: str, local_json: bool) -> None:
+def temporal_snapshot(
+    cli_ctx: CLIContext, at_time: str, fmt: str, local_json: bool
+) -> None:
     """Graph state at a specific point in time.
 
     \b
@@ -2363,10 +4150,13 @@ def temporal_snapshot(cli_ctx: CLIContext, at_time: str, fmt: str, local_json: b
     def _action() -> None:
         try:
             from .kg import TemporalGraphQuery
-            tgq = TemporalGraphQuery(config=cli_ctx.config.to_dict())
-            result = tgq.snapshot(at=at_time)
         except ImportError as exc:
-            raise click.ClickException(f"KG temporal module not available: {exc}") from exc
+            raise click.ClickException(
+                f"KG temporal module not available: {exc}"
+            ) from exc
+        graph = _load_temporal_kg(cli_ctx)
+        tgq = TemporalGraphQuery()
+        result = tgq.reconstruct_at_time(graph, at_time)
         if _is_json(cli_ctx, local_json) or fmt == "json":
             _jecho(result if isinstance(result, dict) else {"snapshot": str(result)})
         else:
@@ -2377,21 +4167,41 @@ def temporal_snapshot(cli_ctx: CLIContext, at_time: str, fmt: str, local_json: b
 
 @temporal.command("query")
 @click.argument("query_str")
+@click.option(
+    "--at",
+    "at_time",
+    default=None,
+    help="ISO 8601 datetime to query at (defaults to the current time).",
+)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def temporal_query(cli_ctx: CLIContext, query_str: str, local_json: bool) -> None:
-    """Temporal-aware graph query."""
+def temporal_query(
+    cli_ctx: CLIContext, query_str: str, at_time: Optional[str], local_json: bool
+) -> None:
+    """Temporal-aware graph query.
+
+    \b
+    Note: the query string is reserved for future query parsing; the result is
+    currently the graph slice valid at --at regardless of its content.
+    """
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         try:
             from .kg import TemporalGraphQuery
-            tgq = TemporalGraphQuery(config=cli_ctx.config.to_dict())
-            result = tgq.query(query_str)
         except ImportError as exc:
-            raise click.ClickException(f"KG temporal module not available: {exc}") from exc
+            raise click.ClickException(
+                f"KG temporal module not available: {exc}"
+            ) from exc
+        graph = _load_temporal_kg(cli_ctx)
+        tgq = TemporalGraphQuery()
+        result = tgq.query_at_time(
+            graph, query_str, at_time or datetime.now(timezone.utc)
+        )
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, (dict, list)) else {"result": str(result)})
+            _jecho(
+                result if isinstance(result, (dict, list)) else {"result": str(result)}
+            )
         else:
             _pprint(cli_ctx, result)
 
@@ -2404,8 +4214,13 @@ def temporal_query(cli_ctx: CLIContext, query_str: str, local_json: bool) -> Non
 @click.option("--format", "fmt", type=click.Choice(["table", "json"]), default="table")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def temporal_history(cli_ctx: CLIContext, entity_id: str, since: Optional[str],
-                     fmt: str, local_json: bool) -> None:
+def temporal_history(
+    cli_ctx: CLIContext,
+    entity_id: str,
+    since: Optional[str],
+    fmt: str,
+    local_json: bool,
+) -> None:
     """Change history for an entity.
 
     \b
@@ -2416,39 +4231,84 @@ def temporal_history(cli_ctx: CLIContext, entity_id: str, since: Optional[str],
 
     def _action() -> None:
         try:
-            from .kg import TemporalVersionManager
-            tvm = TemporalVersionManager(config=cli_ctx.config.to_dict())
-            result = tvm.history(entity_id, since=since)
+            from .kg.temporal_reasoning import TemporalReasoningEngine
+            from .kg.temporal_model import (
+                parse_temporal_value,
+                temporal_structure_to_json_ready,
+            )
         except ImportError as exc:
-            raise click.ClickException(f"KG temporal module not available: {exc}") from exc
+            raise click.ClickException(
+                f"KG temporal module not available: {exc}"
+            ) from exc
+        graph = _load_temporal_kg(cli_ctx)
+        events = TemporalReasoningEngine().timeline_of(entity_id, graph)
+        if since:
+            since_dt = parse_temporal_value(since)
+            if since_dt is not None:
+                if since_dt.tzinfo is None:
+                    since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+                def _aware(ts: datetime) -> datetime:
+                    return (
+                        ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+                    )
+
+                events = [
+                    event for event in events if _aware(event["timestamp"]) >= since_dt
+                ]
+        # Serialize through the kg temporal helpers so timestamps are ISO 8601
+        # in every output mode, consistent with `temporal distance`, instead of
+        # the space-separated str() form json.dumps(default=str) produces.
+        ready = temporal_structure_to_json_ready(
+            events if isinstance(events, list) else []
+        )
         if _is_json(cli_ctx, local_json) or fmt == "json":
-            _jecho(result if isinstance(result, list) else [])
+            _jecho(ready)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, ready)
 
     _run_with_error_handling(_action)
 
 
 @temporal.command("distance")
-@click.option("--event1", required=True)
-@click.option("--event2", required=True)
-@click.option("--history", is_flag=True, default=False)
+@click.option("--event1", required=True, help="First timestamp (ISO 8601).")
+@click.option("--event2", required=True, help="Second timestamp (ISO 8601).")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def temporal_distance(cli_ctx: CLIContext, event1: str, event2: str,
-                      history: bool, local_json: bool) -> None:
-    """Temporal distance between two events."""
+def temporal_distance(
+    cli_ctx: CLIContext, event1: str, event2: str, local_json: bool
+) -> None:
+    """Temporal distance between two timestamps."""
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         try:
-            from .kg import TemporalGraphQuery
-            tgq = TemporalGraphQuery(config=cli_ctx.config.to_dict())
-            result = tgq.distance(event1, event2, include_history=history)
+            from .kg.temporal_model import parse_temporal_value
         except ImportError as exc:
-            raise click.ClickException(f"KG temporal module not available: {exc}") from exc
+            raise click.ClickException(
+                f"KG temporal module not available: {exc}"
+            ) from exc
+        # Exact values, not a granularity: rounding to whole seconds first
+        # collapses any distance smaller than a second to zero.
+        t1 = parse_temporal_value(event1)
+        t2 = parse_temporal_value(event2)
+        if t1 is None or t2 is None:
+            raise click.ClickException(
+                f"Could not parse timestamp(s): {event1!r}, {event2!r}"
+            )
+        if t1.tzinfo is None:
+            t1 = t1.replace(tzinfo=timezone.utc)
+        if t2.tzinfo is None:
+            t2 = t2.replace(tzinfo=timezone.utc)
+        seconds = abs((t2 - t1).total_seconds())
+        result = {
+            "event1": t1.isoformat(),
+            "event2": t2.isoformat(),
+            "distance_seconds": seconds,
+            "distance_days": seconds / 86400,
+        }
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"distance": str(result)})
+            _jecho(result)
         else:
             _pprint(cli_ctx, result)
 
@@ -2456,28 +4316,71 @@ def temporal_distance(cli_ctx: CLIContext, event1: str, event2: str,
 
 
 @temporal.command("allen")
-@click.option("--interval1", required=True)
-@click.option("--interval2", required=True)
+@click.option(
+    "--interval1", required=True, help="First interval as start/end (ISO 8601)."
+)
+@click.option(
+    "--interval2", required=True, help="Second interval as start/end (ISO 8601)."
+)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def temporal_allen(cli_ctx: CLIContext, interval1: str, interval2: str,
-                   local_json: bool) -> None:
+def temporal_allen(
+    cli_ctx: CLIContext, interval1: str, interval2: str, local_json: bool
+) -> None:
     """Allen interval algebra relation between two intervals."""
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         try:
-            from .reasoning import TemporalReasoningEngine
-            engine = TemporalReasoningEngine(config=cli_ctx.config.to_dict())
-            result = engine.allen_relation(interval1, interval2)
+            from .kg.temporal_reasoning import TemporalReasoningEngine
         except ImportError as exc:
-            raise click.ClickException(f"Reasoning module not available: {exc}") from exc
+            raise click.ClickException(
+                f"Reasoning module not available: {exc}"
+            ) from exc
+        engine = TemporalReasoningEngine()
+        iv1 = _parse_allen_interval(interval1)
+        iv2 = _parse_allen_interval(interval2)
+        relation = engine.relation(iv1, iv2)
+        relation_name = relation.value if hasattr(relation, "value") else str(relation)
         if _is_json(cli_ctx, local_json):
-            _jecho({"interval1": interval1, "interval2": interval2, "relation": str(result)})
+            _jecho(
+                {
+                    "interval1": interval1,
+                    "interval2": interval2,
+                    "relation": relation_name,
+                }
+            )
         else:
-            console.print(f"{interval1} ── {result} ──► {interval2}")
+            console.print(f"{interval1} ── {relation_name} ──► {interval2}")
 
     _run_with_error_handling(_action)
+
+
+def _provenance_manager(cli_ctx: CLIContext, *, create: bool = False) -> Any:
+    """Open the provenance store the CLI's commands share.
+
+    A configured ``provenance.storage_path`` wins; otherwise the CLI opens the
+    database the Explorer uses (``SEMANTICA_PROVENANCE_DB`` /
+    ``EXPLORER_PROVENANCE_DB``). Before this every command read a fresh
+    in-memory store and reported nothing (#1810).
+
+    Opening a path that does not exist creates an empty SQLite database there,
+    so a mistyped path read back as an empty, valid store (#2166). Unless
+    ``create`` is set, as for ``invalidate``, which writes, the path must
+    already be a file.
+    """
+    from .provenance import ProvenanceManager, storage_path_from_env
+
+    configured = cli_ctx.config.get("provenance.storage_path")
+    storage_path = None if configured else storage_path_from_env()
+    path = configured or storage_path
+    if path and not create and not Path(path).is_file():
+        raise click.ClickException(
+            f"Provenance database '{path}' does not exist. Check "
+            "provenance.storage_path, SEMANTICA_PROVENANCE_DB or "
+            "EXPLORER_PROVENANCE_DB."
+        )
+    return ProvenanceManager(storage_path=storage_path, config=cli_ctx.config.to_dict())
 
 
 @main.group(invoke_without_command=True)
@@ -2504,8 +4407,7 @@ def provenance_lineage(cli_ctx: CLIContext, entity_id: str, depth: int, local_js
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.lineage(entity_id, depth=depth)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2541,8 +4443,7 @@ def provenance_audit(cli_ctx: CLIContext, since: Optional[str], fmt: str,
             _dry(cli_ctx, "export audit log", since=since, format=fmt, output=output)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.audit_log(since=since, format=fmt)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2581,8 +4482,7 @@ def provenance_export(cli_ctx: CLIContext, fmt: str, base_uri: Optional[str],
             _dry(cli_ctx, "export provenance", format=fmt, base_uri=base_uri, output=output)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             data = pm.export_prov(format=fmt, base_uri=base_uri)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2605,8 +4505,7 @@ def provenance_check(cli_ctx: CLIContext, strict: bool, local_json: bool) -> Non
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.check(strict=strict)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2648,8 +4547,7 @@ def provenance_invalidate(cli_ctx: CLIContext, entity_id: str, agent_id: str,
             _dry(cli_ctx, "invalidate provenance entity", entity_id=entity_id, by=agent_id, reason=reason)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx, create=True)
             result = pm.invalidate(entity_id, agent_id=agent_id, reason=reason)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2680,8 +4578,7 @@ def provenance_verify_chain(cli_ctx: CLIContext, local_json: bool) -> None:
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.verify_chain()
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -2717,8 +4614,7 @@ def provenance_descendants(cli_ctx: CLIContext, entity_id: str, depth: Optional[
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             if depth is not None:
                 entries = [e.to_dict() for e in pm.trace_descendants(entity_id, max_depth=depth)]
                 result = {"entity_id": entity_id, "depth": depth, "entries": entries}
@@ -2742,40 +4638,88 @@ def validate(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
+_RDF_FORMAT_BY_SUFFIX = {
+    ".ttl": "turtle",
+    ".turtle": "turtle",
+    ".nt": "nt",
+    ".ntriples": "nt",
+    ".jsonld": "json-ld",
+    ".json-ld": "json-ld",
+    ".json": "json-ld",
+}
+
+
+def _rdf_format_for(path: str) -> str:
+    """RDF format for a file, chosen from its extension."""
+    suffix = Path(path).suffix.lower()
+    if suffix not in _RDF_FORMAT_BY_SUFFIX:
+        raise click.BadParameter(
+            f"cannot tell the RDF format of '{path}' from its extension; "
+            f"use one of {', '.join(sorted(_RDF_FORMAT_BY_SUFFIX))}",
+            param_hint="'DATA' / '--shapes'",
+        )
+    return _RDF_FORMAT_BY_SUFFIX[suffix]
+
+
 @validate.command("shacl")
-@click.option("--shapes", default=None, type=click.Path(exists=True),
-              help="SHACL shapes file (auto-generated if omitted).")
-@click.option("--strictness", type=click.Choice(["strict", "moderate", "lenient"]),
-              default="moderate", show_default=True)
+@click.argument("data", type=click.Path(exists=True, dir_okay=False))
+@click.option("--shapes", required=True, type=click.Path(exists=True, dir_okay=False),
+              help="SHACL shapes file (Turtle, JSON-LD or N-Triples).")
 @click.option("--report", default=None, type=click.Path(),
               help="Write validation report to file.")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def validate_shacl(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
+def validate_shacl(cli_ctx: CLIContext, data: str, shapes: str,
                    report: Optional[str], local_json: bool) -> None:
-    """Validate data against SHACL constraint shapes.
+    """Validate an RDF file against SHACL constraint shapes.
+
+    Both files are read as RDF; their format comes from the file extension
+    (.ttl, .nt, .jsonld, .json).
 
     \b
     Example:
-      semantica validate shacl --strictness strict --report report.json
+      semantica validate shacl data.ttl --shapes shapes.ttl
     """
     cli_ctx = _require_ctx(cli_ctx)
+    data_format = _rdf_format_for(data)
+    shapes_format = _rdf_format_for(shapes)
 
     def _action() -> None:
         try:
-            from .ontology import OntologyValidator
-            v = OntologyValidator(config=cli_ctx.config.to_dict())
-            result = v.validate_shacl(shapes_file=shapes, strictness=strictness)
+            from .ontology import run_shacl_validation
         except ImportError as exc:
-            raise click.ClickException(f"Ontology/validation module not available: {exc}") from exc
-        payload = result if isinstance(result, dict) else {"valid": bool(result)}
+            raise click.ClickException(
+                f"Ontology/validation module not available: {exc}"
+            ) from exc
+        try:
+            shacl_report = run_shacl_validation(
+                Path(data).read_text(encoding="utf-8"),
+                Path(shapes).read_text(encoding="utf-8"),
+                data_graph_format=data_format,
+                shacl_format=shapes_format,
+            )
+        except ImportError as exc:
+            raise click.ClickException(
+                "SHACL validation needs pyshacl, which ships in the optional "
+                "'shacl' extra: pip install 'semantica[shacl]'"
+            ) from exc
+        payload = {
+            "conforms": shacl_report.conforms,
+            "violation_count": shacl_report.violation_count,
+            "violations": _serialize_extract_result(shacl_report.violations),
+            "warnings": _serialize_extract_result(shacl_report.warnings),
+        }
         if report:
             Path(report).write_text(json.dumps(payload, default=str), encoding="utf-8")
             _ok(cli_ctx, f"Wrote {report}")
         if _is_json(cli_ctx, local_json):
             _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
+        if not shacl_report.conforms:
+            # Exit non-zero like `pipeline validate`, so CI can gate on it
+            # without parsing the report.
+            raise SystemExit(1)
 
     _run_with_error_handling(_action)
 
@@ -2785,11 +4729,23 @@ def validate_shacl(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
               type=click.Choice(["value", "property", "type", "relationship",
                                   "temporal", "logical", "entity", "all"]),
               default="all", show_default=True)
+@click.option(
+    "--property",
+    "property_name",
+    default=None,
+    help="Property to compare (value and property strategies).",
+)
 @click.option("--format", "fmt", type=click.Choice(["json", "table"]),
               default="json", show_default=True)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def validate_conflicts(cli_ctx: CLIContext, strategy: str, fmt: str, local_json: bool) -> None:
+def validate_conflicts(
+    cli_ctx: CLIContext,
+    strategy: str,
+    property_name: Optional[str],
+    fmt: str,
+    local_json: bool,
+) -> None:
     """Detect value, type, temporal, and logical conflicts.
 
     \b
@@ -2797,17 +4753,35 @@ def validate_conflicts(cli_ctx: CLIContext, strategy: str, fmt: str, local_json:
       semantica validate conflicts --format json | jq '.conflicts | length'
     """
     cli_ctx = _require_ctx(cli_ctx)
+    if property_name and strategy not in ("value", "property"):
+        raise click.UsageError(
+            f"--property has no meaning for --strategy {strategy}; it is only "
+            "read by the 'value' and 'property' strategies."
+        )
+    if strategy in ("value", "property") and not property_name:
+        raise click.UsageError(f"--strategy {strategy} needs --property.")
 
     def _action() -> None:
         try:
-            from .conflicts import detect_conflicts
-            result = detect_conflicts(strategy=strategy, config=cli_ctx.config.to_dict())
+            from .conflicts import ConflictDetector
         except ImportError as exc:
             raise click.ClickException(f"Conflicts module not available: {exc}") from exc
+        graph = _knowledge_graph_dict(cli_ctx)
+        detector = ConflictDetector(config=cli_ctx.config.to_dict())
+        conflicts = detector.detect_conflicts(
+            _conflict_entities(graph),
+            method=strategy,
+            property_name=property_name,
+            relationships=graph.get("relationships", []),
+        )
+        payload = {
+            "conflicts": _serialize_extract_result(conflicts),
+            "count": len(conflicts),
+        }
         if _is_json(cli_ctx, local_json) or fmt == "json":
-            _jecho(result if isinstance(result, dict) else {"conflicts": result})
+            _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
@@ -2822,12 +4796,12 @@ def validate_integrity(cli_ctx: CLIContext, local_json: bool) -> None:
     def _action() -> None:
         try:
             from .kg import GraphValidator
-            v = GraphValidator(config=cli_ctx.config.to_dict())
-            result = v.integrity_check()
         except ImportError as exc:
             raise click.ClickException(f"KG module not available: {exc}") from exc
+        # GraphValidator has no integrity_check(); validate() is the check.
+        result = GraphValidator().validate(_kg_graph(cli_ctx)).to_dict()
         if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"valid": bool(result)})
+            _jecho(result)
         else:
             _ok(cli_ctx, f"Integrity check: {result}")
 
@@ -2880,6 +4854,18 @@ def ontology_generate(cli_ctx: CLIContext, domain: Optional[str], output: Option
     _run_with_error_handling(_action)
 
 
+# The CLI advertises rdflib's public format names, but the ingestor hands an
+# explicit format straight to `Dataset.parse`, which wants its own parser names.
+# Passing the advertised name through meant `rdfxml`, `jsonld` and `ntriples`
+# never reached the XML, JSON-LD or N-Triples parser (#1814 review).
+_ONTOLOGY_IMPORT_FORMATS = {
+    "turtle": "turtle",
+    "rdfxml": "xml",
+    "jsonld": "json-ld",
+    "ntriples": "nt",
+}
+
+
 @ontology.command("import")
 @click.argument("source")
 @click.option("--format", "fmt",
@@ -2905,7 +4891,10 @@ def ontology_import(cli_ctx: CLIContext, source: str, fmt: Optional[str],
             return
         try:
             from .ontology import ingest_ontology
-            result = ingest_ontology(source, format=fmt, config=cli_ctx.config.to_dict())
+            ingest_kwargs: Dict[str, Any] = {}
+            if fmt:
+                ingest_kwargs["format"] = _ONTOLOGY_IMPORT_FORMATS[fmt]
+            result = ingest_ontology(source, **ingest_kwargs)
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -2917,24 +4906,37 @@ def ontology_import(cli_ctx: CLIContext, source: str, fmt: Optional[str],
 
 
 @ontology.command("validate")
-@click.option("--shapes", default=None, type=click.Path(exists=True))
-@click.option("--strictness", type=click.Choice(["strict", "moderate", "lenient"]),
-              default="moderate", show_default=True)
+@click.option("--shapes", default=None, hidden=True,
+              help="Moved: use `semantica validate shacl DATA --shapes SHAPES`.")
 @click.option("--report", default=None, type=click.Path())
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def ontology_validate(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
-                      report: Optional[str], local_json: bool) -> None:
-    """Run SHACL validation on the ontology."""
+def ontology_validate(
+    cli_ctx: CLIContext, shapes: Optional[str],
+    report: Optional[str], local_json: bool
+) -> None:
+    """Check the generated ontology for consistency and satisfiability.
+
+    \b
+    Example:
+      semantica ontology validate --report ontology_report.json
+    """
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
+        # --shapes moved to `validate shacl`. Keep accepting it so an existing
+        # script gets a pointer instead of Click's "No such option" usage error
+        # (#1814 review).
+        if shapes:
+            raise click.ClickException(
+                "`ontology validate` no longer takes --shapes; use "
+                "`semantica validate shacl DATA --shapes SHAPES`."
+            )
         try:
             from .ontology import validate_ontology
-            result = validate_ontology(shapes_file=shapes, strictness=strictness,
-                                       config=cli_ctx.config.to_dict())
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
+        result = validate_ontology(_ontology_from_graph(cli_ctx))
         payload = result if isinstance(result, dict) else {"valid": bool(result)}
         if report:
             Path(report).write_text(json.dumps(payload, default=str), encoding="utf-8")
@@ -2942,7 +4944,7 @@ def ontology_validate(cli_ctx: CLIContext, shapes: Optional[str], strictness: st
         if _is_json(cli_ctx, local_json):
             _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
@@ -2958,11 +4960,11 @@ def ontology_shacl(cli_ctx: CLIContext, output: Optional[str], local_json: bool)
     def _action() -> None:
         try:
             from .ontology import SHACLGenerator
-            gen = SHACLGenerator(config=cli_ctx.config.to_dict())
-            result = gen.generate()
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
-        text = str(result)
+        generator = SHACLGenerator(config=cli_ctx.config.to_dict())
+        shapes_graph = generator.generate(_ontology_from_graph(cli_ctx))
+        text = generator.serialize(shapes_graph, format="turtle")
         if output:
             Path(output).write_text(text, encoding="utf-8")
             _ok(cli_ctx, f"Wrote {output}")
@@ -3054,7 +5056,7 @@ def ontology_align(cli_ctx: CLIContext, source: str, target: str, strategy: str,
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
         if output:
-            Path(output).write_text(json.dumps(result, default=str), encoding="utf-8")
+            _write_result_output(Path(output), result)
             _ok(cli_ctx, f"Wrote {output}")
         elif _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"alignments": str(result)})
@@ -3075,33 +5077,76 @@ def ontology_health(cli_ctx: CLIContext, fmt: str, local_json: bool) -> None:
 
     def _action() -> None:
         try:
-            from .ontology import OntologyValidator
-            v = OntologyValidator(config=cli_ctx.config.to_dict())
-            result = v.health()
+            from .ontology import OntologyEngine
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
+        # Read the graph once and hand it to the quality gate as well: the
+        # generated ontology does not retain the instances, so without this the
+        # report omitted every instance-level check (#1814 review).
+        graph = _knowledge_graph_dict(cli_ctx)
+        report = OntologyEngine().quality_check(
+            _ontology_from_graph(cli_ctx, graph), graph_data=graph
+        )
+        payload = _serialize_extract_result(report)
         if _is_json(cli_ctx, local_json) or fmt == "json":
-            _jecho(result if isinstance(result, dict) else {"health": str(result)})
+            _jecho(payload if isinstance(payload, dict) else {"health": payload})
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
 
 @ontology.command("version")
+@click.option("--storage", "storage_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="SQLite store holding saved ontology snapshots.")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def ontology_version(cli_ctx: CLIContext, local_json: bool) -> None:
+def ontology_version(cli_ctx: CLIContext, storage_path: Optional[str],
+                     local_json: bool) -> None:
     """Manage ontology versions."""
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         try:
             from .change_management import OntologyVersionManager
-            v = OntologyVersionManager(**cli_ctx.config.to_dict())
-            result = v.current()
         except ImportError as exc:
-            raise click.ClickException(f"Change management module not available: {exc}") from exc
+            raise click.ClickException(
+                f"Change management module not available: {exc}"
+            ) from exc
+        # OntologyVersionManager keeps an in-memory store unless it is handed a
+        # path, and Config.to_dict() has no top-level one, so the command read a
+        # fresh store and reported "no versions" no matter what another process
+        # had saved (#1814 review). Resolve the shared store from the flag or
+        # `custom.ontology.version_storage_path` — Config keeps a fixed set of
+        # sections, so a setting outside them only survives under `custom`.
+        storage = storage_path or cli_ctx.config.get(
+            "custom.ontology.version_storage_path"
+        )
+        # Same check --storage gets from click.Path(exists=True): opening a
+        # missing path would create an empty SQLite file.
+        if storage and not Path(storage).is_file():
+            raise click.ClickException(
+                f"Ontology version store '{storage}' does not exist."
+            )
+        manager = (
+            OntologyVersionManager(storage_path=storage)
+            if storage
+            else OntologyVersionManager()
+        )
+        versions = manager.list_versions()
+        if versions:
+            result = max(versions, key=lambda s: str(s.get("timestamp") or ""))
+        elif storage:
+            result = {"version": None, "message": "No ontology versions recorded yet."}
+        else:
+            result = {
+                "version": None,
+                "message": (
+                    "No persistent version store selected; pass --storage or set "
+                    "custom.ontology.version_storage_path to read saved snapshots."
+                ),
+            }
         if _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"version": str(result)})
         else:
@@ -3113,11 +5158,33 @@ def ontology_version(cli_ctx: CLIContext, local_json: bool) -> None:
 # ─── Data Out ─────────────────────────────────────────────────────────────────
 
 
+# Formats this command can build out of a graph-store dump. Three are left out
+# because a dump of entities and relationships cannot feed them: OWL and SHACL
+# are serialized from an ontology (`semantica ontology shacl` generates the
+# shapes), and the distance matrix is computed from an Explorer session graph
+# (POST /api/export/distance-enriched). Offering them advertised a failure, and
+# offering OWL would advertise a document with no classes in it.
 _EXPORT_FORMATS = [
     "turtle", "jsonld", "ntriples", "rdfxml",
     "parquet", "arrow", "csv", "json", "yaml",
-    "graphml", "owl", "shacl", "arangodb", "distance-enriched",
+    "graphml", "arangodb",
 ]
+
+
+def _multi_file_destination_error(
+    format_name: str, compress: bool
+) -> click.ClickException:
+    """The error for asking a multi-file format for a single destination."""
+    if compress:
+        return click.ClickException(
+            f"--format {format_name} writes one file per collection, so "
+            f"--compress has no single file to compress; use --output and leave "
+            f"--compress off."
+        )
+    return click.ClickException(
+        f"--format {format_name} writes one file per collection, so stdout "
+        f"cannot carry it; pass --output to name where they go."
+    )
 
 
 @main.command()
@@ -3136,13 +5203,19 @@ def export(
     cli_ctx: CLIContext, fmt: str, output: Optional[str], with_provenance: bool,
     filter_str: Optional[str], compress: bool, local_dry: bool, local_json: bool,
 ) -> None:
-    """Export the graph in 14 supported formats.
+    """Export the graph in 11 supported formats.
+
+    \b
+    arrow, csv and parquet write one file per collection, so --output names a
+    base path there and these formats cannot go to stdout.
 
     \b
     Examples:
       semantica export --format turtle --output graph.ttl
-      semantica export --format parquet --with-provenance --output graph.parquet
+      semantica export --format parquet --output graph.parquet
+        writes graph_entities.parquet and graph_relationships.parquet
       semantica export --format csv --filter "type:Person" --output persons.csv
+        writes persons_entities.csv and persons_relationships.csv
     """
     cli_ctx = _require_ctx(cli_ctx)
 
@@ -3154,7 +5227,7 @@ def export(
         try:
             import tempfile
 
-            from .export import get_export_method
+            from .export import MULTI_FILE_FORMATS, get_export_method
             from .graph_store import get_nodes, get_relationships
             from .graph_store.config import graph_store_config
 
@@ -3162,17 +5235,34 @@ def export(
             if fn is None:
                 raise click.ClickException("Export method not available: export/knowledge_graph")
 
-            graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
-            backend = cli_ctx.store_backend or graph_db.pop("backend", None)
-            previous_graph_config = graph_store_config.get_all()
-            graph_store_config.update(graph_db)
-            if backend:
-                graph_store_config.set("default_backend", backend)
-            try:
-                entities = get_nodes(limit=sys.maxsize)
-                relationships = get_relationships(limit=sys.maxsize)
-            finally:
-                graph_store_config.update(previous_graph_config)
+            # Fail before the store is read. These routes write one file per
+            # collection, which is neither one stream nor one compressed file,
+            # and finding that out after a full export wastes the read.
+            if fmt in MULTI_FILE_FORMATS and (compress or not output):
+                raise _multi_file_destination_error(fmt, compress)
+
+            if _uses_memory_graph(cli_ctx):
+                # ContextGraph.to_kg_dict() already returns entities and
+                # relationships in the shape assembled below.
+                kg = _load_context_graph(cli_ctx).to_kg_dict()
+                entities = kg.get("entities", [])
+                relationships = kg.get("relationships", [])
+            else:
+                graph_db = dict(cli_ctx.config.to_dict().get("graph_db", {}))
+                graph_db.pop("path", None)
+                # Pop before choosing, or an override leaves the configured
+                # backend in the mapping pushed into graph_store_config.
+                configured = graph_db.pop("backend", None)
+                backend = cli_ctx.store_backend or configured
+                previous_graph_config = graph_store_config.get_all()
+                graph_store_config.update(graph_db)
+                if backend:
+                    graph_store_config.set("default_backend", backend)
+                try:
+                    entities = get_nodes(limit=sys.maxsize)
+                    relationships = get_relationships(limit=sys.maxsize)
+                finally:
+                    graph_store_config.update(previous_graph_config)
 
             knowledge_graph = {
                 "entities": entities,
@@ -3195,30 +5285,50 @@ def export(
                 temp_handle.close()
                 target_output = temp_output
 
-            fn(knowledge_graph, target_output, **kwargs)
+            written = fn(knowledge_graph, target_output, **kwargs)
         except ImportError as exc:
             raise click.ClickException(f"Export module not available: {exc}") from exc
-        if compress:
-            import gzip
 
-            assert temp_output is not None
-            compressed = gzip.compress(Path(temp_output).read_bytes())
-            if output:
-                Path(output).write_bytes(compressed)
-                _ok(cli_ctx, f"Wrote compressed {output}")
+        # A route that decides its own output names the files it wrote: Arrow
+        # and Parquet write one file per collection, so the path this command
+        # was given is a base name and is never created. Report what is there
+        # rather than the name that was asked for.
+        produced = [Path(p) for p in written] if written else []
+        try:
+            if produced and (compress or not output):
+                # A backstop: a route that starts writing several files is
+                # caught here too, not only the two rejected above.
+                raise _multi_file_destination_error(fmt, compress)
+            if compress:
+                import gzip
+
+                assert temp_output is not None
+                compressed = gzip.compress(Path(temp_output).read_bytes())
+                if output:
+                    Path(output).write_bytes(compressed)
+                    _ok(cli_ctx, f"Wrote compressed {output}")
+                else:
+                    sys.stdout.buffer.write(compressed)
+            elif output:
+                if produced:
+                    _ok(cli_ctx, f"Wrote {', '.join(str(p) for p in produced)}")
+                elif written is None:
+                    _ok(cli_ctx, f"Wrote {output}")
+                else:
+                    _warn(
+                        cli_ctx,
+                        "Nothing written: the store returned no entities or "
+                        "relationships.",
+                    )
             else:
-                sys.stdout.buffer.write(compressed)
-        elif output:
-            _ok(cli_ctx, f"Wrote {output}")
-        else:
-            assert temp_output is not None
-            try:
-                click.echo(Path(temp_output).read_text(encoding="utf-8"))
-            except UnicodeDecodeError:
-                sys.stdout.buffer.write(Path(temp_output).read_bytes())
-
-        if temp_output:
-            Path(temp_output).unlink(missing_ok=True)
+                assert temp_output is not None
+                try:
+                    click.echo(Path(temp_output).read_text(encoding="utf-8"))
+                except UnicodeDecodeError:
+                    sys.stdout.buffer.write(Path(temp_output).read_bytes())
+        finally:
+            if temp_output:
+                Path(temp_output).unlink(missing_ok=True)
 
     _run_with_error_handling(_action)
 
@@ -3286,14 +5396,115 @@ _viz_command("analytics", "visualize_analytics", "Render centrality and communit
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
 
+# Must stay in step with PipelineTemplateManager.list_templates(). The CLI used to
+# offer five names the manager has never registered, so every `pipeline init`
+# reached "Template not found" once the wrapper called the real API. Pinned by
+# tests/test_cli_commands.py::TestPipeline::test_init_templates_match_the_manager.
 _PIPELINE_TEMPLATES = [
-    "ingest-extract-kg", "rag", "ontology-build", "decision-track", "full",
+    "document_processing", "rag_pipeline", "kg_construction", "ontology_generation",
 ]
+
+
+class PipelineFileError(click.ClickException):
+    """A pipeline file that parses but is not a usable pipeline definition.
+
+    ``errors`` keeps the per-entry messages so ``--json`` can report each
+    offending entry instead of one flattened sentence.
+    """
+
+    def __init__(self, message: str, errors: Optional[List[str]] = None) -> None:
+        super().__init__(message)
+        self.errors = list(errors) if errors else [message]
+
+
+def _pipeline_step_errors(payload: Dict[str, Any]) -> List[str]:
+    """Return an error for every step ``PipelineBuilder`` would silently drop.
+
+    ``PipelineBuilder.build_pipeline`` keeps a step only when both ``name`` and
+    ``type`` are truthy (``pipeline_builder.py`` — ``if step_name and
+    step_type``). Every other entry disappears before the validator sees it, so
+    a partly malformed file used to be reported valid. Check the shape here,
+    while the offending index is still known.
+    """
+    steps = payload.get("steps", [])
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        return [f"'steps' must be a list, got {type(steps).__name__}"]
+    errors: List[str] = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            errors.append(
+                f"steps[{index}] is not a mapping (got {type(step).__name__})"
+            )
+            continue
+        label = f"steps[{index}]"
+        name = step.get("name")
+        if isinstance(name, str) and name.strip():
+            label += f" ('{name}')"
+        for field_name in ("name", "type"):
+            value = step.get(field_name)
+            if not (isinstance(value, str) and value.strip()):
+                errors.append(
+                    f"{label} is missing a non-empty '{field_name}'"
+                )
+    return errors
+
+
+def _pipeline_builder_error_messages(exc: BaseException) -> List[str]:
+    """Split the builder's ``Pipeline validation failed: [...]`` message.
+
+    ``PipelineBuilder.build_pipeline`` raises one ``ValidationError`` whose
+    message embeds the list of validation errors as a Python literal, so a
+    ``--json`` caller that only got that string would have to parse it back.
+    """
+    detail = str(exc)
+    prefix = "Pipeline validation failed: "
+    if detail.startswith(prefix):
+        detail = detail[len(prefix):]
+    if detail.startswith("[") and detail.endswith("]"):
+        try:
+            parsed = ast.literal_eval(detail)
+        except (ValueError, SyntaxError):
+            return [detail]
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    return [detail]
+
+
+def _load_pipeline_file(path: str) -> Any:
+    """Load a pipeline config file into a ``Pipeline`` object.
+
+    Accepts YAML, or JSON (which ``yaml.safe_load`` parses as a subset). Step
+    handlers are process-local and are never restored from a file, so every step
+    of a loaded pipeline has ``handler is None`` — see
+    ``PipelineSerializer.deserialize_pipeline``.
+    """
+    try:
+        from .pipeline import PipelineSerializer
+    except ImportError as exc:
+        raise click.ClickException(f"Pipeline module not available: {exc}") from exc
+    try:
+        payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise click.ClickException(f"Could not parse {path} as YAML: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PipelineFileError(
+            f"{path} is not a pipeline definition: expected a mapping with a "
+            f"'steps' list, got {type(payload).__name__}."
+        )
+    step_errors = _pipeline_step_errors(payload)
+    if step_errors:
+        raise PipelineFileError(
+            f"{path} is not a valid pipeline definition: " + "; ".join(step_errors),
+            errors=step_errors,
+        )
+    return PipelineSerializer().deserialize_pipeline(payload)
 
 
 @pipeline.command("init")
 @click.option("--template", type=click.Choice(_PIPELINE_TEMPLATES),
-              default="ingest-extract-kg", show_default=True)
+              default="document_processing", show_default=True)
 @click.option("--output", default="pipeline.yaml", show_default=True, type=click.Path())
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.pass_obj
@@ -3302,7 +5513,7 @@ def pipeline_init(cli_ctx: CLIContext, template: str, output: str, local_dry: bo
 
     \b
     Example:
-      semantica pipeline init --template ingest-extract-kg --output pipeline.yaml
+      semantica pipeline init --template document_processing --output pipeline.yaml
     """
     cli_ctx = _require_ctx(cli_ctx)
 
@@ -3311,12 +5522,18 @@ def pipeline_init(cli_ctx: CLIContext, template: str, output: str, local_dry: bo
             _dry(cli_ctx, "init pipeline", template=template, output=output)
             return
         try:
-            from .pipeline import PipelineTemplateManager
-            mgr = PipelineTemplateManager()
-            content = mgr.scaffold(template)
-        except ImportError:
-            content = f"# Pipeline template: {template}\nsteps: []\n"
-        Path(output).write_text(content, encoding="utf-8")
+            from .pipeline import PipelineSerializer, PipelineTemplateManager
+        except ImportError as exc:
+            raise click.ClickException(f"Pipeline module not available: {exc}") from exc
+        builder = PipelineTemplateManager().create_pipeline_from_template(template)
+        # serialize_pipeline(..., format="yaml") returns the dict form rather than
+        # a YAML string, so the dump happens here.
+        payload = PipelineSerializer().serialize_pipeline(
+            builder.build(), format="yaml",
+        )
+        Path(output).write_text(
+            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8",
+        )
         _ok(cli_ctx, f"Created {output} from template '{template}'")
 
     _run_with_error_handling(_action)
@@ -3331,16 +5548,75 @@ def pipeline_validate(cli_ctx: CLIContext, pipeline_file: str, local_json: bool)
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
+        # --json promises its own {valid, errors, warnings, pipeline} object, so a
+        # file the loader (or the builder inside it) rejects must still be reported
+        # in that shape instead of falling through to the generic error envelope.
+        json_mode = _is_json(cli_ctx, local_json)
+        errors: List[str] = []
+        warnings_found: List[str] = []
+        pipeline = None
         try:
-            from .pipeline import PipelineValidator
-            v = PipelineValidator()
-            result = v.validate(pipeline_file)
-        except ImportError as exc:
-            raise click.ClickException(f"Pipeline module not available: {exc}") from exc
-        if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"valid": bool(result)})
+            pipeline = _load_pipeline_file(pipeline_file)
+        except PipelineFileError as exc:
+            if not json_mode:
+                raise
+            errors = exc.errors
+        except click.ClickException as exc:
+            if not json_mode:
+                raise
+            errors = [str(exc.format_message())]
+        except SemanticaError as exc:  # the builder rejected the payload
+            if not json_mode:
+                raise
+            errors = _pipeline_builder_error_messages(exc)
+        except Exception as exc:  # malformed in some way we did not anticipate
+            if not json_mode:
+                raise
+            errors = [str(exc)]
+
+        if pipeline is not None:
+            try:
+                from .pipeline import PipelineValidator
+            except ImportError as exc:
+                raise click.ClickException(
+                    f"Pipeline module not available: {exc}"
+                ) from exc
+            # The old wrapper passed the file path straight to validate(). A str has
+            # no steps, so it type-checked nothing and reported valid for any input.
+            result = PipelineValidator().validate(pipeline)
+            errors = [str(e) for e in (getattr(result, "errors", None) or [])]
+            warnings_found = [
+                str(w) for w in (getattr(result, "warnings", None) or [])
+            ]
+            valid = bool(getattr(result, "valid", False))
         else:
-            _ok(cli_ctx, f"Pipeline config valid: {pipeline_file}")
+            valid = False
+
+        if json_mode:
+            _jecho({
+                "valid": valid,
+                "errors": errors,
+                "warnings": warnings_found,
+                "pipeline": pipeline_file,
+            })
+            if not valid:
+                # Text mode already exits non-zero on an invalid file; JSON mode
+                # used to return 0, so callers had to parse the body to notice.
+                raise SystemExit(1)
+            return
+
+        if not valid:
+            for err in errors:
+                _warn(cli_ctx, err)
+            raise click.ClickException(
+                f"Pipeline config invalid: {pipeline_file} "
+                f"({len(errors)} error(s), {len(warnings_found)} warning(s))"
+            )
+        _ok(
+            cli_ctx,
+            f"Pipeline config valid: {pipeline_file} "
+            f"({len(warnings_found)} warning(s))",
+        )
 
     _run_with_error_handling(_action)
 
@@ -3369,16 +5645,52 @@ def pipeline_run(cli_ctx: CLIContext, pipeline_file: str, parallel: int,
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "run pipeline", file=pipeline_file, parallel=parallel)
             return
+        if watch:
+            raise click.ClickException(
+                "--watch has no implementation in the execution engine yet; "
+                "re-run the pipeline after each change instead."
+            )
+        pipeline = _load_pipeline_file(pipeline_file)
+        # _execute_step() returns its input untouched when step.handler is None, so
+        # an all-unhandled pipeline "succeeds" having done nothing. Refuse instead
+        # of reporting a green no-op.
+        unhandled = [
+            step.name for step in pipeline.steps
+            if getattr(step, "handler", None) is None
+        ]
+        if unhandled:
+            raise click.ClickException(
+                f"Cannot execute {pipeline_file}: {len(unhandled)} step(s) have no "
+                f"handler ({', '.join(unhandled)}). Step handlers are Python "
+                "callables and are never restored from a config file, so the engine "
+                "would pass data through every step and still report success. "
+                "Register them with PipelineBuilder.register_step_handler() and run "
+                "the pipeline in Python, or use `semantica pipeline validate` to "
+                "check the config."
+            )
+        # --parallel and --incremental have no run-level switch in the engine:
+        # parallelism is read from pipeline.config and delta mode is per step.
+        pipeline.config["parallelism"] = parallel
+        if incremental:
+            for step in pipeline.steps:
+                step.delta_mode = True
         try:
             from .pipeline import ExecutionEngine
-            engine = ExecutionEngine(config=cli_ctx.config.to_dict())
-            result = engine.run(
-                pipeline_file, workers=parallel,
-                incremental=incremental, watch=watch,
-            )
         except ImportError as exc:
             raise click.ClickException(f"Pipeline module not available: {exc}") from exc
-        _ok(cli_ctx, f"Pipeline completed: {result}")
+        engine = ExecutionEngine(config=cli_ctx.config.to_dict())
+        result = engine.execute_pipeline(pipeline)
+        if not result.success:
+            errors = [str(e) for e in (result.errors or [])]
+            raise click.ClickException(
+                f"Pipeline failed: {'; '.join(errors) if errors else 'no error detail'}"
+            )
+        elapsed = result.metadata.get("execution_time")
+        pipeline_id = result.metadata.get("pipeline_id", pipeline.name)
+        summary = f"Pipeline completed: {pipeline_id}"
+        if isinstance(elapsed, (int, float)):
+            summary += f" in {elapsed:.2f}s"
+        _ok(cli_ctx, summary)
 
     _run_with_error_handling(_action)
 
@@ -3391,16 +5703,16 @@ def pipeline_status(cli_ctx: CLIContext, local_json: bool) -> None:
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        try:
-            from .pipeline import ExecutionEngine
-            engine = ExecutionEngine(config=cli_ctx.config.to_dict())
-            result = engine.status()
-        except ImportError as exc:
-            raise click.ClickException(f"Pipeline module not available: {exc}") from exc
-        if _is_json(cli_ctx, local_json):
-            _jecho(result if isinstance(result, dict) else {"status": str(result)})
-        else:
-            _pprint(cli_ctx, result)
+        # ExecutionEngine.pipeline_status is an in-memory dict and
+        # get_pipeline_status() only reads it, so a pipeline started by another
+        # process is invisible here. There is no id to accept either: ids are
+        # pipeline.name and are never persisted.
+        raise click.ClickException(
+            "`pipeline status` has no source of truth: the execution engine keeps "
+            "pipeline status in memory, so a pipeline started by a separate "
+            "`semantica pipeline run` process cannot be observed from here. Track it "
+            "in the process that called ExecutionEngine.execute_pipeline() instead."
+        )
 
     _run_with_error_handling(_action)
 
@@ -3412,13 +5724,17 @@ def pipeline_stop(cli_ctx: CLIContext) -> None:
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        try:
-            from .pipeline import ExecutionEngine
-            engine = ExecutionEngine(config=cli_ctx.config.to_dict())
-            engine.stop()
-        except ImportError as exc:
-            raise click.ClickException(f"Pipeline module not available: {exc}") from exc
-        _ok(cli_ctx, "Pipeline stopped.")
+        # stop_pipeline() does set a flag the run loop honours (execution_engine.py
+        # :273 and :320), but it takes a pipeline id and that flag lives on the
+        # engine instance doing the stopping, so it cannot reach a pipeline owned by
+        # another process.
+        raise click.ClickException(
+            "`pipeline stop` has nothing to stop: the execution engine tracks running "
+            "pipelines in memory only, so a pipeline started by a separate "
+            "`semantica pipeline run` process is not reachable from here. Call "
+            "ExecutionEngine.stop_pipeline(pipeline_id) in the process running the "
+            "pipeline instead."
+        )
 
     _run_with_error_handling(_action)
 
@@ -3472,14 +5788,17 @@ def store_connect(cli_ctx: CLIContext, backend: str, uri: Optional[str], local_j
 
     def _action() -> None:
         try:
-            from .graph_store import get_graph_store_method
-            store_cls = get_graph_store_method(backend)
+            # get_graph_store_method(task, method_name) is the method
+            # registry, not a backend factory (#1354); build the store
+            # through GraphStore, which resolves the backend by name.
+            from .graph_store import GraphStore
             cfg = dict(cli_ctx.config.to_dict().get("graph_db", {}))
+            cfg.pop("backend", None)
             if uri:
                 cfg["uri"] = uri
-            # Attempt instantiation as the minimal connectivity probe; backends
-            # that require a live connection will fail here if unreachable.
-            store_instance = store_cls(config=cfg)
+            # Instantiation only wires the backend; the probe below performs
+            # the live connectivity check and raises if unreachable.
+            store_instance = GraphStore(backend=backend, **cfg)
             for probe in ("health_check", "ping", "connect"):
                 fn = getattr(store_instance, probe, None)
                 if callable(fn):
@@ -3512,17 +5831,64 @@ def store_stats(cli_ctx: CLIContext, backend: str, fmt: str, local_json: bool) -
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        try:
-            from .graph_store import run_analytics
-            stats = run_analytics(backend=backend, config=cli_ctx.config.to_dict())
-        except ImportError as exc:
-            raise click.ClickException(f"Graph store module not available: {exc}") from exc
+        # run_analytics() is the graph analytics entry point and takes an
+        # algorithm name, not a backend, so passing backend=/config= raised a
+        # TypeError on every call (#1943). memory is served by ContextGraph,
+        # like every other graph command; the rest go through GraphStore.
+        if backend == MEMORY_GRAPH_BACKEND:
+            stats = _load_context_graph(cli_ctx).stats()
+        else:
+            stats = _get_graph_store(cli_ctx, backend=backend).get_stats()
         if _is_json(cli_ctx, local_json) or fmt == "json":
             _jecho(stats if isinstance(stats, dict) else {"stats": str(stats)})
         else:
-            console.print(stats)
+            table = Table(title="[bold]Backend Statistics[/bold]",
+                          box=_TABLE_BOX, show_edge=False, padding=(0, 1))
+            table.add_column("Metric", style=_KEY, no_wrap=True)
+            table.add_column("Value", style=_VAL)
+            items = stats.items() if isinstance(stats, dict) else []
+            for k, v in items:
+                table.add_row(str(k), str(v))
+            console.print(table)
 
     _run_with_error_handling(_action)
+
+
+_MIGRATE_SUPPORTED_BACKENDS = {"faiss", "sqlite", "pgvector"}
+_MIGRATE_BATCH_SIZE = 500
+_PINECONE_DELETE_BATCH_SIZE = 1000
+_PINECONE_VERIFY_ATTEMPTS = 3
+_PINECONE_VERIFY_SLEEP_SECONDS = 0.1
+
+
+def _migrate_backend_config(vs_cfg: Dict[str, Any], backend: str) -> Dict[str, Any]:
+    """Resolve per-backend config out of the vector_store config section.
+
+    Supports both a per-backend nested shape (``vector_store.faiss.dimension``)
+    and the common flat single-backend shape (``vector_store.backend`` +
+    sibling keys), since either can appear depending on how many backends a
+    user has configured.
+    """
+    nested = vs_cfg.get(backend)
+    if isinstance(nested, dict):
+        return dict(nested)
+    if vs_cfg.get("backend") == backend:
+        return {k: v for k, v in vs_cfg.items() if k != "backend"}
+    return {}
+
+
+def _require_faiss_index_path(cfg: Dict[str, Any], role: str) -> str:
+    """FAISS has no server to hold state between commands: a fresh FAISSStore
+    starts empty and nothing outside the process persists it, so migrate and
+    flush need an explicit on-disk index to read from or write to."""
+    index_path = cfg.get("index_path")
+    if not index_path:
+        raise click.ClickException(
+            f"faiss as {role} requires 'index_path' in the vector_store "
+            f"config (vector_store.faiss.index_path or vector_store.index_path "
+            f"when faiss is the configured backend)."
+        )
+    return index_path
 
 
 @store.command("migrate")
@@ -3530,14 +5896,22 @@ def store_stats(cli_ctx: CLIContext, backend: str, fmt: str, local_json: bool) -
 @click.option("--to", "to_backend", required=True)
 @click.option("--namespace", default=None)
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
+@click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
 def store_migrate(cli_ctx: CLIContext, from_backend: str, to_backend: str,
-                  namespace: Optional[str], local_dry: bool) -> None:
+                  namespace: Optional[str], local_dry: bool, local_json: bool) -> None:
     """Migrate data between backends.
+
+    Direct migration is only wired up between faiss, sqlite, and pgvector -
+    these are the backends whose storage contract supports paging through
+    every stored vector. Migrating to or from qdrant, pinecone, milvus, or
+    weaviate still needs the export/reindex workaround below, since each of
+    those needs its own enumeration design (Qdrant scroll, Pinecone list,
+    etc.) that hasn't been built yet.
 
     \b
     Example:
-      semantica store migrate --from faiss --to qdrant --namespace production --dry-run
+      semantica store migrate --from faiss --to sqlite --namespace production --dry-run
     """
     cli_ctx = _require_ctx(cli_ctx)
 
@@ -3545,13 +5919,76 @@ def store_migrate(cli_ctx: CLIContext, from_backend: str, to_backend: str,
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "migrate", from_backend=from_backend, to_backend=to_backend)
             return
-        raise click.ClickException(
-            f"Direct backend migration ({from_backend} → {to_backend}) is not yet supported "
-            "by the vector store layer. To migrate, export your data first:\n"
-            "  semantica export --format parquet --output dump.parquet\n"
-            f"  semantica embed index dump.parquet --store {to_backend}"
-            + (f" --namespace {namespace}" if namespace else "")
-        )
+
+        if from_backend not in _MIGRATE_SUPPORTED_BACKENDS or to_backend not in _MIGRATE_SUPPORTED_BACKENDS:
+            raise click.ClickException(
+                f"Direct backend migration ({from_backend} → {to_backend}) is only supported "
+                f"between {', '.join(sorted(_MIGRATE_SUPPORTED_BACKENDS))}. To migrate involving "
+                "another backend, export your data first:\n"
+                "  semantica export --format parquet --output dump.parquet\n"
+                f"  semantica embed index dump.parquet --store {to_backend}"
+                + (f" --namespace {namespace}" if namespace else "")
+            )
+
+        from .vector_store import VectorStore
+
+        vs_cfg = cli_ctx.config.to_dict().get("vector_store", {}) or {}
+        source_cfg = _migrate_backend_config(vs_cfg, from_backend)
+        dest_cfg = _migrate_backend_config(vs_cfg, to_backend)
+
+        source_index_path = None
+        if from_backend == "faiss":
+            source_index_path = _require_faiss_index_path(source_cfg, "migration source")
+        dest_index_path = None
+        if to_backend == "faiss":
+            dest_index_path = _require_faiss_index_path(dest_cfg, "migration destination")
+
+        source = VectorStore(backend=from_backend, config=source_cfg)
+        if source_index_path:
+            source._backend_store.load_index(source_index_path)
+
+        source_dimension = getattr(source._backend_store, "dimension", None)
+        if source_dimension and "dimension" not in dest_cfg:
+            dest_cfg["dimension"] = source_dimension
+
+        dest = VectorStore(backend=to_backend, config=dest_cfg)
+        if dest_index_path and Path(dest_index_path).exists():
+            dest._backend_store.load_index(dest_index_path)
+
+        migrated = 0
+        vectors_batch: List[Any] = []
+        metadata_batch: List[Dict[str, Any]] = []
+        ids_batch: List[str] = []
+
+        def _flush() -> None:
+            nonlocal migrated
+            if not vectors_batch:
+                return
+            dest.store_vectors(list(vectors_batch), list(metadata_batch), ids=list(ids_batch))
+            migrated += len(vectors_batch)
+            vectors_batch.clear()
+            metadata_batch.clear()
+            ids_batch.clear()
+
+        for item in source.iter_vectors(batch_size=_MIGRATE_BATCH_SIZE):
+            meta = dict(item.get("metadata") or {})
+            if namespace and "namespace" not in meta:
+                meta["namespace"] = namespace
+            vectors_batch.append(item["vector"])
+            metadata_batch.append(meta)
+            ids_batch.append(item["id"])
+            if len(vectors_batch) >= _MIGRATE_BATCH_SIZE:
+                _flush()
+        _flush()
+
+        if dest_index_path and migrated:
+            dest._backend_store.save_index(dest_index_path)
+
+        result = {"from": from_backend, "to": to_backend, "migrated": migrated}
+        if _is_json(cli_ctx, local_json):
+            _jecho(result)
+        else:
+            _ok(cli_ctx, f"Migrated {migrated} vectors from {from_backend} to {to_backend}")
 
     _run_with_error_handling(_action)
 
@@ -3568,12 +6005,104 @@ def store_flush(cli_ctx: CLIContext, namespace: Optional[str], confirm: bool) ->
     def _action() -> None:
         if not confirm:
             raise click.UsageError("--confirm is required to flush a namespace.")
+        # A namespace is a metadata convention (store migrate writes
+        # metadata["namespace"]), not a registry that ordinary storage keeps in
+        # sync, so a flush has to enumerate what the configured backend
+        # actually holds instead of reading namespace membership that
+        # store_vectors() never records (#1943). The backend may also be unable
+        # to enumerate at all, and an unsupported capability is not an empty
+        # namespace, so that path fails loudly rather than reporting zero.
+        from .vector_store import VectorStore
+
+        vs_cfg = cli_ctx.config.to_dict().get("vector_store", {}) or {}
+        default_ns = vs_cfg.get("default_namespace", "default")
+        # The backend every other vector command builds (--vector-store, then
+        # vector_store.backend), not a key the CLI never sets.
+        backend = _configured_vector_backend(cli_ctx) or _DEFAULT_VECTOR_BACKEND
+        is_pinecone = backend.lower() == "pinecone"
+        if is_pinecone:
+            target = (
+                namespace
+                if namespace is not None
+                else vs_cfg.get("default_namespace", "")
+            )
+        else:
+            target = namespace or default_ns
+        if backend == "inmemory":
+            raise click.ClickException(
+                "The 'inmemory' vector backend does not persist between CLI "
+                "invocations, so there is nothing to flush."
+            )
+        backend_cfg = _migrate_backend_config(vs_cfg, backend)
+        # A fresh FAISSStore starts empty, so flushing it would report success
+        # without touching the index on disk. Load it first; FAISSStore then
+        # writes deletions back to that path itself.
+        index_path = (
+            _require_faiss_index_path(backend_cfg, "the flush target")
+            if backend == "faiss" else None
+        )
+        store = VectorStore(backend=backend, config=backend_cfg)
+        if index_path:
+            store._backend_store.load_index(index_path)
+
+        def _namespace_ids() -> List[str]:
+            # Pinecone namespaces are native partitions; other backends use
+            # the metadata namespace convention retained for compatibility.
+            if is_pinecone:
+                return [
+                    item["id"]
+                    for item in store.iter_vectors(namespace=target)
+                ]
+            return [
+                item["id"]
+                for item in store.iter_vectors()
+                if (item.get("metadata") or {}).get("namespace", default_ns) == target
+            ]
+
         try:
-            from .vector_store import delete_vectors
-            delete_vectors(namespace=namespace, config=cli_ctx.config.to_dict())
-        except ImportError as exc:
-            raise click.ClickException(f"Store module not available: {exc}") from exc
-        _ok(cli_ctx, f"Flushed namespace: {namespace or 'default'}")
+            vector_ids = _namespace_ids()
+        except NotImplementedError as exc:
+            raise click.ClickException(
+                f"Backend '{backend}' cannot enumerate its stored vectors, so "
+                f"namespace '{target}' cannot be flushed selectively. {exc}"
+            ) from exc
+
+        removed = 0
+        if vector_ids:
+            if is_pinecone:
+                for start in range(0, len(vector_ids), _PINECONE_DELETE_BATCH_SIZE):
+                    store.delete_vectors(
+                        vector_ids[start:start + _PINECONE_DELETE_BATCH_SIZE],
+                        namespace=target,
+                    )
+            else:
+                store.delete_vectors(vector_ids)
+            # Report what is verifiably gone, not what was requested: backends
+            # such as FAISS silently ignore ids they no longer hold, and
+            # delete_vectors() reports success for the call as a whole (#1943).
+            if is_pinecone:
+                still_there = set(vector_ids)
+                for attempt in range(_PINECONE_VERIFY_ATTEMPTS):
+                    still_there = set(_namespace_ids()).intersection(vector_ids)
+                    if not still_there or attempt == _PINECONE_VERIFY_ATTEMPTS - 1:
+                        break
+                    time.sleep(_PINECONE_VERIFY_SLEEP_SECONDS)
+            else:
+                still_there = set(_namespace_ids())
+            removed = sum(1 for vector_id in vector_ids if vector_id not in still_there)
+            if removed == 0 and not is_pinecone:
+                raise click.ClickException(
+                    f"None of the {len(vector_ids)} vectors in namespace "
+                    f"'{target}' were removed; backend '{backend}' may not "
+                    "support deletion for this store."
+                )
+
+        message = f"Flushed namespace: {target} ({removed} vectors removed)"
+        if is_pinecone:
+            unconfirmed = len(vector_ids) - removed
+            if unconfirmed:
+                message += f"; {unconfirmed} vectors unconfirmed"
+        _ok(cli_ctx, message)
 
     _run_with_error_handling(_action)
 
@@ -3594,9 +6123,15 @@ def _collect_backup_sources(
     config_path: Optional[str],
     include: str,
     strip_config: bool,
-) -> List[Tuple[str, Path]]:
-    """Return (arcname, local_path) pairs for local files to include in a backup."""
+) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
+    """Return (arcname, local_path) pairs for local files to include in a backup.
+
+    Also returns each configured store whose local path does not exist or holds
+    no files, so the caller can report it instead of writing a partial archive
+    with no sign that a store was dropped (#2009, #2014).
+    """
     sources: List[Tuple[str, Path]] = []
+    skipped: List[Dict[str, str]] = []
 
     if not strip_config and include in ("config", "all"):
         candidates: List[str] = [c for c in [config_path, "semantica.yaml", "semantica.yml"] if c]
@@ -3612,11 +6147,26 @@ def _collect_backup_sources(
         if ont_path:
             p = Path(ont_path)
             if p.is_dir():
+                before = len(sources)
                 for f in p.rglob("*"):
                     if f.is_file():
                         sources.append((f"ontology/{f.relative_to(p)}", f))
+                if len(sources) == before:
+                    # An existing-but-empty directory contributed nothing; report
+                    # it instead of dropping it silently (#2014).
+                    skipped.append({
+                        "store": "ontology",
+                        "backend": "file",
+                        "path": _redact(ont_path),
+                    })
             elif p.is_file():
                 sources.append((f"ontology/{p.name}", p))
+            else:
+                skipped.append({
+                    "store": "ontology",
+                    "backend": "file",
+                    "path": _redact(ont_path),
+                })
 
     store_map = {"graph": "graph_db", "vector": "vector_store", "triplet": "triplet_store"}
     for store_type, cfg_key in store_map.items():
@@ -3629,16 +6179,84 @@ def _collect_backup_sources(
         _dp: Any = info.get("path") or info.get("data_path") or info.get("index_path")
         data_path: Optional[str] = str(_dp) if _dp else None
         if not data_path:
+            # No local path key at all: a cloud/database backend, which
+            # `backup info` reports as not file-copyable. Not a skip.
             continue
         p = Path(data_path)
         if p.is_dir():
+            before = len(sources)
             for f in p.rglob("*"):
                 if f.is_file():
                     sources.append((f"{store_type}/{f.relative_to(p)}", f))
+            if len(sources) == before:
+                # Same reporting rule as a missing path: an empty directory
+                # yields no files, so the store would vanish from the archive
+                # with no sign of it (#2014).
+                skipped.append({
+                    "store": store_type,
+                    "backend": str(info.get("backend", "unknown")),
+                    "path": _redact(data_path),
+                })
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
+        else:
+            # Redacted: this is shown in a warning and written to the
+            # manifest, even with --strip-config.
+            skipped.append({
+                "store": store_type,
+                "backend": str(info.get("backend", "unknown")),
+                "path": _redact(data_path),
+            })
 
-    return sources
+    return sources, skipped
+
+
+def _skip_label(store: str) -> str:
+    """Human label for a skipped entry, without calling ontology a 'store'."""
+    return "ontology" if store == "ontology" else f"{store} store"
+
+
+def _warn_skipped(cli_ctx: CLIContext, skipped: List[Dict[str, str]]) -> None:
+    """Name every configured path that contributed no files (#2009, #2014)."""
+    for entry in skipped:
+        _warn(
+            cli_ctx,
+            f"Skipping {_skip_label(entry['store'])} ({entry['backend']}): "
+            f"path does not exist or contains no files: {entry['path']}",
+        )
+
+
+def _raise_on_no_store_data(sources: List[Tuple[str, Path]], include: str) -> None:
+    """Refuse a backup that would hold no store data at all (#1820).
+
+    Called by the real command and by its dry run alike: a preview that
+    reports success for an archive the real command refuses to write is the
+    same surprise as a successful backup with nothing in it (#2122).
+    """
+    if include not in ("graph", "vector", "triplet", "all"):
+        return
+    if any(arcname.startswith(("graph/", "vector/", "triplet/"))
+           for arcname, _ in sources):
+        return
+    stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
+    raise click.ClickException(
+        f"No store data to back up: found no local files for the {stores}. "
+        "backup create only copies file-based stores (a graph_db / vector_store / "
+        "triplet_store path that exists on disk); run `semantica backup info` "
+        "to see how to back up other backends."
+    )
+
+
+def _raise_on_skipped(skipped: List[Dict[str, str]], *, target: str) -> None:
+    """Raise the --fail-on-skip error naming every skipped path."""
+    if not skipped:
+        return
+    missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
+    raise click.ClickException(
+        f"Configured store path does not exist or contains no files: {missing}. "
+        f"Nothing from those stores would be {target}; create the path, drop it "
+        "from the config, or omit --fail-on-skip to continue with the rest."
+    )
 
 
 def _redact(uri: str) -> str:
@@ -3706,13 +6324,15 @@ def backup_info(cli_ctx: CLIContext, local_json: bool) -> None:
               help="Read passphrase from file (must not be world-readable).")
 @click.option("--strip-config", is_flag=True, default=False,
               help="Exclude semantica.yaml to avoid storing credentials at rest.")
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_create(
     cli_ctx: CLIContext, destination: str, include: str, compress: bool,
     encrypt: bool, keyfile: Optional[str], strip_config: bool,
-    local_dry: bool, local_quiet: bool,
+    fail_on_skip: bool, local_dry: bool, local_quiet: bool,
 ) -> None:
     """Create a full backup archive.
 
@@ -3725,7 +6345,24 @@ def backup_create(
 
     def _action() -> None:
         if _is_dry(cli_ctx, local_dry):
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            # A dry run is a preview of the real command, so it has to report
+            # the same skipped stores, honour --fail-on-skip and refuse an
+            # archive the real run would not write (#2109, #2122).
+            cfg = cli_ctx.config.to_dict()
+            sources, skipped = _collect_backup_sources(
+                cfg, cli_ctx.config_path, include, strip_config,
+            )
+            _warn_skipped(cli_ctx, skipped)
+            _raise_on_no_store_data(sources, include)
+            if fail_on_skip:
+                _raise_on_skipped(skipped, target="in the archive")
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -3747,13 +6384,30 @@ def backup_create(
             passphrase = kp.read_text(encoding="utf-8").strip()
             if not passphrase:
                 raise click.ClickException(f"Keyfile {keyfile} is empty; cannot derive encryption key.")
-        elif encrypt:
-            passphrase = click.prompt("Backup passphrase", hide_input=True,
-                                      confirmation_prompt=True)
         else:
             passphrase = None
 
         cfg = cli_ctx.config.to_dict()
+        sources, skipped = _collect_backup_sources(
+            cfg, cli_ctx.config_path, include, strip_config,
+        )
+        # A configured store whose path is missing was dropped without a word,
+        # so a partial archive was reported as a success (#2009). Report every
+        # one before the prompts, and before the empty-archive check below so
+        # the missing paths are named even when no store is left to back up.
+        _warn_skipped(cli_ctx, skipped)
+
+        # Fail before any prompt instead of writing an archive with no
+        # store data in it (#1820).
+        _raise_on_no_store_data(sources, include)
+
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="in the archive")
+
+        if encrypt and passphrase is None:
+            passphrase = click.prompt("Backup passphrase", hide_input=True,
+                                      confirmation_prompt=True)
+
         if not strip_config and not encrypt and passphrase is None:
             if not quiet:
                 console.print(
@@ -3766,13 +6420,13 @@ def backup_create(
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         import tarfile, tempfile, shutil
-        sources = _collect_backup_sources(cfg, cli_ctx.config_path, include, strip_config)
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest: Dict[str, Any] = {
                 "include": include,
                 "version": str(__version__),
                 "files": [arcname for arcname, _ in sources],
+                "skipped": skipped,
             }
             (tmp_path / "backup_manifest.json").write_text(
                 json.dumps(manifest, indent=2), encoding="utf-8",
@@ -3840,11 +6494,13 @@ def backup_create(
 @click.option("--include",
               type=click.Choice(["graph", "vector", "triplet", "config", "ontology", "all"]),
               default="all", show_default=True)
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
-                local_dry: bool, local_quiet: bool) -> None:
+                fail_on_skip: bool, local_dry: bool, local_quiet: bool) -> None:
     """Incremental folder sync (idempotent, copies only changed files).
 
     \b
@@ -3858,10 +6514,17 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
         import shutil
         dest = Path(destination)
         cfg = cli_ctx.config.to_dict()
-        sources = _collect_backup_sources(cfg, cli_ctx.config_path, include, strip_config=False)
+        sources, skipped = _collect_backup_sources(
+            cfg, cli_ctx.config_path, include, strip_config=False,
+        )
+        # A skipped store used to be discarded here, so a sync after a partial
+        # create reported success for an incomplete store set (#2014).
+        _warn_skipped(cli_ctx, skipped)
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:
@@ -4188,7 +6851,7 @@ def explorer(ctx: click.Context) -> None:
 
 
 @explorer.command("start")
-@click.option("--port", default=5173, type=int, show_default=True)
+@click.option("--port", default=5173, type=click.IntRange(1, 65535), show_default=True)
 @click.option("--api-url", default="http://localhost:8000", show_default=True)
 @click.option("--graph", default=None, type=click.Path(exists=True),
               help="Optional graph JSON file to preload.")
@@ -4242,7 +6905,7 @@ def explorer_status(cli_ctx: CLIContext, local_json: bool) -> None:
 
 
 @explorer.command("open")
-@click.option("--port", default=5173, type=int, show_default=True)
+@click.option("--port", default=5173, type=click.IntRange(1, 65535), show_default=True)
 @click.pass_obj
 def explorer_open(cli_ctx: CLIContext, port: int) -> None:
     """Open the Explorer in the default browser."""
@@ -4271,15 +6934,15 @@ def mcp_start(cli_ctx: CLIContext, transport: str, port: int) -> None:
 
     \b
     Example:
-      semantica mcp start --transport http --port 3000
+      semantica mcp start --transport stdio
     """
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         import subprocess as sp
-        cmd = [sys.executable, "-m", "mcp.server"]
+        cmd = [sys.executable, "-m", "semantica_mcp.mcp.server"]
         if transport == "http":
-            cmd += ["--port", str(port)]
+            raise click.ClickException("HTTP transport is not supported (stdio only).")
         proc = sp.Popen(cmd)
         _write_pid("mcp", proc.pid)
         _ok(cli_ctx, f"MCP server started (pid {proc.pid})")
@@ -4319,15 +6982,10 @@ def mcp_list_tools(cli_ctx: CLIContext, local_json: bool) -> None:
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        try:
-            from mcp.tools import __all__ as tools
-        except ImportError:
-            tools = [
-                "extract_entities", "extract_relations", "build_graph",
-                "query_graph", "get_graph_analytics", "run_reasoning",
-                "record_decision", "get_decisions", "export_graph",
-                "validate_shacl", "get_provenance", "embed_and_search",
-            ]
+        # Same catalog the server exposes via tools/list, so `list-tools`
+        # and `mcp start` can't drift (issue #1355).
+        from semantica_mcp.mcp.tools import TOOL_DEFINITIONS
+        tools = [t["name"] for t in TOOL_DEFINITIONS]
         if _is_json(cli_ctx, local_json):
             _jecho({"tools": list(tools)})
         else:
@@ -4360,12 +7018,15 @@ def mcp_call(cli_ctx: CLIContext, tool_name: str, args: str, local_json: bool) -
             tool_args = json.loads(args)
         except json.JSONDecodeError as exc:
             raise click.ClickException(f"Invalid JSON in --args: {exc}") from exc
+        if not isinstance(tool_args, dict):
+            raise click.ClickException("--args must be a JSON object")
+        # Dispatch through the same server `mcp start` spawns; its session
+        # module never defined MCPSession (issue #1355).
+        from semantica_mcp.mcp.server import UnknownToolError, call_tool
         try:
-            from mcp.session import MCPSession
-            session = MCPSession(config=cli_ctx.config.to_dict())
-            result = session.call_tool(tool_name, **tool_args)
-        except ImportError as exc:
-            raise click.ClickException(f"MCP module not available: {exc}") from exc
+            result = call_tool(tool_name, tool_args)
+        except UnknownToolError as exc:
+            raise click.ClickException(str(exc)) from exc
         if _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, (dict, list)) else {"result": str(result)})
         else:

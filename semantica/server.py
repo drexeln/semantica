@@ -5,6 +5,7 @@ This module provides the REST API server for the Semantica framework
 using FastAPI and uvicorn.
 """
 
+import asyncio
 import logging
 import os
 import uvicorn
@@ -24,8 +25,10 @@ from .utils.logging import setup_logging
 try:
     from .context.context_graph import ContextGraph
     from .explorer.session import GraphSession
-    from .explorer.ws import ConnectionManager
+    from .explorer.ws import ConnectionManager, install_graph_updates_websocket
     from .explorer.dependencies import anonymous_access_allowed, get_expected_api_key, require_auth
+    from .explorer.markdown_resources import MarkdownResourceRegistry
+    from .explorer.runtime import explorer_capabilities, install_mutation_bridge
     EXPLORER_AVAILABLE = True
 except ImportError:
     EXPLORER_AVAILABLE = False
@@ -57,16 +60,24 @@ async def lifespan(app: FastAPI):
             graph = ContextGraph()
             app.state.session = GraphSession(graph)
             app.state.ws_manager = ConnectionManager()
+            app.state.event_loop = asyncio.get_running_loop()
+            app.state.agent_memory = None
+            app.state.markdown_resources = MarkdownResourceRegistry(graph)
+            install_mutation_bridge(app, app.state.session)
             logging.info("Database Session and WebSockets attached to app state.")
         except Exception as e:
             logging.error(f"Failed to initialize GraphSession: {e}")
             app.state.session = None
             app.state.ws_manager = None
+            app.state.agent_memory = None
+            app.state.markdown_resources = None
     else:
         app.state.session = None
         app.state.ws_manager = None
+        app.state.agent_memory = None
+        app.state.markdown_resources = None
 
-    yield  
+    yield
 
     logging.info("Shutting down Semantica API...")
     if getattr(app.state, "session", None) and hasattr(app.state.session.graph, "close"):
@@ -81,20 +92,28 @@ app = FastAPI(
 )
 
 # --- CORS -----------------------------------------------------------
-# Allow origins from environment (comma-separated); defaults to
-# localhost only so production deployments must configure this.
-_cors_origins_env = os.environ.get(
-    "SEMANTICA_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+# Allow origins from environment (comma-separated). The default matches
+# semantica/explorer/app.py: the Vite dev server (5173) and this server's
+# own port (8000), on localhost and 127.0.0.1 only, so a browser opened on
+# the server can open its WebSocket. Production deployments must set
+# SEMANTICA_CORS_ORIGINS, which replaces the default entirely.
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost:8000,http://127.0.0.1:8000"
 )
+_cors_origins_env = os.environ.get("SEMANTICA_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS)
 _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
     max_age=600,
 )
+
+if EXPLORER_AVAILABLE:
+    install_graph_updates_websocket(app, _cors_origins)
 
 
 # --- Security response headers -------------------------------------
@@ -138,7 +157,10 @@ async def root():
     return {
         "name": "Semantica API",
         "version": __version__,
-        "status": "active"
+        "status": "active",
+        "capabilities": explorer_capabilities(
+            getattr(app.state, "agent_memory", None)
+        ),
     }
 
 @app.get("/health")
@@ -165,6 +187,8 @@ if EXPLORER_AVAILABLE:
             enrich,
             export_import,
             graph,
+            markdown,
+            memories,
             ontology,
             temporal,
             vocabulary,
@@ -179,6 +203,8 @@ if EXPLORER_AVAILABLE:
         app.include_router(enrich.router, dependencies=_auth)
         app.include_router(export_import.router, dependencies=_auth)
         app.include_router(graph.router, dependencies=_auth)
+        app.include_router(markdown.router, dependencies=_auth)
+        app.include_router(memories.router, dependencies=_auth)
         app.include_router(ontology.router, dependencies=_auth)
         app.include_router(temporal.router, dependencies=_auth)
         app.include_router(vocabulary.router, dependencies=_auth)

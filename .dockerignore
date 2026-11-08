@@ -104,3 +104,14 @@ test_data
 test_data/**
 sample_data
 sample_data/**
+
+# Local journals, temp output, and test-run artifacts must stay out of build context.
+.tmp
+.tmp/**
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+test_runs
+test_runs/**
+_tmp_falcon_static_build
+_tmp_falcon_static_build/**

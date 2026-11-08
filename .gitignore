@@ -126,3 +126,28 @@ demo_out/
 
 # Worktrees
 .worktrees/
+
+# Local FALCON business data, generated reports and test output.
+# Publish portable code and synthetic fixtures through explicit reviewed paths.
+/EXXETA/
+/tmp/
+/.tmp/
+/test_runs/
+/_tmp*/
+/explorer/*.xlsx
+/explorer/*.xls
+/FALCON_Decision_Centric_V1/*.pdf
+~$*
+
+# Local persistence and credentials (including SQLite WAL/SHM companions).
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+.webui_secret_key
+*.p8
